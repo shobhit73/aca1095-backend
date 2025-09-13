@@ -34,6 +34,41 @@ CANON_ALIASES = {
 
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
+# --- cache for pay deductions so FastAPI doesn't need to pass it explicitly ---
+_PAY_DED_CACHE = None  # type: pd.DataFrame | None
+
+def _pick_monthly_deduction(pay_df: pd.DataFrame, emp: str, m_start: date, m_end: date) -> float:
+    """
+    Picks the Line 15 monthly employee contribution for a month by:
+      - filtering pay deductions that overlap the month window
+      - picking the row with the latest startdate (effective most recently)
+    Returns 0.0 if nothing applicable; rounded to 2 decimals.
+    """
+    if pay_df is None or pay_df.empty:
+        return 0.0
+    if not {"employeeid","amount","startdate","enddate"} <= set(pay_df.columns):
+        return 0.0
+
+    df = pay_df[pay_df["employeeid"].map(_coerce_str) == _coerce_str(emp)].copy()
+    if df.empty:
+        return 0.0
+
+    # Overlap with the month [m_start, m_end]
+    ov = df[(df["startdate"] <= pd.to_datetime(m_end)) & (df["enddate"] >= pd.to_datetime(m_start))]
+    if ov.empty:
+        return 0.0
+
+    # Choose latest effective record in/for that month
+    ov = ov.sort_values(["startdate", "enddate"])
+    cand = ov[ov["startdate"] <= pd.to_datetime(m_end)]
+    row = (cand.iloc[-1] if not cand.empty else ov.iloc[-1])
+    amt = row.get("amount", 0.0)
+    try:
+        return round(float(amt), 2)
+    except Exception:
+        return 0.0
+
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = (df.columns.str.strip().str.replace(r"\s+", " ", regex=True).str.lower())
@@ -133,6 +168,7 @@ def _boolify(df, cols):
 
 def prepare_inputs(data: dict):
     cleaned = {}
+    global _PAY_DED_CACHE
     for sheet, cols in EXPECTED_SHEETS.items():
         df = _pick_sheet(data, sheet)
         if df.empty:
@@ -161,8 +197,13 @@ def prepare_inputs(data: dict):
         elif sheet == "pay deductions":
             df = _parse_date_cols(df, ["startdate","enddate"], default_end_cols=["enddate"])
         cleaned[sheet] = df
+        
+    _PAY_DED_CACHE = cleaned["pay deductions"]
+
     return (cleaned["emp demographic"], cleaned["emp status"], cleaned["emp eligibility"],
             cleaned["emp enrollment"], cleaned["dep enrollment"], cleaned["pay deductions"])
+    # return (cleaned["emp demographic"], cleaned["emp status"], cleaned["emp eligibility"],
+            # cleaned["emp enrollment"], cleaned["dep enrollment"], cleaned["pay deductions"])
 
 def choose_report_year(emp_elig: pd.DataFrame, fallback_to_current=True) -> int:
     if emp_elig.empty or not {"eligibilitystartdate","eligibilityenddate"} <= set(emp_elig.columns):
@@ -207,6 +248,7 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=N
             for c in df.columns:
                 if c.endswith("date") and not np.issubdtype(df[c].dtype, np.datetime64):
                     df[c] = pd.to_datetime(df[c], errors="coerce")
+    pay = _PAY_DED_CACHE if _PAY_DED_CACHE is not None else pd.DataFrame()
     flags=[]
     for _,row in out.iterrows():
         emp = row["employeeid"]; ms=row["monthstart"].date(); me=row["monthend"].date()
@@ -244,6 +286,9 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=N
             l14 = "1F"
         else:
             l14 = "1H"
+        
+        # ---- Line 15 (Employee Required Contribution - monthly amount) ----
+        l15_amt = _pick_monthly_deduction(pay, emp, ms, me)  # float rounded 2 decimals
 
         # Line 16
         if enrolled_allmonth: l16 = "2C"
@@ -258,20 +303,25 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=N
             "offer_ee_allmonth": eligible_allmonth, "enrolled_allmonth": enrolled_allmonth,
             "offer_spouse": offer_spouse, "offer_dependents": offer_dependents, "waitingperiod_month": waitingperiod_month,
             "line14_final": l14, "line16_final": l16,
+            "line15_amount": l15_amt,
         })
     interim = pd.concat([out.reset_index(drop=True), pd.DataFrame(flags)], axis=1)
     base_cols = ["employeeid","firstname","lastname","year","monthnum","month","monthstart","monthend"]
     flag_cols = ["employed","ft","eligibleforcoverage","eligible_allmonth","eligible_mv","offer_ee_allmonth",
-                 "enrolled_allmonth","offer_spouse","offer_dependents","waitingperiod_month","line14_final","line16_final"]
+                 "enrolled_allmonth","offer_spouse","offer_dependents","waitingperiod_month","line14_final","line15_amount","line16_final"]
     keep = [c for c in base_cols if c in interim.columns] + [c for c in flag_cols if c in interim.columns]
     interim = interim[keep].sort_values(["employeeid","year","monthnum"]).reset_index(drop=True)
     return interim
 
 def build_final(interim: pd.DataFrame) -> pd.DataFrame:
     df = interim.copy()
-    out = df.loc[:, ["employeeid","month","line14_final","line16_final"]].rename(columns={
-        "employeeid":"EmployeeID","month":"Month","line14_final":"Line14_Final","line16_final":"Line16_Final"
+    out = df.loc[:, ["employeeid","month","line14_final","line16_final","line15_amount"]].rename(columns={
+        "employeeid":"EmployeeID","month":"Month","line14_final":"Line14_Final","line16_final":"Line16_Final","line15_amount":"Line15_Amount"
     })
+    # two-decimal formatting for display in "Final"
+    if "Line15_Amount" in out.columns:
+        out["Line15_Amount"] = out["Line15_Amount"].apply(lambda x: ("" if pd.isna(x) else f"{float(x):.2f}"))
+
     if "monthnum" in df.columns:
         out = out.join(df["monthnum"]).sort_values(["EmployeeID","monthnum"]).drop(columns=["monthnum"])
     else:
@@ -295,6 +345,9 @@ F_L14 = ["f1_17[0]","f1_18[0]","f1_19[0]","f1_20[0]","f1_21[0]","f1_22[0]","f1_2
 # Part II Line 16 (All 12 + Jan..Dec)
 F_L16 = ["f1_43[0]","f1_44[0]","f1_45[0]","f1_46[0]","f1_47[0]","f1_48[0]","f1_49[0]",
          "f1_50[0]","f1_51[0]","f1_52[0]","f1_53[0]","f1_54[0]","f1_55[0]"]
+# Part II Line 15 (All 12 + Jan..Dec)
+F_L15 = ["f1_30[0]","f1_31[0]","f1_32[0]","f1_33[0]","f1_34[0]","f1_35[0]","f1_36[0]",
+         "f1_37[0]","f1_38[0]","f1_39[0]","f1_40[0]","f1_41[0]","f1_42[0]"]
 
 def set_need_appearances(writer: PdfWriter):
     root = writer._root_object
@@ -402,7 +455,9 @@ def fill_pdf_for_employee(pdf_bytes: bytes, emp_row: pd.Series, final_df_emp: pd
     # ---- Part II codes from Final table (Line 14 & Line 16) ----
     l14_by_m = {row["Month"]: _coerce_str(row["Line14_Final"]) for _,row in final_df_emp.iterrows()}
     l16_by_m = {row["Month"]: _coerce_str(row["Line16_Final"]) for _,row in final_df_emp.iterrows()}
-
+    # ---- NEW: Part II Line 15 amounts ----
+    l15_by_m = {row["Month"]: _coerce_str(row.get("Line15_Amount","")) for _,row in final_df_emp.iterrows()}
+    
     def all12_value(d):
         vals = [d.get(m, "") for m in MONTHS]
         uniq = {v for v in vals if v}
@@ -410,14 +465,17 @@ def fill_pdf_for_employee(pdf_bytes: bytes, emp_row: pd.Series, final_df_emp: pd
 
     l14_all = all12_value(l14_by_m)
     l16_all = all12_value(l16_by_m)
+    l15_all = all12_value(l15_by_m)
 
     l14_values = [l14_all] + [l14_by_m.get(m,"") for m in MONTHS]
     l16_values = [l16_all] + [l16_by_m.get(m,"") for m in MONTHS]
+    l15_values = [l15_all] + [l15_by_m.get(m,"") for m in MONTHS]
 
     part2_map = {}
     for name,val in zip(F_L14, l14_values): part2_map[name]=val
     for name,val in zip(F_L16, l16_values): part2_map[name]=val
-
+    for name,val in zip(F_L15, l15_values): part2_map[name]=val
+    
     mapping = {}
     mapping.update(part1_map); mapping.update(part2_map)
 
