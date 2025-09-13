@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic<3
+pandas
+numpy
+PyPDF2
+reportlab
+xlsxwriter
