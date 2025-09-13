@@ -39,34 +39,37 @@ _PAY_DED_CACHE = None  # type: pd.DataFrame | None
 
 def _pick_monthly_deduction(pay_df: pd.DataFrame, emp: str, m_start: date, m_end: date) -> float:
     """
-    Picks the Line 15 monthly employee contribution for a month by:
-      - filtering pay deductions that overlap the month window
-      - picking the row with the latest startdate (effective most recently)
-    Returns 0.0 if nothing applicable; rounded to 2 decimals.
+    Return the Line 15 monthly employee contribution for the month window.
+    Supports two input shapes for the 'pay deductions' sheet:
+      A) Wide monthly columns: employeeid, jan, feb, ... dec
+      B) Range rows: employeeid, amount, startdate, enddate  (latest effective in the month wins)
+    Returns NaN if truly missing; numeric 0.00 passes through when present.
     """
     if pay_df is None or pay_df.empty:
-        return 0.0
-    if not {"employeeid","amount","startdate","enddate"} <= set(pay_df.columns):
-        return 0.0
+        return np.nan
 
-    df = pay_df[pay_df["employeeid"].map(_coerce_str) == _coerce_str(emp)].copy()
+    emp_key = _coerce_str(emp)
+    df = pay_df[pay_df["employeeid"].map(_coerce_str) == emp_key].copy()
     if df.empty:
-        return 0.0
+        return np.nan
 
-    # Overlap with the month [m_start, m_end]
-    ov = df[(df["startdate"] <= pd.to_datetime(m_end)) & (df["enddate"] >= pd.to_datetime(m_start))]
-    if ov.empty:
-        return 0.0
+    # Shape A: monthly-wide columns (after normalize_columns() -> lowercase)
+    mon_key = m_start.strftime("%b").lower()  # "jan", "feb", ...
+    if mon_key in df.columns:
+        val = pd.to_numeric(df.iloc[0][mon_key], errors="coerce")
+        return round(float(val), 2) if pd.notna(val) else np.nan
 
-    # Choose latest effective record in/for that month
-    ov = ov.sort_values(["startdate", "enddate"])
-    cand = ov[ov["startdate"] <= pd.to_datetime(m_end)]
-    row = (cand.iloc[-1] if not cand.empty else ov.iloc[-1])
-    amt = row.get("amount", 0.0)
-    try:
-        return round(float(amt), 2)
-    except Exception:
-        return 0.0
+    # Shape B: range rows
+    if {"amount","startdate","enddate"} <= set(df.columns):
+        ov = df[(df["startdate"] <= pd.to_datetime(m_end)) &
+                (df["enddate"]   >= pd.to_datetime(m_start))]
+        if ov.empty:
+            return np.nan
+        ov = ov.sort_values(["startdate", "enddate"])
+        val = pd.to_numeric(ov.iloc[-1]["amount"], errors="coerce")
+        return round(float(val), 2) if pd.notna(val) else np.nan
+
+    return np.nan
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -475,7 +478,7 @@ def fill_pdf_for_employee(pdf_bytes: bytes, emp_row: pd.Series, final_df_emp: pd
     for name,val in zip(F_L14, l14_values): part2_map[name]=val
     for name,val in zip(F_L16, l16_values): part2_map[name]=val
     for name,val in zip(F_L15, l15_values): part2_map[name]=val
-    
+
     mapping = {}
     mapping.update(part1_map); mapping.update(part2_map)
 
