@@ -121,13 +121,24 @@ def _ensure_employeeid_str(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _any_overlap(df, start_col, end_col, m_start: date, m_end: date, mask: Optional[pd.Series] = None) -> bool:
+def _any_overlap(df, start_col, end_col, m_start, m_end, mask=None) -> bool:
     if df is None or df.empty:
         return False
-    _m = mask if mask is not None else pd.Series(True, index=df.index)
+
+    # --- align mask to df.index ---
+    if mask is None:
+        _m = pd.Series(True, index=df.index)
+    else:
+        if not isinstance(mask, pd.Series):
+            _m = pd.Series(mask, index=df.index)
+        else:
+            _m = mask.reindex(df.index, fill_value=False)
+        _m = _m.astype(bool)
+
     s = df.loc[_m, start_col].fillna(pd.Timestamp.min).dt.date
     e = df.loc[_m, end_col].fillna(pd.Timestamp.max).dt.date
     return bool(((e >= m_start) & (s <= m_end)).any())
+
 
 
 def _all_month(df, start_col, end_col, m_start: date, m_end: date, mask: Optional[pd.Series] = None) -> bool:
@@ -402,10 +413,27 @@ def build_interim(
         employed = _any_overlap(st_emp, "statusstartdate", "statusenddate", ms, me) if not st_emp.empty else True
         ft = _any_overlap(st_emp, "statusstartdate", "statusenddate", ms, me, mask=st_emp.get("role", pd.Series()).astype(str).str.upper().eq("FT")) if not st_emp.empty else True
 
-        # Eligibility flags
-        eligible_any = _any_overlap(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me) if not el_emp.empty else False
-        eligible_allmonth = _all_month(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me) if not el_emp.empty else False
-        eligible_mv_any = _any_overlap(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me, mask=el_emp.get("minimumvaluecoverage", pd.Series(False)).fillna(False)) if not el_emp.empty else False
+# Eligibility flags
+eligible_any = _any_overlap(
+    el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me
+) if not el_emp.empty else False
+
+eligible_allmonth = _all_month(
+    el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me
+) if not el_emp.empty else False
+
+if not el_emp.empty:
+    if "minimumvaluecoverage" in el_emp.columns:
+        mv_mask = el_emp["minimumvaluecoverage"].fillna(False).astype(bool)
+    else:
+        mv_mask = pd.Series(False, index=el_emp.index)
+    eligible_mv_any = _any_overlap(
+        el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me, mask=mv_mask
+    )
+else:
+    eligible_mv_any = False
+
+
 
         # Offer scope: spouse/dependents from Dep Enrollment OR EligibleTier=EMPFAM
         offer_spouse = False
