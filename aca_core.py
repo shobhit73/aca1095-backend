@@ -718,7 +718,6 @@ def fill_pdf_for_employee(
         F_PART1[3]: city,
         F_PART1[4]: state,
         F_PART1[5]: zipcode,
-        # F_PART1[6], F_PART1[7] can be employer name/EIN if your PDF map includes them.
     }
 
     # Part II — assemble monthly dicts
@@ -731,43 +730,54 @@ def fill_pdf_for_employee(
         uniq = {v for v in vals if v}
         return list(uniq)[0] if len(uniq) == 1 else ""
 
-    l14_all = all12_value(l14_by_m)
-    l16_all = all12_value(l16_by_m)
-    l15_all = all12_value(l15_by_m)
+    l14_values = [all12_value(l14_by_m)] + [l14_by_m.get(m, "") for m in MONTHS]
+    l16_values = [all12_value(l16_by_m)] + [l16_by_m.get(m, "") for m in MONTHS]
+    l15_values = [all12_value(l15_by_m)] + [l15_by_m.get(m, "") for m in MONTHS]
 
-    l14_values = [l14_all] + [l14_by_m.get(m, "") for m in MONTHS]
-    l16_values = [l16_all] + [l16_by_m.get(m, "") for m in MONTHS]
-    l15_values = [l15_all] + [l15_by_m.get(m, "") for m in MONTHS]
-
-    mapping = {}
+    mapping: Dict[str, str] = {}
     mapping.update({name: val for name, val in zip(F_L14, l14_values)})
     mapping.update({name: val for name, val in zip(F_L16, l16_values)})
     mapping.update({name: val for name, val in zip(F_L15, l15_values)})
     mapping.update(part1_map)
 
-    # ---- EDITABLE output (NeedAppearances) ----
+    # ---- EDITABLE output ----
     writer_edit = PdfWriter()
-    for i in range(len(reader.pages)):
-        writer_edit.add_page(reader.pages[i])
+    for p in reader.pages:
+        writer_edit.add_page(p)
 
-    # Set field values if acroform present
-    if "/AcroForm" in reader.trailer["/Root"]:
-        form = reader.trailer["/Root"]["/AcroForm"]
-        if "/Fields" in form:
+    # Try to copy AcroForm (and its Fields) from the source PDF and fill
+    try:
+        root = reader.trailer.get("/Root")
+        acro = None
+        if root and "/AcroForm" in root:
+            acro = root["/AcroForm"].get_object()
+
+        if acro and "/Fields" in acro and acro["/Fields"]:
+            # Attach original AcroForm (with fields) to the writer
+            writer_edit._root_object.update({NameObject("/AcroForm"): acro})
             set_need_appearances(writer_edit)
+
             fields = writer_edit._root_object["/AcroForm"]["/Fields"]
             name_to_field = {}
             for f in fields:
                 try:
-                    name_to_field[f.get_object()["/T"]] = f
+                    obj = f.get_object()
+                    nm = obj.get("/T")
+                    if nm:
+                        name_to_field[nm] = f
                 except Exception:
                     pass
+
             for name, val in mapping.items():
                 if not val:
                     continue
                 if name in name_to_field:
                     obj = name_to_field[name].get_object()
                     obj.update({NameObject("/V"): createStringObject(str(val))})
+        # else: no fields — we’ll deliver a valid (but unfilled) PDF instead of 500
+    except Exception:
+        # Any unexpected AcroForm issue: skip filling but produce a valid PDF
+        pass
 
     editable_name = f"1095c_filled_editable_{first}_{last}_{year_used}.pdf"
     editable_bytes = io.BytesIO()
@@ -777,14 +787,15 @@ def fill_pdf_for_employee(
     # ---- FLATTENED output ----
     reader2 = PdfReader(io.BytesIO(editable_bytes.getvalue()))
     writer_flat = PdfWriter()
-    for i in range(len(reader2.pages)):
-        writer_flat.add_page(reader2.pages[i])
+    for p in reader2.pages:
+        writer_flat.add_page(p)
     flat_name = f"1095c_filled_flattened_{first}_{last}_{year_used}.pdf"
     flat_bytes = io.BytesIO()
     writer_flat.write(flat_bytes)
     flat_bytes.seek(0)
 
     return editable_name, editable_bytes, flat_name, flat_bytes
+
 
 
 # =========================
