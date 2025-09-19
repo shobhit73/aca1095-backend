@@ -1,10 +1,19 @@
-fastapi
-uvicorn[standard]
-python-multipart
-pydantic<3
-pandas
-numpy
-PyPDF2
-reportlab
-xlsxwriter
-openpyxl>=3.1.2
+# Web API
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+
+# Data wrangling
+pandas==2.2.2
+numpy==1.26.4
+openpyxl==3.1.5
+XlsxWriter==3.2.0
+
+# PDF fill/overlay
+PyPDF2==3.0.1
+reportlab==4.2.2
+
+# Utils
+pydantic==2.9.2
+pydantic-settings==2.5.2
+typing_extensions>=4.10.0
