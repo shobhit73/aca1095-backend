@@ -285,16 +285,28 @@ def choose_report_year(emp_elig: pd.DataFrame, fallback_to_current: bool = True)
     """Pick the year with the most eligibility rows overlapping, else current year or 2024."""
     if emp_elig is None or emp_elig.empty:
         return datetime.now().year if fallback_to_current else 2024
+
     counts: Dict[int, int] = {}
     for _, r in emp_elig.iterrows():
         s = pd.to_datetime(r.get("eligibilitystartdate"), errors="coerce")
         e = pd.to_datetime(r.get("eligibilityenddate"), errors="coerce")
+        # If both missing, skip; otherwise fill the missing side explicitly (avoid bool(NaT))
         if pd.isna(s) and pd.isna(e):
             continue
-        s = s or pd.Timestamp.min
-        e = e or pd.Timestamp.max
-        for y in range(s.year, e.year + 1):
+        if pd.isna(s):
+            s = pd.Timestamp.min
+        if pd.isna(e):
+            e = pd.Timestamp.max
+
+        # Guard against non-timestamp leftovers
+        try:
+            sy, ey = int(s.year), int(e.year)
+        except Exception:
+            continue
+
+        for y in range(sy, ey + 1):
             counts[y] = counts.get(y, 0) + 1
+
     if not counts:
         return datetime.now().year if fallback_to_current else 2024
     return max(sorted(counts), key=lambda y: (counts[y], y))
