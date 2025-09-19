@@ -701,7 +701,7 @@ def fill_pdf_for_employee(
     """
     reader = PdfReader(io.BytesIO(blank_pdf_bytes))
 
-    # Part I — first/last/ssn/address from emp_demo
+    # ---- Part I values ----
     emp_row = emp_demo.iloc[0] if not emp_demo.empty else pd.Series({})
     first = _coerce_str(emp_row.get("firstname", ""))
     last = _coerce_str(emp_row.get("lastname", ""))
@@ -720,7 +720,7 @@ def fill_pdf_for_employee(
         F_PART1[5]: zipcode,
     }
 
-    # Part II — assemble monthly dicts
+    # ---- Part II values ----
     l14_by_m = {row["Month"]: _coerce_str(row["Line14_Final"]) for _, row in final_df_emp.iterrows()}
     l16_by_m = {row["Month"]: _coerce_str(row["Line16_Final"]) for _, row in final_df_emp.iterrows()}
     l15_by_m = {row["Month"]: _coerce_str(row.get("Line15_Amount", "")) for _, row in final_df_emp.iterrows()}
@@ -740,43 +740,20 @@ def fill_pdf_for_employee(
     mapping.update({name: val for name, val in zip(F_L15, l15_values)})
     mapping.update(part1_map)
 
-    # ---- EDITABLE output ----
+    # ---- EDITABLE output (use PyPDF2 API to set fields) ----
     writer_edit = PdfWriter()
-    for p in reader.pages:
-        writer_edit.add_page(p)
+    for page in reader.pages:
+        writer_edit.add_page(page)
 
-    # Try to copy AcroForm (and its Fields) from the source PDF and fill
+    # Tell viewers to render filled values
+    set_need_appearances(writer_edit)
+
+    # Try to fill; if the PDF has no fields, this just does nothing (no error)
     try:
-        root = reader.trailer.get("/Root")
-        acro = None
-        if root and "/AcroForm" in root:
-            acro = root["/AcroForm"].get_object()
-
-        if acro and "/Fields" in acro and acro["/Fields"]:
-            # Attach original AcroForm (with fields) to the writer
-            writer_edit._root_object.update({NameObject("/AcroForm"): acro})
-            set_need_appearances(writer_edit)
-
-            fields = writer_edit._root_object["/AcroForm"]["/Fields"]
-            name_to_field = {}
-            for f in fields:
-                try:
-                    obj = f.get_object()
-                    nm = obj.get("/T")
-                    if nm:
-                        name_to_field[nm] = f
-                except Exception:
-                    pass
-
-            for name, val in mapping.items():
-                if not val:
-                    continue
-                if name in name_to_field:
-                    obj = name_to_field[name].get_object()
-                    obj.update({NameObject("/V"): createStringObject(str(val))})
-        # else: no fields — we’ll deliver a valid (but unfilled) PDF instead of 500
+        for i in range(len(writer_edit.pages)):
+            writer_edit.update_page_form_field_values(writer_edit.pages[i], mapping)
     except Exception:
-        # Any unexpected AcroForm issue: skip filling but produce a valid PDF
+        # If anything odd, deliver a valid (unfilled) PDF instead of 500
         pass
 
     editable_name = f"1095c_filled_editable_{first}_{last}_{year_used}.pdf"
@@ -795,6 +772,7 @@ def fill_pdf_for_employee(
     flat_bytes.seek(0)
 
     return editable_name, editable_bytes, flat_name, flat_bytes
+
 
 
 
