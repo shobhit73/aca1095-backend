@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import io
 import zipfile
+import logging
+import traceback
 from datetime import datetime
 from typing import Optional
 
@@ -22,6 +24,10 @@ from aca_core import (
     fill_pdf_for_employee,
 )
 
+# ---------- logging ----------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("aca1095")
+
 
 # =========================
 # Settings & App
@@ -29,7 +35,7 @@ from aca_core import (
 
 class Settings(BaseSettings):
     FASTAPI_API_KEY: str = ""                  # required in prod; empty disables auth
-    ACA_MODE: str = "SIMPLIFIED"               # SIMPLIFIED | IRS_STRICT (default Simplified for UAT parity)
+    ACA_MODE: str = "SIMPLIFIED"               # SIMPLIFIED | IRS_STRICT
     FILING_YEAR: Optional[int] = None          # if None, auto-pick from data
     AFFORDABILITY_THRESHOLD: float = 50.00     # used only in SIMPLIFIED
     PENALTY_A_AMOUNT: float = 241.67           # display-only in dashboard
@@ -76,6 +82,20 @@ def _resolve_run_config(
     )
 
 
+def _err_response(ctx: str, e: Exception, status: int = 500):
+    # Log full traceback server-side and return a compact error + first 4k chars of trace to caller
+    log.exception("%s failed", ctx)
+    return JSONResponse(
+        status_code=status,
+        content={
+            "ok": False,
+            "error": str(e) or "<no message>",
+            "trace": traceback.format_exc()[:4000],
+            "where": ctx,
+        },
+    )
+
+
 # =========================
 # Routes
 # =========================
@@ -96,7 +116,7 @@ def health():
 @app.post("/final_and_interim", dependencies=[Depends(_require_api_key)])
 async def final_and_interim(
     excel: UploadFile = File(..., description="Input workbook (.xlsx)"),
-    # New optional run-time controls coming from the Vercel UI:
+    # Optional run-time controls from the UI:
     aca_mode: Optional[str] = Form(None),
     filing_year: Optional[str] = Form(None),
     affordability_threshold: Optional[str] = Form(None),
@@ -156,7 +176,7 @@ async def final_and_interim(
     except HTTPException:
         raise
     except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+        return _err_response("final_and_interim", e)
 
 
 @app.post("/generate/single", dependencies=[Depends(_require_api_key)])
@@ -192,6 +212,7 @@ async def generate_single_pdf(
         target_emp = employee_id or (emp_ids[0] if emp_ids else None)
         if not target_emp:
             raise HTTPException(status_code=400, detail="No employees found in the input workbook.")
+
         # Filter rows for the employee
         interim_emp = interim[interim["employeeid"].astype(str) == str(target_emp)]
         if interim_emp.empty:
@@ -228,7 +249,7 @@ async def generate_single_pdf(
     except HTTPException:
         raise
     except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+        return _err_response("generate_single", e)
 
 
 @app.post("/generate/zip", dependencies=[Depends(_require_api_key)])
@@ -292,7 +313,7 @@ async def generate_zip_pdfs(
     except HTTPException:
         raise
     except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+        return _err_response("generate_zip", e)
 
 
 # Convenience alias for your previous naming (if any)
@@ -304,7 +325,7 @@ async def process_excel_alias(
     affordability_threshold: Optional[str] = Form(None),
     include_penalty_dashboard: Optional[str] = Form("true"),
 ):
-    # Just forward to /final_and_interim to keep backward compatibility with your Vercel proxy
+    # Forward to /final_and_interim to keep backward compatibility with your Vercel proxy
     return await final_and_interim(
         excel=excel,
         aca_mode=aca_mode,
