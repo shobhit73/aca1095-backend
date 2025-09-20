@@ -701,24 +701,33 @@ def fill_pdf_for_employee(
     """
     reader = PdfReader(io.BytesIO(blank_pdf_bytes))
 
-    # ---- Part I values ----
-    emp_row = emp_demo.iloc[0] if not emp_demo.empty else pd.Series({})
-    first = _coerce_str(emp_row.get("firstname", ""))
-    last = _coerce_str(emp_row.get("lastname", ""))
-    ssn = normalize_ssn_digits(emp_row.get("ssn", ""))
-    addr1 = _coerce_str(emp_row.get("addressline1", ""))
-    city = _coerce_str(emp_row.get("city", ""))
-    state = _coerce_str(emp_row.get("state", ""))
-    zipcode = _coerce_str(emp_row.get("zipcode", ""))
+# ---- Part I values ----
+emp_row = emp_demo.iloc[0] if not emp_demo.empty else pd.Series({})
+first  = _coerce_str(emp_row.get("firstname", ""))
+# middle name: accept common variants if present
+middle = _coerce_str(
+    emp_row.get("middlename", emp_row.get("midname", emp_row.get("mi", "")))
+)
+last   = _coerce_str(emp_row.get("lastname", ""))
 
-    part1_map = {
-        F_PART1[0]: f"{first} {last}".strip(),
-        F_PART1[1]: ssn,
-        F_PART1[2]: street,
-        F_PART1[3]: city,
-        F_PART1[4]: state,
-        F_PART1[5]: zipcode,
-    }
+ssn    = normalize_ssn_digits(emp_row.get("ssn", ""))
+addr1  = _coerce_str(emp_row.get("addressline1", ""))
+city   = _coerce_str(emp_row.get("city", ""))
+state  = _coerce_str(emp_row.get("state", ""))
+zipcode = _coerce_str(emp_row.get("zipcode", ""))
+
+full_name = " ".join([p for p in [first, middle, last] if p])
+
+# Map to your PDF fields (adjust only the *keys* to match your PDF if needed)
+part1_map = {
+    F_PART1[0]: full_name,  # Name
+    F_PART1[1]: ssn,        # SSN
+    F_PART1[2]: addr1,      # Street address
+    F_PART1[3]: city,       # City
+    F_PART1[4]: state,      # State
+    F_PART1[5]: zipcode,    # ZIP
+}
+
 
     # ---- Part II values ----
     l14_by_m = {row["Month"]: _coerce_str(row["Line14_Final"]) for _, row in final_df_emp.iterrows()}
