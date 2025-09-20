@@ -696,46 +696,42 @@ def fill_pdf_for_employee(
     year_used: int,
 ) -> Tuple[str, io.BytesIO, str, io.BytesIO]:
     """
-    Fills Part I (name/SSN/address) and Part II (Line 14/15/16 All-12 or Jan..Dec) for a single employee.
-    Returns (editable_filename, editable_bytes, flattened_filename, flattened_bytes)
+    Build mapping and fill the 1095-C PDF for one employee.
+    Returns (editable_filename, editable_pdf_bytes, flattened_filename, flattened_pdf_bytes).
     """
     reader = PdfReader(io.BytesIO(blank_pdf_bytes))
 
-# ---- Part I values ----
-emp_row = emp_demo.iloc[0] if not emp_demo.empty else pd.Series({})
+    # ---- Part I values ----
+    emp_row = emp_demo.iloc[0] if not emp_demo.empty else pd.Series({})
 
-first   = _coerce_str(emp_row.get("firstname", ""))
-# accept common variants for middle; use only the initial if present
-middle  = _coerce_str(emp_row.get("middlename", emp_row.get("midname", emp_row.get("mi", ""))))
-last    = _coerce_str(emp_row.get("lastname", ""))
+    first   = _coerce_str(emp_row.get("firstname", ""))
+    middle  = _coerce_str(emp_row.get("middlename", emp_row.get("midname", emp_row.get("mi", ""))))
+    last    = _coerce_str(emp_row.get("lastname", ""))
 
-ssn     = normalize_ssn_digits(emp_row.get("ssn", ""))
-addr1   = _coerce_str(emp_row.get("addressline1", ""))
-city    = _coerce_str(emp_row.get("city", ""))
-state   = _coerce_str(emp_row.get("state", ""))
-zipcode = _coerce_str(emp_row.get("zipcode", ""))
+    ssn     = normalize_ssn_digits(emp_row.get("ssn", ""))
+    addr1   = _coerce_str(emp_row.get("addressline1", ""))
+    city    = _coerce_str(emp_row.get("city", ""))
+    state   = _coerce_str(emp_row.get("state", ""))
+    zipcode = _coerce_str(emp_row.get("zipcode", ""))
 
-# Map to your PDF's actual field names (from the painted PDF)
-# Name is split across three boxes: first, middle initial, last
-name_parts = {
-    "f1_1[0]": first,                      # First name
-    "f":        (middle[:1] if middle else ""),  # Middle initial (leave blank if none)
-    "f1_3[0]":  last,                       # Last name
-}
-# keep only non-empty entries
-name_parts = {k: v for k, v in name_parts.items() if v}
+    # Name is split across three boxes on this 2024 form
+    name_parts = {
+        "f1_1[0]": first,                                 # First
+        "f":        (middle[:1] if middle else ""),        # Middle initial (leave blank if none)
+        "f1_3[0]":  last,                                  # Last
+    }
+    name_parts = {k: v for k, v in name_parts.items() if v}
 
-part1_map = {
-    **name_parts,
-    "f1_4[0]": ssn,      # SSN
-    "f1_5[0]": addr1,    # Street address
-    "f1_6[0]": city,     # City
-    "f1_7[0]": state,    # State
-    "f1_56":  zipcode,   # ZIP (Line 17)
-}
+    part1_map = {
+        **name_parts,
+        "f1_4[0]": ssn,       # SSN
+        "f1_5[0]": addr1,     # Street
+        "f1_6[0]": city,      # City
+        "f1_7[0]": state,     # State
+        "f1_56":  zipcode,    # ZIP (Line 17)
+    }
 
-
-    # ---- Part II values ----
+    # ---- Part II values (from Final table for this employee) ----
     l14_by_m = {row["Month"]: _coerce_str(row["Line14_Final"]) for _, row in final_df_emp.iterrows()}
     l16_by_m = {row["Month"]: _coerce_str(row["Line16_Final"]) for _, row in final_df_emp.iterrows()}
     l15_by_m = {row["Month"]: _coerce_str(row.get("Line15_Amount", "")) for _, row in final_df_emp.iterrows()}
@@ -755,33 +751,36 @@ part1_map = {
     mapping.update({name: val for name, val in zip(F_L15, l15_values)})
     mapping.update(part1_map)
 
-    # ---- EDITABLE output (use PyPDF2 API to set fields) ----
+    # ---- Build EDITABLE (AcroForm) PDF ----
     writer_edit = PdfWriter()
-    for page in reader.pages:
-        writer_edit.add_page(page)
+    for p in reader.pages:
+        writer_edit.add_page(p)
 
-    # Tell viewers to render filled values
-    set_need_appearances(writer_edit)
+    # Let viewers render the filled values; if helper exists, use it
+    try:
+        set_need_appearances(writer_edit)  # your helper, if defined
+    except Exception:
+        pass
 
-    # Try to fill; if the PDF has no fields, this just does nothing (no error)
     try:
         for i in range(len(writer_edit.pages)):
             writer_edit.update_page_form_field_values(writer_edit.pages[i], mapping)
     except Exception:
-        # If anything odd, deliver a valid (unfilled) PDF instead of 500
+        # If the PDF has no fields or any oddity, skip filling but still return a valid PDF
         pass
 
-    editable_name = f"1095c_filled_editable_{first}_{last}_{year_used}.pdf"
+    editable_name = f"1095c_filled_editable_{first or 'EE'}_{last or 'Employee'}_{year_used}.pdf"
     editable_bytes = io.BytesIO()
     writer_edit.write(editable_bytes)
     editable_bytes.seek(0)
 
-    # ---- FLATTENED output ----
+    # ---- Build FLATTENED PDF (no form fields) ----
     reader2 = PdfReader(io.BytesIO(editable_bytes.getvalue()))
     writer_flat = PdfWriter()
     for p in reader2.pages:
         writer_flat.add_page(p)
-    flat_name = f"1095c_filled_flattened_{first}_{last}_{year_used}.pdf"
+
+    flat_name = f"1095c_filled_flattened_{first or 'EE'}_{last or 'Employee'}_{year_used}.pdf"
     flat_bytes = io.BytesIO()
     writer_flat.write(flat_bytes)
     flat_bytes.seek(0)
