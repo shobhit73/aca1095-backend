@@ -703,29 +703,35 @@ def fill_pdf_for_employee(
 
 # ---- Part I values ----
 emp_row = emp_demo.iloc[0] if not emp_demo.empty else pd.Series({})
-first  = _coerce_str(emp_row.get("firstname", ""))
-# middle name: accept common variants if present
-middle = _coerce_str(
-    emp_row.get("middlename", emp_row.get("midname", emp_row.get("mi", "")))
-)
-last   = _coerce_str(emp_row.get("lastname", ""))
 
-ssn    = normalize_ssn_digits(emp_row.get("ssn", ""))
-addr1  = _coerce_str(emp_row.get("addressline1", ""))
-city   = _coerce_str(emp_row.get("city", ""))
-state  = _coerce_str(emp_row.get("state", ""))
+first   = _coerce_str(emp_row.get("firstname", ""))
+# accept common variants for middle; use only the initial if present
+middle  = _coerce_str(emp_row.get("middlename", emp_row.get("midname", emp_row.get("mi", ""))))
+last    = _coerce_str(emp_row.get("lastname", ""))
+
+ssn     = normalize_ssn_digits(emp_row.get("ssn", ""))
+addr1   = _coerce_str(emp_row.get("addressline1", ""))
+city    = _coerce_str(emp_row.get("city", ""))
+state   = _coerce_str(emp_row.get("state", ""))
 zipcode = _coerce_str(emp_row.get("zipcode", ""))
 
-full_name = " ".join([p for p in [first, middle, last] if p])
+# Map to your PDF's actual field names (from the painted PDF)
+# Name is split across three boxes: first, middle initial, last
+name_parts = {
+    "f1_1[0]": first,                      # First name
+    "f":        (middle[:1] if middle else ""),  # Middle initial (leave blank if none)
+    "f1_3[0]":  last,                       # Last name
+}
+# keep only non-empty entries
+name_parts = {k: v for k, v in name_parts.items() if v}
 
-# Map to your PDF fields (adjust only the *keys* to match your PDF if needed)
 part1_map = {
-    F_PART1[0]: full_name,  # Name
-    F_PART1[1]: ssn,        # SSN
-    F_PART1[2]: addr1,      # Street address
-    F_PART1[3]: city,       # City
-    F_PART1[4]: state,      # State
-    F_PART1[5]: zipcode,    # ZIP
+    **name_parts,
+    "f1_4[0]": ssn,      # SSN
+    "f1_5[0]": addr1,    # Street address
+    "f1_6[0]": city,     # City
+    "f1_7[0]": state,    # State
+    "f1_56":  zipcode,   # ZIP (Line 17)
 }
 
 
