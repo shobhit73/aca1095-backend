@@ -7,6 +7,7 @@ import io
 import zipfile
 import logging
 import traceback
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -14,8 +15,8 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic_settings import BaseSettings
 
+# NOTE: Do NOT import RunConfig from aca_core (it no longer exists there).
 from aca_core import (
-    RunConfig,
     load_excel,
     build_interim,
     build_final,
@@ -27,6 +28,18 @@ from aca_core import (
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("aca1095")
+
+
+# =========================
+# Local RunConfig (compat shim)
+# =========================
+@dataclass
+class RunConfig:
+    year: Optional[int]
+    aca_mode: str
+    affordability_threshold: float
+    penalty_a_amount: float
+    penalty_b_amount: float
 
 
 # =========================
@@ -139,7 +152,11 @@ async def final_and_interim(
         )
 
         # Decide year used (cfg may have None -> build_interim auto-picked)
-        year_used = int(interim["year"].iloc[0]) if not interim.empty else (cfg.year or settings.FILING_YEAR or datetime.utcnow().year)
+        year_used = (
+            int(interim["year"].iloc[0])
+            if ("year" in interim.columns and not interim.empty)
+            else (cfg.year or settings.FILING_YEAR or datetime.utcnow().year)
+        )
 
         # Final table
         final = build_final(interim)
@@ -162,7 +179,11 @@ async def final_and_interim(
             penalty_dashboard=penalty_df,
         )
 
-        filename = f"Final_Interim_{year_used}.xlsx" if penalty_df is None else f"Final_Interim_Penalty_{year_used}.xlsx"
+        filename = (
+            f"Final_Interim_{year_used}.xlsx"
+            if penalty_df is None
+            else f"Final_Interim_Penalty_{year_used}.xlsx"
+        )
         headers = {
             "Content-Disposition": f'attachment; filename="{filename}"',
             "X-Backend-Mode": cfg.aca_mode,
@@ -205,7 +226,11 @@ async def generate_single_pdf(
             frames["dep_enroll"],
             cfg=cfg,
         )
-        year_used = int(interim["year"].iloc[0]) if not interim.empty else (cfg.year or settings.FILING_YEAR or datetime.utcnow().year)
+        year_used = (
+            int(interim["year"].iloc[0])
+            if ("year" in interim.columns and not interim.empty)
+            else (cfg.year or settings.FILING_YEAR or datetime.utcnow().year)
+        )
 
         # Pick employee
         emp_ids = sorted(set(interim["employeeid"].astype(str))) if not interim.empty else []
@@ -277,7 +302,11 @@ async def generate_zip_pdfs(
             frames["dep_enroll"],
             cfg=cfg,
         )
-        year_used = int(interim["year"].iloc[0]) if not interim.empty else (cfg.year or settings.FILING_YEAR or datetime.utcnow().year)
+        year_used = (
+            int(interim["year"].iloc[0])
+            if ("year" in interim.columns and not interim.empty)
+            else (cfg.year or settings.FILING_YEAR or datetime.utcnow().year)
+        )
 
         # Group by employee, generate PDFs, zip them
         mem = io.BytesIO()
