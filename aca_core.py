@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import io
 from dataclasses import dataclass
+import calendar
+from datetime import date
 from datetime import date, datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -121,14 +123,15 @@ def parse_date_safe(v) -> Optional[date]:
     except Exception:
         return None
 
-def month_bounds(year: int, month_num: int) -> Tuple[date, date]:
+
+
+def month_bounds(year: int, month_num: int):
+    """Return (first_day, last_day) as datetime.date objects for the given month."""
     start = date(year, month_num, 1)
-    if month_num == 12:
-        end = date(year, 12, 31)
-    else:
-        end = date(year, month_num+1, 1) - pd.Timedelta(days=1)
-        end = end.date()
+    last_day = calendar.monthrange(year, month_num)[1]
+    end = date(year, month_num, last_day)
     return start, end
+
 
 def to_bool(x) -> bool:
     if isinstance(x, str):
