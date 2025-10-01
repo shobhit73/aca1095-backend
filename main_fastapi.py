@@ -1,5 +1,5 @@
 # main_fastapi.py
-# FastAPI service for ACA 1095: Excel -> (Final, Interim, Penalty Dashboard) and PDF generation.
+# FastAPI service for ACA 1095: Excel -> (Final, Interim, optional Penalty Dashboard) and PDF generation.
 
 from __future__ import annotations
 
@@ -11,18 +11,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
+import pandas as pd
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic_settings import BaseSettings
 
-# NOTE: Do NOT import RunConfig from aca_core (it no longer exists there).
+# Import ONLY the symbols that exist in your current aca_core.py
 from aca_core import (
-    load_excel,
-    build_interim,
-    build_final,
-    build_penalty_dashboard,
-    save_excel_outputs,
-    fill_pdf_for_employee,
+    load_excel,          # (file_bytes: bytes) -> dict of raw sheets
+    prepare_inputs,      # (data: dict) -> (emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions)
+    build_interim,       # (emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=None) -> DataFrame
+    build_final,         # (interim) -> DataFrame
+    save_excel_outputs,  # (interim, final, year) -> bytes    # 2-sheet writer (Final/Interim)
+    fill_pdf_for_employee,  # (pdf_bytes, emp_row: Series, final_df_emp: DataFrame, year_used: int)
 )
 
 # ---------- logging ----------
@@ -31,7 +32,7 @@ log = logging.getLogger("aca1095")
 
 
 # =========================
-# Local RunConfig (compat shim)
+# Local RunConfig (lightweight shim)
 # =========================
 @dataclass
 class RunConfig:
@@ -45,15 +46,14 @@ class RunConfig:
 # =========================
 # Settings & App
 # =========================
-
 class Settings(BaseSettings):
     FASTAPI_API_KEY: str = ""                  # required in prod; empty disables auth
-    ACA_MODE: str = "SIMPLIFIED"               # SIMPLIFIED | IRS_STRICT
-    FILING_YEAR: Optional[int] = None          # if None, auto-pick from data
-    AFFORDABILITY_THRESHOLD: float = 50.00     # used only in SIMPLIFIED
+    ACA_MODE: str = "SIMPLIFIED"               # placeholder; current aca_core doesn't branch on mode
+    FILING_YEAR: Optional[int] = None          # if None, aca_core.build_interim will auto-pick from data
+    AFFORDABILITY_THRESHOLD: float = 50.00     # not used by current aca_core, kept for forward-compat
     PENALTY_A_AMOUNT: float = 241.67           # display-only in dashboard
     PENALTY_B_AMOUNT: float = 362.50           # display-only in dashboard
-    APP_VERSION: str = "1.1.0"
+    APP_VERSION: str = "1.1.1"
 
 settings = Settings()
 app = FastAPI(title="ACA 1095 Backend", version=settings.APP_VERSION)
@@ -85,7 +85,6 @@ def _resolve_run_config(
         thr = float(affordability_threshold) if affordability_threshold not in (None, "", "null") else settings.AFFORDABILITY_THRESHOLD
     except Exception:
         thr = settings.AFFORDABILITY_THRESHOLD
-
     return RunConfig(
         year=year,
         aca_mode=mode,
@@ -96,7 +95,6 @@ def _resolve_run_config(
 
 
 def _err_response(ctx: str, e: Exception, status: int = 500):
-    # Log full traceback server-side and return a compact error + first 4k chars of trace to caller
     log.exception("%s failed", ctx)
     return JSONResponse(
         status_code=status,
@@ -110,255 +108,59 @@ def _err_response(ctx: str, e: Exception, status: int = 500):
 
 
 # =========================
-# Routes
+# Simple Penalty Dashboard (local)
 # =========================
+def build_penalty_dashboard_local(interim: pd.DataFrame) -> pd.DataFrame:
+    """
+    Lightweight, non-authoritative dashboard so the API can return a 3-sheet workbook.
+    You can replace this later with a richer aca_core implementation.
+    """
+    if interim.empty:
+        return pd.DataFrame(columns=[
+            "EmployeeID", "Months_No_Offer_1H", "Months_Enrolled_2C",
+            "Months_Waiting_2D", "Months_NotFT_2B", "Months_NotEmployed_2A",
+            "Months_Blank", "Potential_Risk_Flag", "Notes"
+        ])
 
-@app.get("/health", dependencies=[Depends(_require_api_key)])
-def health():
-    return {
-        "ok": True,
-        "version": settings.APP_VERSION,
-        "mode": settings.ACA_MODE.upper(),
-        "default_year": settings.FILING_YEAR,
-        "threshold": f"{settings.AFFORDABILITY_THRESHOLD:.2f}",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-    }
+    df = interim.copy()
+    df["EmployeeID"] = df["employeeid"].astype(str)
 
+    def agg(grp: pd.DataFrame):
+        l14 = grp["line14_final"].astype(str).str.upper().fillna("")
+        l16 = grp["line16_final"].astype(str).str.upper().fillna("")
+        no_offer = (l14 == "1H").sum()
+        e2c = (l16 == "2C").sum()
+        e2d = (l16 == "2D").sum()
+        e2b = (l16 == "2B").sum()
+        e2a = (l16 == "2A").sum()
+        blanks = ((l16 == "") | (l16.isna())).sum()
+        # naive "risk": months with 1H offer AND not covered by 2A/2B/2D that month
+        # (we don't compute per-month pairing here; this is a coarse head-up flag)
+        potential = "Yes" if no_offer > 0 and (e2a + e2b + e2d) == 0 else "Review"
+        return pd.Series({
+            "Months_No_Offer_1H": int(no_offer),
+            "Months_Enrolled_2C": int(e2c),
+            "Months_Waiting_2D": int(e2d),
+            "Months_NotFT_2B": int(e2b),
+            "Months_NotEmployed_2A": int(e2a),
+            "Months_Blank": int(blanks),
+            "Potential_Risk_Flag": potential,
+            "Notes": "",
+        })
 
-@app.post("/final_xlsx", dependencies=[Depends(_require_api_key)])
-@app.post("/final_and_interim", dependencies=[Depends(_require_api_key)])
-async def final_and_interim(
-    excel: UploadFile = File(..., description="Input workbook (.xlsx)"),
-    # Optional run-time controls from the UI:
-    aca_mode: Optional[str] = Form(None),
-    filing_year: Optional[str] = Form(None),
-    affordability_threshold: Optional[str] = Form(None),
-    include_penalty_dashboard: Optional[str] = Form("true"),
-):
-    try:
-        excel_bytes = await excel.read()
-        frames = load_excel(excel_bytes)
-
-        cfg = _resolve_run_config(aca_mode, filing_year, affordability_threshold)
-
-        # Build Interim (includes Line14/15/16 + Penalty flags/reasons)
-        interim = build_interim(
-            frames["emp_demo"],
-            frames["emp_status"],
-            frames["emp_elig"],
-            frames["emp_enroll"],
-            frames["dep_enroll"],
-            cfg=cfg,
-        )
-
-        # Decide year used (cfg may have None -> build_interim auto-picked)
-        year_used = (
-            int(interim["year"].iloc[0])
-            if ("year" in interim.columns and not interim.empty)
-            else (cfg.year or settings.FILING_YEAR or datetime.utcnow().year)
-        )
-
-        # Final table
-        final = build_final(interim)
-
-        # Optional Penalty Dashboard
-        penalty_df = None
-        if _parse_bool(include_penalty_dashboard):
-            penalty_df = build_penalty_dashboard(
-                interim,
-                year=year_used,
-                penalty_a_amt=cfg.penalty_a_amount,
-                penalty_b_amt=cfg.penalty_b_amount,
-            )
-
-        # Save workbook
-        xlsx_bytes = save_excel_outputs(
-            interim=interim,
-            final=final,
-            year=year_used,
-            penalty_dashboard=penalty_df,
-        )
-
-        filename = (
-            f"Final_Interim_{year_used}.xlsx"
-            if penalty_df is None
-            else f"Final_Interim_Penalty_{year_used}.xlsx"
-        )
-        headers = {
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "X-Backend-Mode": cfg.aca_mode,
-            "X-Backend-Year": str(year_used),
-        }
-        return StreamingResponse(
-            io.BytesIO(xlsx_bytes),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers=headers,
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        return _err_response("final_and_interim", e)
+    out = df.groupby("EmployeeID", as_index=False).apply(agg, include_groups=False)
+    # Show names if present
+    if {"firstname", "lastname"}.issubset(df.columns):
+        names = df[["EmployeeID", "firstname", "lastname"]].drop_duplicates()
+        out = names.merge(out, on="EmployeeID", how="right")
+    return out.reset_index(drop=True)
 
 
-@app.post("/generate/single", dependencies=[Depends(_require_api_key)])
-async def generate_single_pdf(
-    excel: UploadFile = File(..., description="Input workbook (.xlsx)"),
-    pdf: UploadFile = File(..., description="Blank 1095-C PDF form"),
-    employee_id: Optional[str] = Form(None),
-    flattened_only: Optional[str] = Form("true"),
-    # Optional run-time controls
-    aca_mode: Optional[str] = Form(None),
-    filing_year: Optional[str] = Form(None),
-    affordability_threshold: Optional[str] = Form(None),
-):
-    try:
-        excel_bytes = await excel.read()
-        pdf_bytes = await pdf.read()
-
-        frames = load_excel(excel_bytes)
-        cfg = _resolve_run_config(aca_mode, filing_year, affordability_threshold)
-
-        interim = build_interim(
-            frames["emp_demo"],
-            frames["emp_status"],
-            frames["emp_elig"],
-            frames["emp_enroll"],
-            frames["dep_enroll"],
-            cfg=cfg,
-        )
-        year_used = (
-            int(interim["year"].iloc[0])
-            if ("year" in interim.columns and not interim.empty)
-            else (cfg.year or settings.FILING_YEAR or datetime.utcnow().year)
-        )
-
-        # Pick employee
-        emp_ids = sorted(set(interim["employeeid"].astype(str))) if not interim.empty else []
-        target_emp = employee_id or (emp_ids[0] if emp_ids else None)
-        if not target_emp:
-            raise HTTPException(status_code=400, detail="No employees found in the input workbook.")
-
-        # Filter rows for the employee
-        interim_emp = interim[interim["employeeid"].astype(str) == str(target_emp)]
-        if interim_emp.empty:
-            raise HTTPException(status_code=404, detail=f"EmployeeID {target_emp} not found.")
-
-        final_emp = build_final(interim_emp)
-
-        # Emp demographic slice (Part I)
-        demo_emp = frames["emp_demo"]
-        if not demo_emp.empty:
-            demo_emp = demo_emp[demo_emp["employeeid"].astype(str) == str(target_emp)]
-
-        editable_name, editable_bytes, flat_name, flat_bytes = fill_pdf_for_employee(
-            blank_pdf_bytes=pdf_bytes,
-            emp_demo=demo_emp,
-            final_df_emp=final_emp,
-            year_used=year_used,
-        )
-
-        if _parse_bool(flattened_only):
-            filename = flat_name
-            stream = flat_bytes
-        else:
-            filename = editable_name
-            stream = editable_bytes
-
-        headers = {
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "X-Backend-Mode": cfg.aca_mode,
-            "X-Backend-Year": str(year_used),
-        }
-        return StreamingResponse(stream, media_type="application/pdf", headers=headers)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        return _err_response("generate_single", e)
-
-
-@app.post("/generate/zip", dependencies=[Depends(_require_api_key)])
-async def generate_zip_pdfs(
-    excel: UploadFile = File(..., description="Input workbook (.xlsx)"),
-    pdf: UploadFile = File(..., description="Blank 1095-C PDF form"),
-    # Optional run-time controls
-    aca_mode: Optional[str] = Form(None),
-    filing_year: Optional[str] = Form(None),
-    affordability_threshold: Optional[str] = Form(None),
-    flattened_only: Optional[str] = Form("true"),
-):
-    try:
-        excel_bytes = await excel.read()
-        pdf_bytes = await pdf.read()
-
-        frames = load_excel(excel_bytes)
-        cfg = _resolve_run_config(aca_mode, filing_year, affordability_threshold)
-
-        interim = build_interim(
-            frames["emp_demo"],
-            frames["emp_status"],
-            frames["emp_elig"],
-            frames["emp_enroll"],
-            frames["dep_enroll"],
-            cfg=cfg,
-        )
-        year_used = (
-            int(interim["year"].iloc[0])
-            if ("year" in interim.columns and not interim.empty)
-            else (cfg.year or settings.FILING_YEAR or datetime.utcnow().year)
-        )
-
-        # Group by employee, generate PDFs, zip them
-        mem = io.BytesIO()
-        with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for emp in sorted(set(interim["employeeid"].astype(str))):
-                interim_emp = interim[interim["employeeid"].astype(str) == emp]
-                final_emp = build_final(interim_emp)
-
-                demo_emp = frames["emp_demo"]
-                if not demo_emp.empty:
-                    demo_emp = demo_emp[demo_emp["employeeid"].astype(str) == emp]
-
-                editable_name, editable_bytes, flat_name, flat_bytes = fill_pdf_for_employee(
-                    blank_pdf_bytes=pdf_bytes,
-                    emp_demo=demo_emp,
-                    final_df_emp=final_emp,
-                    year_used=year_used,
-                )
-
-                if _parse_bool(flattened_only):
-                    zf.writestr(flat_name, flat_bytes.getvalue())
-                else:
-                    zf.writestr(editable_name, editable_bytes.getvalue())
-
-        mem.seek(0)
-        headers = {
-            "Content-Disposition": f'attachment; filename="1095c_all_{year_used}.zip"',
-            "X-Backend-Mode": cfg.aca_mode,
-            "X-Backend-Year": str(year_used),
-        }
-        return StreamingResponse(mem, media_type="application/zip", headers=headers)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        return _err_response("generate_zip", e)
-
-
-# Convenience alias for your previous naming (if any)
-@app.post("/process/excel", dependencies=[Depends(_require_api_key)])
-async def process_excel_alias(
-    excel: UploadFile = File(...),
-    aca_mode: Optional[str] = Form(None),
-    filing_year: Optional[str] = Form(None),
-    affordability_threshold: Optional[str] = Form(None),
-    include_penalty_dashboard: Optional[str] = Form("true"),
-):
-    # Forward to /final_and_interim to keep backward compatibility with your Vercel proxy
-    return await final_and_interim(
-        excel=excel,
-        aca_mode=aca_mode,
-        filing_year=filing_year,
-        affordability_threshold=affordability_threshold,
-        include_penalty_dashboard=include_penalty_dashboard,
-    )
+def write_three_sheet_workbook(interim: pd.DataFrame, final: pd.DataFrame, penalty: pd.DataFrame, year: int) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as xw:
+        final.to_excel(xw, index=False, sheet_name=f"Final {year}")
+        interim.to_excel(xw, index=False, sheet_name=f"Interim {year}")
+        penalty.to_excel(xw, index=False, sheet_name=f"Penalty Dashboard {year}")
+    buf.seek(0)
+    ret
