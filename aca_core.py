@@ -19,10 +19,8 @@ FALSY  = {"n","no","false","f","0",0,False,None,np.nan}
 # Canonical token sets (after normalization)
 FT_TOKENS = {"FT","FULLTIME","FTE","CATEGORY2","CAT2"}
 PT_TOKENS = {"PT","PARTTIME","PTE"}
-ACTIVE_TOKENS = FT_TOKENS | PT_TOKENS | {"ACTIVE"}
-
-# Used for 'employed' overlap mask (backward compatibility)
-ACTIVE_STATUS = {"FT","FULL-TIME","FULL TIME","PT","PART-TIME","PART TIME","ACTIVE"}
+# Treat ACTIVE + LOA as 'employed' for overlap detection; role FT/PT also implies 'employed'
+EMPLOYED_TOKENS = {"ACTIVE","LOA"} | FT_TOKENS | PT_TOKENS
 
 # Affordability placeholder for 1A vs 1E
 AFFORDABILITY_THRESHOLD = 50.00
@@ -44,7 +42,6 @@ CANON_ALIASES = {
 
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
-# ---------- normalization helpers ----------
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = (df.columns.str.strip().str.replace(r"\s+", " ", regex=True).str.lower())
@@ -55,7 +52,6 @@ def _coerce_str(x) -> str:
     return str(x).strip()
 
 def _norm_token(x) -> str:
-    """UPPER, strip non-alnum: 'Full time'/'FULL-TIME' → 'FULLTIME'."""
     return re.sub(r"[^A-Z0-9]", "", str(x).upper())
 
 def _normalize_employeeid(x) -> str:
@@ -176,11 +172,11 @@ def prepare_inputs(data: dict):
                 df = df.rename(columns={misspell: canon})
         df = _ensure_employeeid_str(df)
         if sheet == "emp status":
+            # Keep if you ever add a dedicated status sheet
             if "employmentstatus" in df.columns:
                 df["employmentstatus"] = df["employmentstatus"].astype(str).str.strip()
             if "role" in df.columns:
                 df["role"] = df["role"].astype(str).str.strip()
-            # also cache normalized tokens for faster masks
             if "employmentstatus" in df.columns:
                 df["_estatus_norm"] = df["employmentstatus"].map(_norm_token)
             if "role" in df.columns:
@@ -261,6 +257,22 @@ def _pick_monthly_deduction(pay_df: pd.DataFrame, emp: str, ms: date, me: date) 
         return None
 
 # =========================
+# Build a status table from Emp Demographic (Role/EmploymentStatus are dated here)
+# =========================
+def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
+    need = {"employeeid","role","employmentstatus","statusstartdate","statusenddate"}
+    if emp_demo.empty or not need <= set(emp_demo.columns):
+        return pd.DataFrame(columns=list(need))
+    st = emp_demo.loc[:, list(need)].copy()
+    st["employeeid"] = st["employeeid"].map(_normalize_employeeid)
+    st["role"] = st["role"].astype(str).str.strip()
+    st["employmentstatus"] = st["employmentstatus"].astype(str).str.strip()
+    st["_role_norm"] = st["role"].map(_norm_token)
+    st["_estatus_norm"] = st["employmentstatus"].map(_norm_token)
+    st = _parse_date_cols(st, ["statusstartdate","statusenddate"], default_end_cols=["statusenddate"])
+    return st
+
+# =========================
 # Core: Interim / Final
 # =========================
 def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=None, pay_deductions=None) -> pd.DataFrame:
@@ -268,20 +280,37 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=N
     employee_ids = _collect_employee_ids(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll)
     grid = _grid_for_year(employee_ids, year)
 
-    # Demographic basic info (deduped)
-    demo = pd.DataFrame(columns=["employeeid","firstname","lastname"])
+    # Demographic minimal fields (names)
+    demo_names = pd.DataFrame(columns=["employeeid","firstname","lastname"])
     if not emp_demo.empty:
         tmp = emp_demo.copy()
         if "employeeid" in tmp.columns:
             tmp["employeeid"] = tmp["employeeid"].map(_normalize_employeeid)
-        demo = tmp[["employeeid","firstname","lastname"]].drop_duplicates("employeeid", keep="first")
+        for col in ["firstname","lastname"]:
+            if col not in tmp.columns: tmp[col] = ""
+        demo_names = tmp[["employeeid","firstname","lastname"]].drop_duplicates("employeeid", keep="first")
 
-    out = grid.merge(demo, on="employeeid", how="left")
+    out = grid.merge(demo_names, on="employeeid", how="left")
 
-    stt, elg, enr, dep = emp_status.copy(), emp_elig.copy(), emp_enroll.copy(), dep_enroll.copy()
+    # Build a unified status table:
+    # Prefer a dedicated 'emp status' sheet if present; otherwise derive from Demographic
+    stt = emp_status.copy()
+    if (stt is None) or stt.empty or not {"statusstartdate","statusenddate"} <= set(stt.columns):
+        stt = _status_from_demographic(emp_demo)
+    else:
+        # ensure normalized tokens exist
+        if "employeeid" in stt.columns:
+            stt["employeeid"] = stt["employeeid"].map(_normalize_employeeid)
+        if "employmentstatus" in stt.columns:
+            stt["_estatus_norm"] = stt["employmentstatus"].astype(str).map(_norm_token)
+        if "role" in stt.columns:
+            stt["_role_norm"] = stt["role"].astype(str).map(_norm_token)
+        stt = _parse_date_cols(stt, ["statusstartdate","statusenddate"], default_end_cols=["statusenddate"])
+
+    elg, enr, dep = emp_elig.copy(), emp_enroll.copy(), dep_enroll.copy()
     pay = pay_deductions.copy() if pay_deductions is not None else pd.DataFrame()
 
-    for df in (stt,elg,enr,dep,pay):
+    for df in (elg,enr,dep,pay):
         if (df is not None) and (not df.empty):
             if "employeeid" in df.columns:
                 df["employeeid"] = df["employeeid"].map(_normalize_employeeid)
@@ -297,49 +326,40 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=N
         en_emp = enr[enr["employeeid"]==emp] if not enr.empty else enr
         de_emp = dep[dep["employeeid"]==emp] if not dep.empty else dep
 
-        # Normalize tokens on-the-fly (in case they weren't created earlier)
+        # Ensure normalized tokens present for this slice (defensive)
         if (not st_emp.empty):
             if "_estatus_norm" not in st_emp.columns and "employmentstatus" in st_emp.columns:
-                st_emp = st_emp.copy()
-                st_emp["_estatus_norm"] = st_emp["employmentstatus"].map(_norm_token)
+                st_emp = st_emp.copy(); st_emp["_estatus_norm"] = st_emp["employmentstatus"].map(_norm_token)
             if "_role_norm" not in st_emp.columns and "role" in st_emp.columns:
-                st_emp = st_emp.copy()
-                st_emp["_role_norm"] = st_emp["role"].map(_norm_token)
+                st_emp = st_emp.copy(); st_emp["_role_norm"] = st_emp["role"].map(_norm_token)
 
-        # Employment (any overlap with active-ish rows)
+        # ----- EMPLOYED -----
         employed=False
         if not st_emp.empty and {"statusstartdate","statusenddate"} <= set(st_emp.columns):
             active_mask = pd.Series(False, index=st_emp.index)
             if "_estatus_norm" in st_emp.columns:
-                active_mask = active_mask | st_emp["_estatus_norm"].isin(ACTIVE_TOKENS)
+                active_mask = active_mask | st_emp["_estatus_norm"].isin(EMPLOYED_TOKENS)
             if "_role_norm" in st_emp.columns:
                 active_mask = active_mask | st_emp["_role_norm"].isin(FT_TOKENS | PT_TOKENS)
-            # fallback to legacy ACTIVE_STATUS strings if normalized not available
-            if "employmentstatus" in st_emp.columns:
-                active_mask = active_mask | st_emp["employmentstatus"].astype(str).str.upper().isin(ACTIVE_STATUS)
             employed = _any_overlap(st_emp, "statusstartdate","statusenddate", ms,me, mask=active_mask)
 
-        # FT: full month if either role OR employmentstatus implies FT for the full month
+        # ----- FT/PT FULL-MONTH -----
         ft_full_month = False
-        if not st_emp.empty and {"statusstartdate","statusenddate"} <= set(st_emp.columns):
-            ft_mask = pd.Series(False, index=st_emp.index)
-            if "_role_norm" in st_emp.columns:
-                ft_mask = ft_mask | st_emp["_role_norm"].isin(FT_TOKENS)
-            if "_estatus_norm" in st_emp.columns:
-                ft_mask = ft_mask | st_emp["_estatus_norm"].isin(FT_TOKENS)
-            ft_full_month = _all_month(st_emp, "statusstartdate","statusenddate", ms,me, mask=ft_mask)
-
-        # PT: full month if either role OR employmentstatus implies PT for the full month (and not FT)
         pt_full_month = False
         if not st_emp.empty and {"statusstartdate","statusenddate"} <= set(st_emp.columns):
+            ft_mask = pd.Series(False, index=st_emp.index)
             pt_mask = pd.Series(False, index=st_emp.index)
             if "_role_norm" in st_emp.columns:
+                ft_mask = ft_mask | st_emp["_role_norm"].isin(FT_TOKENS)
                 pt_mask = pt_mask | st_emp["_role_norm"].isin(PT_TOKENS)
             if "_estatus_norm" in st_emp.columns:
+                # if someone encodes FT/PT in employmentstatus, allow it too
+                ft_mask = ft_mask | st_emp["_estatus_norm"].isin(FT_TOKENS)
                 pt_mask = pt_mask | st_emp["_estatus_norm"].isin(PT_TOKENS)
+            ft_full_month = _all_month(st_emp, "statusstartdate","statusenddate", ms,me, mask=ft_mask)
             pt_full_month = (not ft_full_month) and _all_month(st_emp, "statusstartdate","statusenddate", ms,me, mask=pt_mask)
 
-        # Eligibility flags (employee)
+        # ----- ELIGIBILITY -----
         eligible_any=False; eligible_allmonth=False; eligible_mv_full=False
         if not el_emp.empty and {"eligibilitystartdate","eligibilityenddate"} <= set(el_emp.columns):
             eligible_any = _any_overlap(el_emp, "eligibilitystartdate","eligibilityenddate", ms,me)
@@ -348,23 +368,20 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=N
                 mv_mask = el_emp["minimumvaluecoverage"].fillna(False).astype(bool)
                 eligible_mv_full = _all_month(el_emp, "eligibilitystartdate","eligibilityenddate", ms,me, mask=mv_mask)
 
-        # Enrollment flags
+        # ----- ENROLLMENT -----
         enrolled_any=False; enrolled_allmonth=False
         if not en_emp.empty and {"enrollmentstartdate","enrollmentenddate"} <= set(en_emp.columns):
             en_mask = en_emp["isenrolled"].fillna(True) if "isenrolled" in en_emp.columns else pd.Series(True,index=en_emp.index)
             enrolled_any = _any_overlap(en_emp, "enrollmentstartdate","enrollmentenddate", ms,me, mask=en_mask)
             enrolled_allmonth = _all_month(en_emp, "enrollmentstartdate","enrollmentenddate", ms,me, mask=en_mask)
 
-        # Dependent offers: must be FULL MONTH for Line 14 scope
+        # ----- DEPENDENTS (full-month scope for L14) -----
         offer_spouse_full=False; offer_child_full=False
         if not de_emp.empty and {"dependentrelationship","eligiblestartdate","eligibleenddate"} <= set(de_emp.columns):
             offer_spouse_full = _all_month(de_emp, "eligiblestartdate","eligibleenddate", ms,me, mask=de_emp["dependentrelationship"].eq("Spouse"))
             offer_child_full  = _all_month(de_emp, "eligiblestartdate","eligibleenddate", ms,me, mask=de_emp["dependentrelationship"].eq("Child"))
 
-        # Waiting period proxy: employed & FT but not yet eligible in the month
         waitingperiod_month = bool(employed and ft_full_month and not eligible_any)
-
-        # Monthly employee cost (for 1A vs 1E)
         monthly_cost = _pick_monthly_deduction(pay, emp, ms, me)
 
         # ----- LINE 14 -----
@@ -409,7 +426,7 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=N
         flags.append({
             "employed": employed,
             "ft": ft_full_month,
-            "parttime": pt_full_month,   # informational
+            "parttime": pt_full_month,
             "eligibleforcoverage": eligible_any,
             "eligible_allmonth": eligible_allmonth,
             "eligible_mv": eligible_mv_full,
@@ -433,7 +450,7 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=N
     keep = [c for c in base_cols if c in interim.columns] + [c for c in flag_cols if c in interim.columns]
     interim = interim[keep]
 
-    # Hard safety: ensure 1 row per (EmployeeID, Year, Month)
+    # Safety: ensure exactly one row per EmployeeID × Year × Month
     interim = interim.drop_duplicates(subset=["employeeid","year","monthnum"]).sort_values(
         ["employeeid","year","monthnum"]
     ).reset_index(drop=True)
