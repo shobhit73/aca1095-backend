@@ -1,3 +1,4 @@
+# main_fastapi.py
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -6,7 +7,8 @@ import pandas as pd
 
 from aca_core import (
     load_excel, prepare_inputs, choose_report_year, build_interim, build_final,
-    save_excel_outputs, fill_pdf_for_employee, MONTHS, _coerce_str
+    save_excel_outputs, fill_pdf_for_employee, MONTHS, _coerce_str,
+    build_penalty_dashboard,   # <-- NEW IMPORT
 )
 
 app = FastAPI(title="ACA-1095 Builder API", version="1.0.0")
@@ -31,6 +33,7 @@ async def require_api_key(request: Request):
 async def health():
     return {"ok": True}
 
+# -------- Excel -> Interim/Final (+Penalty Dashboard) --------
 @app.post("/process/excel", dependencies=[Depends(require_api_key)])
 async def process_excel(excel: UploadFile = File(...)):
     if not excel.filename.lower().endswith(".xlsx"):
@@ -38,20 +41,31 @@ async def process_excel(excel: UploadFile = File(...)):
     excel_bytes = await excel.read()
     try:
         data = load_excel(excel_bytes)
-        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, _ = prepare_inputs(data)
+        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(data)
         year_used = choose_report_year(emp_elig)
-        interim_df = build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used)
-        final_df = build_final(interim_df)
-        out_bytes = save_excel_outputs(interim_df, final_df, year_used)
+        interim_df = build_interim(
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
+            year=year_used, pay_deductions=pay_deductions
+        )
+        final_df   = build_final(interim_df)
+        penalty_df = build_penalty_dashboard(interim_df)   # <-- NEW
+
+        # Write 3 sheets: Final, Interim, Penalty Dashboard
+        out_bytes = save_excel_outputs(
+            interim_df, final_df, year_used, penalty_dashboard=penalty_df  # <-- NEW
+        )
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Failed to process Excel: {e}")
 
-    fname = f"final_and_interim_{year_used}.xlsx"
+    fname = f"final_interim_penalty_{year_used}.xlsx"
     headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
-    return StreamingResponse(io.BytesIO(out_bytes),
-                             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                             headers=headers)
+    return StreamingResponse(
+        io.BytesIO(out_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers
+    )
 
+# -------- Single PDF fill --------
 @app.post("/generate/single", dependencies=[Depends(require_api_key)])
 async def generate_single(
     excel: UploadFile = File(...),
@@ -67,7 +81,7 @@ async def generate_single(
 
     try:
         data = load_excel(excel_bytes)
-        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, _ = prepare_inputs(data)
+        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(data)
         if emp_demo.empty:
             raise HTTPException(status_code=422, detail="No employees in Emp Demographic")
 
@@ -79,7 +93,10 @@ async def generate_single(
             raise HTTPException(status_code=404, detail=f"EmployeeID {employee_id} not found")
 
         year_used = choose_report_year(emp_elig)
-        interim_df = build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used)
+        interim_df = build_interim(
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
+            year=year_used, pay_deductions=pay_deductions
+        )
         final_df = build_final(interim_df)
 
         emp_final = final_df[final_df["EmployeeID"].astype(str)==str(employee_id)].copy()
@@ -107,6 +124,7 @@ async def generate_single(
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"PDF generation failed: {e}")
 
+# -------- Bulk PDF fill --------
 @app.post("/generate/bulk", dependencies=[Depends(require_api_key)])
 async def generate_bulk(
     excel: UploadFile = File(...),
@@ -121,7 +139,7 @@ async def generate_bulk(
 
     try:
         data = load_excel(excel_bytes)
-        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, _ = prepare_inputs(data)
+        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(data)
         if emp_demo.empty:
             raise HTTPException(status_code=422, detail="No employees in Emp Demographic")
 
@@ -133,14 +151,17 @@ async def generate_bulk(
         else:
             ids = all_ids
 
-        interim_df = build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used)
+        interim_df = build_interim(
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
+            year=year_used, pay_deductions=pay_deductions
+        )
         final_df = build_final(interim_df)
 
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
             for eid in ids:
                 row = emp_demo[emp_demo["employeeid"].astype(str)==eid]
-                if row.empty: 
+                if row.empty:
                     continue
                 emp_final = final_df[final_df["EmployeeID"].astype(str)==eid].copy()
                 if emp_final.empty:
