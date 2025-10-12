@@ -112,7 +112,11 @@ def parse_date_safe(d, default_end: bool=False):
     return dt.date()
 
 def month_bounds(year:int, month:int):
-    return date(year, month, 1), _last_day_of_month(year, month)
+    # Harden inputs coming from UI/JSON like "2025" or 2025.0
+    y = _int_year(year, datetime.now().year)
+    m = int(float(month))
+    return date(y, m, 1), _last_day_of_month(y, m)
+
 
 def _any_overlap(df, start_col, end_col, m_start, m_end, mask=None) -> bool:
     if df.empty: return False
@@ -230,10 +234,16 @@ def choose_report_year(emp_elig: pd.DataFrame, fallback_to_current=True) -> int:
     for _,r in emp_elig.iterrows():
         s = pd.to_datetime(r.get("eligibilitystartdate"), errors="coerce")
         e = pd.to_datetime(r.get("eligibilityenddate"), errors="coerce")
-        if pd.isna(s) and pd.isna(e): continue
-        s = s or pd.Timestamp.min; e = e or pd.Timestamp.max
-        for y in range(s.year, e.year+1): counts[y]=counts.get(y,0)+1
-    return max(sorted(counts), key=lambda y:(counts[y], y)) if counts else (datetime.now().year if fallback_to_current else 2024)
+        if pd.isna(s) and pd.isna(e):
+            continue
+        s = s or pd.Timestamp.min
+        e = e or pd.Timestamp.max
+        sy = int(s.year)
+        ey = int(e.year)
+        for y in range(sy, ey + 1):  # ensure ints for range()
+            counts[y] = counts.get(y, 0) + 1
+    return max(sorted(counts), key=lambda y: (counts[y], y)) if counts else (datetime.now().year if fallback_to_current else 2024)
+
 
 def _collect_employee_ids(*dfs):
     ids=set()
@@ -530,6 +540,10 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=N
 
 def build_final(interim: pd.DataFrame) -> pd.DataFrame:
     df = interim.copy()
+        # coerce monthnum to int for safe sorting (handles 1.0 etc.)
+    if "monthnum" in df.columns:
+        df["monthnum"] = df["monthnum"].apply(lambda x: int(float(x)) if pd.notna(x) else x)
+
     out = df.loc[:, ["employeeid","month","line14_final","line16_final"]].rename(columns={
         "employeeid":"EmployeeID","month":"Month","line14_final":"Line14_Final","line16_final":"Line16_Final"
     })
@@ -574,6 +588,9 @@ def build_penalty_dashboard(interim: pd.DataFrame,
 
     df = interim.copy()
     df["EmployeeID"] = df["employeeid"]
+        # coerce monthnum to int for mapping to FULL_MONTHS
+    if "monthnum" in df.columns:
+        df["monthnum"] = df["monthnum"].apply(lambda x: int(float(x)) if pd.notna(x) else x)
     df["MonthFull"] = df["monthnum"].map(MONTHNUM_TO_FULL)
 
     cond_A = df["line14_final"].eq("1H")
