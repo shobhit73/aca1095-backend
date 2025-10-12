@@ -15,6 +15,11 @@ from reportlab.pdfgen import canvas
 # =========================
 TRUTHY = {"y","yes","true","t","1",1,True}
 FALSY  = {"n","no","false","f","0",0,False,None,np.nan}
+def _int_year(y, fallback=None):
+    try:
+        return int(float(y))
+    except Exception:
+        return fallback if fallback is not None else datetime.now().year
 
 # Canonical token sets (after normalization)
 FT_TOKENS = {"FT","FULLTIME","FTE","CATEGORY2","CAT2"}
@@ -239,6 +244,7 @@ def _collect_employee_ids(*dfs):
     return sorted(ids)
 
 def _grid_for_year(employee_ids, year:int) -> pd.DataFrame:
+    year = _int_year(year, datetime.now().year)  # <— ensure int
     recs=[]
     for emp in employee_ids:
         for m in range(1,13):
@@ -297,7 +303,9 @@ def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
 # Core: Interim / Final
 # =========================
 def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=None, pay_deductions=None) -> pd.DataFrame:
-    if year is None: year = choose_report_year(emp_elig)
+    if year is None:
+        year = choose_report_year(emp_elig)
+    year = _int_year(year, datetime.now().year) 
     employee_ids = _collect_employee_ids(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll)
     grid = _grid_for_year(employee_ids, year)
 
