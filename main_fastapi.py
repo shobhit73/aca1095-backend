@@ -5,10 +5,14 @@ from fastapi.responses import StreamingResponse
 import io, zipfile, json, os
 import pandas as pd
 
-from aca_core import (
-    load_excel, prepare_inputs, choose_report_year, build_interim, build_final,
-    save_excel_outputs, fill_pdf_for_employee, MONTHS, _coerce_str,
-    build_penalty_dashboard,   # <-- NEW IMPORT
+from aca_processing import (
+    load_excel, prepare_inputs, choose_report_year, MONTHS, _coerce_str
+)
+from aca_builder import (
+    build_interim, build_final, build_penalty_dashboard
+)
+from aca_pdf import (
+    save_excel_outputs, fill_pdf_for_employee
 )
 
 app = FastAPI(title="ACA-1095 Builder API", version="1.0.0")
