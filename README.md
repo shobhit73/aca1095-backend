@@ -1,7 +1,3 @@
-Here’s a clean, copy-pasteable **README.md** for your repo:
-
----
-
 # ACA 1095-C Builder
 
 End-to-end tool to turn a single Excel workbook into:
