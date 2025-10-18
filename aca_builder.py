@@ -220,6 +220,9 @@ def build_interim(
     """
     Returns a rich employee x month Interim with status/offer/enrollment/affordability flags
     and preliminary Line 14/16.
+
+    NOTE: eligible_mv is TRUE if PlanA is present EITHER in Eligibility OR in Enrollment
+    for the month (any overlap in the month).
     """
 
     # Defensive aliasing for alternate headers
@@ -265,11 +268,20 @@ def build_interim(
             elig_any   = _any_overlap(el_emp, "eligibilitystartdate","eligibilityenddate", ms, me) if not el_emp.empty else False
             elig_full  = _all_month(el_emp,  "eligibilitystartdate","eligibilityenddate", ms, me) if not el_emp.empty else False
 
+            # eligible_mv: TRUE if PlanA appears in Eligibility OR Enrollment for the month
             eligible_mv = False
+
             if "plancode" in el_emp.columns:
                 plan_u = el_emp["plancode"].astype(str).str.upper().str.strip()
-                mask = plan_u.eq("PLANA")
-                eligible_mv = _any_overlap(el_emp, "eligibilitystartdate","eligibilityenddate", ms, me, mask=mask)
+                eligible_mv |= _any_overlap(
+                    el_emp, "eligibilitystartdate","eligibilityenddate", ms, me, mask=plan_u.eq("PLANA")
+                )
+
+            if "plancode" in en_emp.columns:
+                plan_u2 = en_emp["plancode"].astype(str).str.upper().str.strip()
+                eligible_mv |= _any_overlap(
+                    en_emp, "enrollmentstartdate","enrollmentenddate", ms, me, mask=plan_u2.eq("PLANA")
+                )
 
             offer_ee_allmonth  = _offered_allmonth(el_emp, ms, me)
             offer_spouse       = _offer_spouse_any(el_emp, ms, me)
@@ -373,9 +385,6 @@ def build_final(interim_df: pd.DataFrame) -> pd.DataFrame:
     """
     Build the Final sheet expected by the PDF filler:
       EmployeeID, Month, Line14_Final, Line16_Final
-
-    If monthly codes are already on Interim (`line14_final`/`line16_final`), we reuse them.
-    Otherwise, we derive them from Interim flags using the same logic as above.
     """
     if interim_df is None or interim_df.empty:
         return pd.DataFrame(columns=["EmployeeID","Month","Line14_Final","Line16_Final"])
@@ -389,7 +398,7 @@ def build_final(interim_df: pd.DataFrame) -> pd.DataFrame:
         else:
             df["Month"] = pd.Categorical(MONTHS, categories=MONTHS, ordered=True)
 
-    # Prepare codes
+    # Use existing monthly codes or derive from flags
     if "line14_final" not in df.columns or "line16_final" not in df.columns:
         l14 = []
         l16 = []
