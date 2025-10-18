@@ -270,13 +270,11 @@ def build_interim(
 
             # eligible_mv: TRUE if PlanA appears in Eligibility OR Enrollment for the month
             eligible_mv = False
-
             if "plancode" in el_emp.columns:
                 plan_u = el_emp["plancode"].astype(str).str.upper().str.strip()
                 eligible_mv |= _any_overlap(
                     el_emp, "eligibilitystartdate","eligibilityenddate", ms, me, mask=plan_u.eq("PLANA")
                 )
-
             if "plancode" in en_emp.columns:
                 plan_u2 = en_emp["plancode"].astype(str).str.upper().str.strip()
                 eligible_mv |= _any_overlap(
@@ -290,10 +288,24 @@ def build_interim(
             # ---- enrollment flags
             enrolled_full = False
             if not en_emp.empty:
+                # start with all rows
                 mask_en = pd.Series(True, index=en_emp.index)
+
+                # honor IsEnrolled if present
                 if "isenrolled" in en_emp.columns:
-                    mask_en = en_emp["isenrolled"].astype(bool)
-                enrolled_full = _all_month(en_emp, "enrollmentstartdate","enrollmentenddate", ms, me, mask=mask_en)
+                    mask_en &= en_emp["isenrolled"].astype(bool)
+
+                # EXCLUDE "Waive" rows from counting as enrollment
+                waive_mask = pd.Series(False, index=en_emp.index)
+                for col in ("plancode", "planname"):
+                    if col in en_emp.columns:
+                        s = en_emp[col].astype(str).str.upper().str.strip()
+                        waive_mask |= s.eq("WAIVE")
+                mask_en &= ~waive_mask
+
+                enrolled_full = _all_month(
+                    en_emp, "enrollmentstartdate","enrollmentenddate", ms, me, mask=mask_en
+                )
 
             # ---- dependents eligible/enrolled
             spouse_eligible = _dep_any(de_emp, ms, me, SPOUSE_REL, "eligible")
