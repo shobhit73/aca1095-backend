@@ -8,6 +8,7 @@ import pandas as pd
 
 from aca_processing import (
     MONTHS,
+    FULL_MONTHS,
     _collect_employee_ids, _grid_for_year, month_bounds,
     _any_overlap, _all_month,
     _status_from_demographic,
@@ -20,6 +21,16 @@ AFFORDABILITY_THRESHOLD = 50.00  # < $50 => affordable   (change to <= if you wa
 EMP_TIERS = ("EMP", "EMPFAM", "EMPSPOUSE")
 SPOUSE_TOKENS = ("SPOUSE",)      # detect spouse offer in eligibility tier text
 DEPEND_TOKENS = ("FAM", "CHILD", "DEPEND")  # detect dependents offer in tier text
+
+# Penalty amounts (per month)
+PENALTY_A_MONTHLY = 241.67  # No MEC offered
+PENALTY_B_MONTHLY = 362.50  # Waived unaffordable offer
+
+# How to break lines in the Reason cell:
+# False => newline (\n) for Excel (wrap text in cell)
+# True  => <br> for HTML rendering (web)
+USE_HTML_BREAKS = False
+BR = "<br>" if USE_HTML_BREAKS else "\n"
 
 
 # ------------------------------------------------------------
@@ -444,27 +455,142 @@ def build_final(interim_df: pd.DataFrame) -> pd.DataFrame:
 
 def build_penalty_dashboard(interim_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Simple rollup for visibility:
-      EmployeeID, Months_EligibleMV, Months_Affordable, Months_EligibleMV_NotAffordable
+    Output shape:
+      EmployeeID | Reason | January ... December
+
+    Monthly penalties:
+      Penalty A → offer_ee_allmonth == False → $PENALTY_A_MONTHLY
+      Penalty B → offer_ee_allmonth == True AND enrolled_allmonth == False AND affordable_plan == False
+                   → $PENALTY_B_MONTHLY
+      Else      → "-"
+
+    The Reason text explains *why* MEC was not offered in Penalty A months
+    (waiting period, not employed, not eligible), listing the specific months.
     """
     if interim_df is None or interim_df.empty:
-        return pd.DataFrame(columns=[
-            "EmployeeID","Months_EligibleMV","Months_Affordable","Months_EligibleMV_NotAffordable"
-        ])
+        return pd.DataFrame(columns=["EmployeeID", "Reason"] + MONTHS)
 
     df = interim_df.copy()
-    g = df.groupby("EmployeeID", dropna=False)
-    res = pd.DataFrame({
-        "Months_EligibleMV": g["eligible_mv"].sum(min_count=0),
-        "Months_Affordable": g["affordable_plan"].sum(min_count=0),
-    }).reset_index()
 
-    df["_mv_not_aff"] = df["eligible_mv"].astype(bool) & (~df["affordable_plan"].astype(bool))
-    mna = df.groupby("EmployeeID")["_mv_not_aff"].sum(min_count=0).reset_index(
-        name="Months_EligibleMV_NotAffordable"
+    # Ensure required flags exist
+    for col in ["offer_ee_allmonth", "enrolled_allmonth", "affordable_plan",
+                "waitingperiod_month", "employed", "eligibleforcoverage", "MonthNum"]:
+        if col not in df.columns:
+            # sensible defaults
+            df[col] = False if col != "MonthNum" else None
+
+    # helpers
+    def money(x: float) -> str:
+        return f"${x:,.2f}"
+
+    thr = float(AFFORDABILITY_THRESHOLD)
+    threshold_txt = f"${thr:,.0f}" if thr.is_integer() else f"${thr:,.2f}"
+
+    def fmt_month_list(idx_list: List[int]) -> str:
+        """Format a list of 1-based month indexes as 'January and February' / 'January, February, and March'."""
+        names = [FULL_MONTHS[i-1] for i in idx_list]
+        if not names:
+            return ""
+        if len(names) == 1:
+            return names[0]
+        if len(names) == 2:
+            return f"{names[0]} and {names[1]}"
+        return f"{', '.join(names[:-1])}, and {names[-1]}"
+
+    reason_b = (
+        f"Penalty B: Waived Unaffordable Coverage{BR}"
+        "The employee was offered minimum essential coverage (MEC), but the lowest-cost option for "
+        f"employee-only coverage was not affordable (>{threshold_txt}). The employee chose to waive "
+        "this unaffordable coverage."
     )
 
-    out = res.merge(mna, on="EmployeeID", how="left").fillna(0)
-    for c in ["Months_EligibleMV","Months_Affordable","Months_EligibleMV_NotAffordable"]:
-        out[c] = out[c].astype(int)
-    return out
+    rows = []
+    for emp, sub in df.groupby("EmployeeID", dropna=False):
+        # handy by-month lookup
+        by_m = {int(r["MonthNum"]): r for _, r in sub.iterrows() if pd.notna(r.get("MonthNum"))}
+
+        any_a = False
+        any_b = False
+        month_vals: List[str] = []
+
+        # collect Penalty A subreasons
+        months_a: List[int] = []
+        months_wait: List[int] = []
+        months_not_emp: List[int] = []
+        months_not_elig: List[int] = []
+        months_other: List[int] = []
+
+        for idx, mon in enumerate(MONTHS, start=1):
+            r = by_m.get(idx)
+            if r is None:
+                month_vals.append("-")
+                continue
+
+            offered_full  = bool(r.get("offer_ee_allmonth", False))
+            enrolled_full = bool(r.get("enrolled_allmonth", False))
+            affordable    = bool(r.get("affordable_plan", False))
+            waiting       = bool(r.get("waitingperiod_month", False))
+            employed      = bool(r.get("employed", False))
+            eligible      = bool(r.get("eligibleforcoverage", False))
+
+            if not offered_full:
+                # Penalty A month
+                month_vals.append(money(PENALTY_A_MONTHLY))
+                any_a = True
+                months_a.append(idx)
+
+                # classify reason for "no MEC offered"
+                if not employed:
+                    months_not_emp.append(idx)
+                elif waiting:
+                    months_wait.append(idx)
+                elif not eligible:
+                    months_not_elig.append(idx)
+                else:
+                    months_other.append(idx)
+
+            elif offered_full and (not enrolled_full) and (not affordable):
+                # Penalty B month
+                month_vals.append(money(PENALTY_B_MONTHLY))
+                any_b = True
+            else:
+                month_vals.append("-")
+
+        if not any_a and not any_b:
+            # no penalties → omit
+            continue
+
+        if any_a:
+            # Build detailed A-reason text
+            sublines: List[str] = []
+            if months_not_emp:
+                sublines.append(
+                    f"No coverage could be offered in {fmt_month_list(months_not_emp)} because the employee was not employed."
+                )
+            if months_wait:
+                sublines.append(
+                    f"Employee was not eligible for coverage in {fmt_month_list(months_wait)} because they were in their waiting period during those month(s)."
+                )
+            if months_not_elig:
+                sublines.append(
+                    f"Employee was not eligible for coverage in {fmt_month_list(months_not_elig)}."
+                )
+            if months_other:
+                sublines.append(
+                    f"No minimum essential coverage offer was recorded in {fmt_month_list(months_other)}."
+                )
+
+            reason = "Penalty A: No MEC offered"
+            if sublines:
+                reason = reason + BR + BR.join(sublines)
+        else:
+            reason = reason_b
+
+        rows.append({
+            "EmployeeID": str(emp),
+            "Reason": reason,
+            **dict(zip(MONTHS, month_vals))
+        })
+
+    cols = ["EmployeeID", "Reason"] + MONTHS
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
