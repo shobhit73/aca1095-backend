@@ -2,62 +2,16 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-import io, zipfile, json, os, importlib, types
+import io, zipfile, json, os
 import pandas as pd
 
 from aca_processing import (
     load_excel, prepare_inputs, choose_report_year, MONTHS, _coerce_str
 )
-
-# ---- Safe import for builder functions (avoids startup crash on missing symbols) ----
-def _load_builder():
-    m = importlib.import_module("aca_builder")
-    # required
-    if not hasattr(m, "build_interim"):
-        raise ImportError("aca_builder.build_interim is missing")
-
-    # optional (provide safe fallbacks so the API still boots)
-    if not hasattr(m, "build_final"):
-        def _final_stub(interim_df: pd.DataFrame) -> pd.DataFrame:
-            # Minimal shape expected by PDF filler
-            if interim_df is None or interim_df.empty:
-                return pd.DataFrame(columns=["EmployeeID","Month","Line14_Final","Line16_Final"])
-            df = interim_df.rename(columns={"employeeid":"EmployeeID","month":"Month","monthnum":"MonthNum"}).copy()
-            if "Month" not in df.columns and "MonthNum" in df.columns:
-                months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-                df["Month"] = df["MonthNum"].map(lambda i: months[int(i)-1])
-            out = df[["EmployeeID","Month"]].copy()
-            out["Line14_Final"] = ""
-            out["Line16_Final"] = ""
-            return out
-        m.build_final = _final_stub
-
-    if not hasattr(m, "build_penalty_dashboard"):
-        def _pen_stub(interim_df: pd.DataFrame) -> pd.DataFrame:
-            if interim_df is None or interim_df.empty:
-                return pd.DataFrame(columns=[
-                    "EmployeeID","Months_EligibleMV","Months_Affordable","Months_EligibleMV_NotAffordable"
-                ])
-            d = interim_df.rename(columns={"employeeid":"EmployeeID"}).copy()
-            g = d.groupby("EmployeeID")
-            res = pd.DataFrame({
-                "Months_EligibleMV": g["eligible_mv"].sum(min_count=0),
-                "Months_Affordable": g["affordable_plan"].sum(min_count=0),
-            }).reset_index()
-            d["_mv_not_aff"] = d["eligible_mv"].astype(bool) & (~d["affordable_plan"].astype(bool))
-            mna = d.groupby("EmployeeID")["_mv_not_aff"].sum(min_count=0).reset_index(name="Months_EligibleMV_NotAffordable")
-            out = res.merge(mna, on="EmployeeID", how="left").fillna(0)
-            for c in ["Months_EligibleMV","Months_Affordable","Months_EligibleMV_NotAffordable"]:
-                out[c] = out[c].astype(int)
-            return out
-        m.build_penalty_dashboard = _pen_stub
-
-    return m.build_interim, m.build_final, m.build_penalty_dashboard
-
-build_interim, build_final, build_penalty_dashboard = _load_builder()
-# -----------------------------------------------------------------------------
-
-from aca_pdf import (  # keep this import after the robust loader to simplify startup
+from aca_builder import (
+    build_interim, build_final, build_penalty_dashboard
+)
+from aca_pdf import (
     save_excel_outputs, fill_pdf_for_employee
 )
 
@@ -81,19 +35,7 @@ async def require_api_key(request: Request):
 
 @app.get("/health")
 async def health():
-    # Expose which builder funcs are present — handy for Render logs
-    try:
-        m = importlib.import_module("aca_builder")
-        return {
-            "ok": True,
-            "builder_has": {
-                "build_interim": hasattr(m, "build_interim"),
-                "build_final": hasattr(m, "build_final"),
-                "build_penalty_dashboard": hasattr(m, "build_penalty_dashboard"),
-            }
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    return {"ok": True}
 
 # -------- Excel -> Interim/Final (+Penalty Dashboard) --------
 @app.post("/process/excel", dependencies=[Depends(require_api_key)])
@@ -104,20 +46,18 @@ async def process_excel(excel: UploadFile = File(...)):
     try:
         data = load_excel(excel_bytes)
         emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(data)
-
         year_used = choose_report_year(emp_elig)
-
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
+            year=year_used, pay_deductions=pay_deductions
         )
         final_df   = build_final(interim_df)
-        penalty_df = build_penalty_dashboard(interim_df)
+        penalty_df = build_penalty_dashboard(interim_df)   # <-- NEW
 
+        # Write 3 sheets: Final, Interim, Penalty Dashboard
         out_bytes = save_excel_outputs(
-            interim_df, final_df, year_used, penalty_dashboard=penalty_df
+            interim_df, final_df, year_used, penalty_dashboard=penalty_df  # <-- NEW
         )
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Failed to process Excel: {e}")
 
@@ -157,19 +97,15 @@ async def generate_single(
             raise HTTPException(status_code=404, detail=f"EmployeeID {employee_id} not found")
 
         year_used = choose_report_year(emp_elig)
-
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
+            year=year_used, pay_deductions=pay_deductions
         )
         final_df = build_final(interim_df)
 
         emp_final = final_df[final_df["EmployeeID"].astype(str)==str(employee_id)].copy()
         if emp_final.empty:
-            emp_final = pd.DataFrame({
-                "Month": MONTHS,
-                "Line14_Final": ["" for _ in MONTHS],
-                "Line16_Final": ["" for _ in MONTHS]
-            })
+            emp_final = pd.DataFrame({"Month": MONTHS, "Line14_Final": ["" for _ in MONTHS], "Line16_Final": ["" for _ in MONTHS]})
 
         editable_name, editable_bytes, flat_name, flat_bytes = fill_pdf_for_employee(
             pdf_bytes, row.iloc[0], emp_final, year_used
@@ -220,7 +156,8 @@ async def generate_bulk(
             ids = all_ids
 
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
+            year=year_used, pay_deductions=pay_deductions
         )
         final_df = build_final(interim_df)
 
@@ -232,11 +169,7 @@ async def generate_bulk(
                     continue
                 emp_final = final_df[final_df["EmployeeID"].astype(str)==eid].copy()
                 if emp_final.empty:
-                    emp_final = pd.DataFrame({
-                        "Month": MONTHS,
-                        "Line14_Final": ["" for _ in MONTHS],
-                        "Line16_Final": ["" for _ in MONTHS]
-                    })
+                    emp_final = pd.DataFrame({"Month": MONTHS, "Line14_Final": ["" for _ in MONTHS], "Line16_Final": ["" for _ in MONTHS]})
                 _, _, flat_name, flat_bytes = fill_pdf_for_employee(pdf_bytes, row.iloc[0], emp_final, year_used)
                 z.writestr(flat_name, flat_bytes.getvalue())
         zip_buf.seek(0)
