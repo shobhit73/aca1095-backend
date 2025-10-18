@@ -19,14 +19,12 @@ from aca_processing import (
 # ------------------------------------------------------------
 AFFORDABILITY_THRESHOLD = 50.00  # < $50 => affordable   (change to <= if you want 50 to count)
 EMP_TIERS = ("EMP", "EMPFAM", "EMPSPOUSE")
-SPOUSE_TOKENS = ("SPOUSE",)      # detect spouse offer in eligibility tier text
-DEPEND_TOKENS = ("FAM", "CHILD", "DEPEND")  # detect dependents offer in tier text
 
 # Penalty amounts (per month)
 PENALTY_A_MONTHLY = 241.67  # No MEC offered
 PENALTY_B_MONTHLY = 362.50  # Waived unaffordable offer
 
-# How to break lines in the Reason cell:
+# Reason cell line breaks:
 # False => newline (\n) for Excel (wrap text in cell)
 # True  => <br> for HTML rendering (web)
 USE_HTML_BREAKS = False
@@ -54,7 +52,7 @@ def _apply_aliases(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------
-# Affordability helper (EMP tier)
+# Helpers
 # ------------------------------------------------------------
 def _latest_emp_cost_for_month(el_df: pd.DataFrame, ms, me) -> Optional[float]:
     """
@@ -84,55 +82,58 @@ def _latest_emp_cost_for_month(el_df: pd.DataFrame, ms, me) -> Optional[float]:
     return float(v) if not pd.isna(v) else None
 
 
-# ------------------------------------------------------------
-# Offer detection from Eligibility tiers
-# ------------------------------------------------------------
 def _offered_allmonth(el_emp: pd.DataFrame, ms, me) -> bool:
     """Employee-level offer for full month (any tier that includes employee)."""
     if el_emp.empty or "eligibilitytier" not in el_emp.columns:
         return False
     tiers = el_emp["eligibilitytier"].astype(str).str.upper().str.strip()
-    mask = tiers.isin(EMP_TIERS) | tiers.str.contains("EMP", na=False)
+    mask = tiers.str.contains("EMP", na=False)  # any EMP* tier implies employee offer
     return _all_month(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me, mask=mask)
 
-def _offer_spouse_any(el_emp: pd.DataFrame, ms, me) -> bool:
-    if el_emp.empty or "eligibilitytier" not in el_emp.columns:
+
+def _tier_offered_any(
+    df: pd.DataFrame,
+    tier_col: str,
+    tokens: Tuple[str, ...],
+    start_col: str,
+    end_col: str,
+    ms, me,
+    *,
+    require_enrolled: bool = False,   # when True, also require isenrolled True if present AND exclude Waive
+) -> bool:
+    """
+    TRUE if any row's <tier_col> contains any 'tokens' and date overlaps the month.
+    String matching is case-insensitive substring match.
+
+    If require_enrolled=True (for Enrollment checks):
+      - honors 'isenrolled' if present
+      - excludes rows where plancode/planname == 'WAIVE'
+    """
+    if df.empty or tier_col not in df.columns:
         return False
-    tiers = el_emp["eligibilitytier"].astype(str).str.upper().str.strip()
-    mask = pd.Series(False, index=el_emp.index)
-    for t in SPOUSE_TOKENS:
-        mask |= tiers.str.contains(t, na=False)
-    return _any_overlap(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me, mask=mask)
 
-def _offer_dependents_any(el_emp: pd.DataFrame, ms, me) -> bool:
-    if el_emp.empty or "eligibilitytier" not in el_emp.columns:
-        return False
-    tiers = el_emp["eligibilitytier"].astype(str).str.upper().str.strip()
-    mask = pd.Series(False, index=el_emp.index)
-    for t in DEPEND_TOKENS:
-        mask |= tiers.str.contains(t, na=False)
-    return _any_overlap(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me, mask=mask)
+    # base mask
+    mask = pd.Series(True, index=df.index)
 
+    if require_enrolled and "isenrolled" in df.columns:
+        mask &= df["isenrolled"].astype(bool)
 
-# ------------------------------------------------------------
-# Dependent eligibility/enrollment helpers
-# ------------------------------------------------------------
-def _dep_any(df: pd.DataFrame, ms, me, rel_tokens: Tuple[str, ...], flag_col: str) -> bool:
-    if df.empty or "dependentrelationship" not in df.columns or flag_col not in df.columns:
-        return False
-    rel = df["dependentrelationship"].astype(str).str.upper().str.strip()
-    mask_rel = pd.Series(False, index=df.index)
-    for t in rel_tokens:
-        mask_rel |= rel.str.contains(t, na=False)
-    mask_final = mask_rel & df[flag_col].astype(bool)
-    # choose the right date columns based on flag type
-    start_col = "eligiblestartdate" if flag_col == "eligible" else "enrollmentstartdate"
-    end_col   = "eligibleenddate"   if flag_col == "eligible" else "enrollmentenddate"
-    return _any_overlap(df, start_col, end_col, ms, me, mask=mask_final)
+    # exclude WAIVE rows from enrollment-based checks
+    if require_enrolled:
+        waive_mask = pd.Series(False, index=df.index)
+        for col in ("plancode", "planname"):
+            if col in df.columns:
+                s = df[col].astype(str).str.upper().str.strip()
+                waive_mask |= s.eq("WAIVE")
+        mask &= ~waive_mask
 
-# spouse/child tokens
-SPOUSE_REL = ("SPOUSE",)
-CHILD_REL  = ("CHILD","SON","DAUGHTER","DEPEND")
+    tiers = df[tier_col].astype(str).str.upper().str.strip()
+    tok_mask = pd.Series(False, index=df.index)
+    for t in tokens:
+        tok_mask |= tiers.str.contains(t, na=False)
+    mask &= tok_mask
+
+    return _any_overlap(df, start_col, end_col, ms, me, mask=mask)
 
 
 # ------------------------------------------------------------
@@ -234,6 +235,14 @@ def build_interim(
 
     NOTE: eligible_mv is TRUE if PlanA is present EITHER in Eligibility OR in Enrollment
     for the month (any overlap in the month).
+
+    NEW (per your spec):
+      spouse_eligible  : Eligibility. eligibilitytier has EMPFAM or EMPSPOUSE (any overlap)
+      child_eligible   : Eligibility. eligibilitytier has EMPFAM or EMPCHILD  (any overlap)
+      spouse_enrolled  : Enrollment.  enrollmenttier has EMPFAM or EMPSPOUSE (any overlap, excluding WAIVE; honors isenrolled)
+      child_enrolled   : Enrollment.  enrollmenttier has EMPFAM or EMPCHILD  (any overlap, excluding WAIVE; honors isenrolled)
+      offer_spouse     : spouse_eligible OR spouse_enrolled
+      offer_dependents : child_eligible  OR child_enrolled
     """
 
     # Defensive aliasing for alternate headers
@@ -293,36 +302,50 @@ def build_interim(
                 )
 
             offer_ee_allmonth  = _offered_allmonth(el_emp, ms, me)
-            offer_spouse       = _offer_spouse_any(el_emp, ms, me)
-            offer_dependents   = _offer_dependents_any(el_emp, ms, me)
 
-            # ---- enrollment flags
+            # ---- enrollment flags (for full-month enrollment, excluding "Waive")
             enrolled_full = False
             if not en_emp.empty:
-                # start with all rows
                 mask_en = pd.Series(True, index=en_emp.index)
-
-                # honor IsEnrolled if present
                 if "isenrolled" in en_emp.columns:
                     mask_en &= en_emp["isenrolled"].astype(bool)
-
-                # EXCLUDE "Waive" rows from counting as enrollment
                 waive_mask = pd.Series(False, index=en_emp.index)
                 for col in ("plancode", "planname"):
                     if col in en_emp.columns:
                         s = en_emp[col].astype(str).str.upper().str.strip()
                         waive_mask |= s.eq("WAIVE")
                 mask_en &= ~waive_mask
-
                 enrolled_full = _all_month(
                     en_emp, "enrollmentstartdate","enrollmentenddate", ms, me, mask=mask_en
                 )
 
-            # ---- dependents eligible/enrolled
-            spouse_eligible = _dep_any(de_emp, ms, me, SPOUSE_REL, "eligible")
-            child_eligible  = _dep_any(de_emp, ms, me, CHILD_REL,  "eligible")
-            spouse_enrolled = _dep_any(de_emp, ms, me, SPOUSE_REL, "enrolled")
-            child_enrolled  = _dep_any(de_emp, ms, me, CHILD_REL,  "enrolled")
+            # ---- spouse/child eligibility from Emp Eligibility tiers
+            spouse_eligible = _tier_offered_any(
+                el_emp, "eligibilitytier", ("EMPFAM", "EMPSPOUSE"),
+                "eligibilitystartdate", "eligibilityenddate", ms, me,
+                require_enrolled=False
+            )
+            child_eligible = _tier_offered_any(
+                el_emp, "eligibilitytier", ("EMPFAM", "EMPCHILD"),
+                "eligibilitystartdate", "eligibilityenddate", ms, me,
+                require_enrolled=False
+            )
+
+            # ---- spouse/child enrollment from Emp Enrollment tiers (exclude WAIVE, honor isenrolled)
+            spouse_enrolled = _tier_offered_any(
+                en_emp, "enrollmenttier", ("EMPFAM", "EMPSPOUSE"),
+                "enrollmentstartdate", "enrollmentenddate", ms, me,
+                require_enrolled=True
+            )
+            child_enrolled = _tier_offered_any(
+                en_emp, "enrollmenttier", ("EMPFAM", "EMPCHILD"),
+                "enrollmentstartdate", "enrollmentenddate", ms, me,
+                require_enrolled=True
+            )
+
+            # ---- final dependent/spouse offer flags (eligibility OR enrollment)
+            offer_spouse     = spouse_eligible or spouse_enrolled
+            offer_dependents = child_eligible  or child_enrolled
 
             # ---- affordability
             emp_cost = _latest_emp_cost_for_month(el_emp, ms, me)
@@ -330,7 +353,6 @@ def build_interim(
             # To count $50 as affordable, change the comparator above to <=
 
             # ---- waiting period (simple heuristic)
-            # Employed this month, not yet eligible this month, and a future eligibility start exists.
             waiting = False
             if employed and not elig_any and not el_emp.empty and "eligibilitystartdate" in el_emp.columns:
                 future_starts = el_emp["eligibilitystartdate"].dropna()
@@ -366,13 +388,13 @@ def build_interim(
                 "offer_ee_allmonth": bool(offer_ee_allmonth),
                 "enrolled_allmonth": bool(enrolled_full),
 
-                "offer_spouse": bool(offer_spouse),
-                "offer_dependents": bool(offer_dependents),
-
+                # spouse/child flags per your rules
                 "spouse_eligible": bool(spouse_eligible),
                 "child_eligible": bool(child_eligible),
                 "spouse_enrolled": bool(spouse_enrolled),
                 "child_enrolled": bool(child_enrolled),
+                "offer_spouse": bool(offer_spouse),
+                "offer_dependents": bool(offer_dependents),
 
                 "waitingperiod_month": bool(waiting),
                 "affordable_plan": bool(affordable),
@@ -383,11 +405,16 @@ def build_interim(
 
     interim = pd.DataFrame(rows)
 
-    # Year-level 1G (never FT all year)
+    # Year-level '1G' code:
+    # Report 1G only if:
+    #   - Employee was NOT full-time in ANY month (never FT all year), AND
+    #   - They were enrolled in the employer's plan for AT LEAST ONE FULL MONTH.
     if not interim.empty:
-        ft_by_emp = interim.groupby("EmployeeID")["ft"].sum(min_count=0)
-        one_g = ft_by_emp == 0
-        interim["line14_all12"] = interim["EmployeeID"].map(lambda e: "1G" if bool(one_g.get(e, False)) else "")
+        ft_by_emp = interim.groupby("EmployeeID")["ft"].sum(min_count=0)  # count months marked FT
+        any_enrolled_full = interim.groupby("EmployeeID")["enrolled_allmonth"].any()
+        def code_1g(emp_id: str) -> str:
+            return "1G" if (ft_by_emp.get(emp_id, 0) == 0 and bool(any_enrolled_full.get(emp_id, False))) else ""
+        interim["line14_all12"] = interim["EmployeeID"].map(code_1g)
 
     # Consistent ordering
     order = [
@@ -487,7 +514,7 @@ def build_penalty_dashboard(interim_df: pd.DataFrame) -> pd.DataFrame:
     threshold_txt = f"${thr:,.0f}" if thr.is_integer() else f"${thr:,.2f}"
 
     def fmt_month_list(idx_list: List[int]) -> str:
-        """Format a list of 1-based month indexes as 'January and February' / 'January, February, and March'."""
+        """Format 1-based month indexes as 'January and February' / 'January, February, and March'."""
         names = [FULL_MONTHS[i-1] for i in idx_list]
         if not names:
             return ""
@@ -506,21 +533,18 @@ def build_penalty_dashboard(interim_df: pd.DataFrame) -> pd.DataFrame:
 
     rows = []
     for emp, sub in df.groupby("EmployeeID", dropna=False):
-        # handy by-month lookup
         by_m = {int(r["MonthNum"]): r for _, r in sub.iterrows() if pd.notna(r.get("MonthNum"))}
 
         any_a = False
         any_b = False
         month_vals: List[str] = []
 
-        # collect Penalty A subreasons
-        months_a: List[int] = []
         months_wait: List[int] = []
         months_not_emp: List[int] = []
         months_not_elig: List[int] = []
         months_other: List[int] = []
 
-        for idx, mon in enumerate(MONTHS, start=1):
+        for idx, _ in enumerate(MONTHS, start=1):
             r = by_m.get(idx)
             if r is None:
                 month_vals.append("-")
@@ -534,12 +558,9 @@ def build_penalty_dashboard(interim_df: pd.DataFrame) -> pd.DataFrame:
             eligible      = bool(r.get("eligibleforcoverage", False))
 
             if not offered_full:
-                # Penalty A month
                 month_vals.append(money(PENALTY_A_MONTHLY))
                 any_a = True
-                months_a.append(idx)
 
-                # classify reason for "no MEC offered"
                 if not employed:
                     months_not_emp.append(idx)
                 elif waiting:
@@ -550,18 +571,15 @@ def build_penalty_dashboard(interim_df: pd.DataFrame) -> pd.DataFrame:
                     months_other.append(idx)
 
             elif offered_full and (not enrolled_full) and (not affordable):
-                # Penalty B month
                 month_vals.append(money(PENALTY_B_MONTHLY))
                 any_b = True
             else:
                 month_vals.append("-")
 
         if not any_a and not any_b:
-            # no penalties → omit
             continue
 
         if any_a:
-            # Build detailed A-reason text
             sublines: List[str] = []
             if months_not_emp:
                 sublines.append(
