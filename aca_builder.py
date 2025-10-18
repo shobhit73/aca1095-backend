@@ -406,15 +406,23 @@ def build_interim(
     interim = pd.DataFrame(rows)
 
     # Year-level '1G' code:
-    # Report 1G only if:
-    #   - Employee was NOT full-time in ANY month (never FT all year), AND
-    #   - They were enrolled in the employer's plan for AT LEAST ONE FULL MONTH.
+    #  Report 1G only if:
+    #    - Employee was NOT full-time in ANY month (never FT all year), AND
+    #    - They were enrolled in the employer's plan for AT LEAST ONE FULL MONTH.
     if not interim.empty:
-        ft_by_emp = interim.groupby("EmployeeID")["ft"].sum(min_count=0)  # count months marked FT
-        any_enrolled_full = interim.groupby("EmployeeID")["enrolled_allmonth"].any()
+        ft_by_emp = interim.groupby("EmployeeID")["ft"].sum(min_count=0)              # how many months FT
+        any_enrolled_full = interim.groupby("EmployeeID")["enrolled_allmonth"].any()  # any full-month enrollment
+
         def code_1g(emp_id: str) -> str:
             return "1G" if (ft_by_emp.get(emp_id, 0) == 0 and bool(any_enrolled_full.get(emp_id, False))) else ""
+
         interim["line14_all12"] = interim["EmployeeID"].map(code_1g)
+
+        # If employee is 1G, blank out all monthly Line 14 codes
+        if "line14_final" in interim.columns:
+            one_g_emp_ids = set(interim.loc[interim["line14_all12"].eq("1G"), "EmployeeID"].unique())
+            if one_g_emp_ids:
+                interim.loc[interim["EmployeeID"].isin(one_g_emp_ids), "line14_final"] = ""
 
     # Consistent ordering
     order = [
