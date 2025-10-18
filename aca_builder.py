@@ -40,13 +40,17 @@ def _apply_aliases(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     cols = set(df.columns)
 
-    # EligiblePlan -> plancode
+    # EligiblePlan -> plancode  (Emp Eligibility)
     if "eligibleplan" in cols and "plancode" not in cols:
         df["plancode"] = df["eligibleplan"].astype(str).str.strip()
 
-    # EligibleTier -> eligibilitytier
+    # EligibleTier -> eligibilitytier  (Emp Eligibility)
     if "eligibletier" in cols and "eligibilitytier" not in cols:
         df["eligibilitytier"] = df["eligibletier"].astype(str).str.strip()
+
+    # NEW: Tier -> enrollmenttier  (Emp Enrollment)
+    if "tier" in cols and "enrollmenttier" not in cols:
+        df["enrollmenttier"] = df["tier"].astype(str).str.strip()
 
     return df
 
