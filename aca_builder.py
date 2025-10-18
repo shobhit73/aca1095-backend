@@ -10,7 +10,7 @@ from aca_processing import (
     MONTHS,
     _collect_employee_ids, _grid_for_year, month_bounds,
     _any_overlap, _all_month,
-    _status_from_demographic,   # available in aca_processing
+    _status_from_demographic,
 )
 
 # ------------------------------------------------------------
@@ -133,7 +133,6 @@ def _has_status_any(st_emp: pd.DataFrame, ms, me) -> bool:
 
 def _is_ft(st_emp: pd.DataFrame, ms, me) -> bool:
     if st_emp.empty: return False
-    # we rely on normalized tokens prepared in aca_processing
     tok_cols = [c for c in ["_estatus_norm","_role_norm"] if c in st_emp.columns]
     if not tok_cols:
         return False
@@ -156,16 +155,16 @@ def _is_pt(st_emp: pd.DataFrame, ms, me) -> bool:
 
 
 # ------------------------------------------------------------
-# Line 14/16 (simple UAT rules)
+# Line 14/16 (rules)
 # ------------------------------------------------------------
 def _month_line14(eligible_mv: bool, offer_ee_allmonth: bool, offer_spouse: bool,
                   offer_dependents: bool, affordable: bool) -> str:
     """
-    UAT simplification:
+    Simplified mapping:
       - If no full-month offer to employee → 1H
       - If MV offered (PlanA) full-month:
            if spouse+dependents also offered → 1A if affordable else 1E
-           else → 1E  (real IRS mapping might choose 1B/1C/1D; we simplify to 1E)
+           else → 1E
       - If no MV but full-month MEC offer → 1F
     """
     if not offer_ee_allmonth:
@@ -176,8 +175,33 @@ def _month_line14(eligible_mv: bool, offer_ee_allmonth: bool, offer_spouse: bool
         return "1E"
     return "1F"
 
-def _month_line16() -> str:
-    # Placeholder: leave blank for now (safe). Add safe-harbor rules here later.
+def _month_line16(
+    employed: bool,
+    enrolled_full: bool,
+    waiting: bool,
+    ft: bool,
+    offer_ee_allmonth: bool,
+    affordable: bool,
+) -> str:
+    """
+    Practical precedence:
+      2A: not employed any day this month
+      2C: enrolled in coverage for the entire month
+      2D: limited non-assessment period / waiting
+      2B: not full-time for the month
+      2H: rate-of-pay safe harbor (use affordable flag)
+      else: blank
+    """
+    if not employed:
+        return "2A"
+    if enrolled_full:
+        return "2C"
+    if waiting:
+        return "2D"
+    if not ft:
+        return "2B"
+    if offer_ee_allmonth and affordable:
+        return "2H"
     return ""
 
 
@@ -277,9 +301,16 @@ def build_interim(
                 future_starts = el_emp["eligibilitystartdate"].dropna()
                 waiting = (future_starts.dt.date > me).any()
 
-            # ---- UAT Line 14/16 (per month)
+            # ---- Line 14/16 (per month)
             l14 = _month_line14(eligible_mv, offer_ee_allmonth, offer_spouse, offer_dependents, affordable)
-            l16 = _month_line16()
+            l16 = _month_line16(
+                employed=bool(employed),
+                enrolled_full=bool(enrolled_full),
+                waiting=bool(waiting),
+                ft=bool(ft),
+                offer_ee_allmonth=bool(offer_ee_allmonth),
+                affordable=bool(affordable),
+            )
 
             rows.append({
                 "EmployeeID": str(emp),
@@ -344,7 +375,7 @@ def build_final(interim_df: pd.DataFrame) -> pd.DataFrame:
       EmployeeID, Month, Line14_Final, Line16_Final
 
     If monthly codes are already on Interim (`line14_final`/`line16_final`), we reuse them.
-    Otherwise, we derive them from Interim flags using the same UAT logic as above.
+    Otherwise, we derive them from Interim flags using the same logic as above.
     """
     if interim_df is None or interim_df.empty:
         return pd.DataFrame(columns=["EmployeeID","Month","Line14_Final","Line16_Final"])
@@ -360,7 +391,6 @@ def build_final(interim_df: pd.DataFrame) -> pd.DataFrame:
 
     # Prepare codes
     if "line14_final" not in df.columns or "line16_final" not in df.columns:
-        # derive if missing
         l14 = []
         l16 = []
         for _, r in df.iterrows():
@@ -371,7 +401,14 @@ def build_final(interim_df: pd.DataFrame) -> pd.DataFrame:
                 bool(r.get("offer_dependents")),
                 bool(r.get("affordable_plan")),
             ))
-            l16.append(_month_line16())
+            l16.append(_month_line16(
+                employed=bool(r.get("employed")),
+                enrolled_full=bool(r.get("enrolled_allmonth")),
+                waiting=bool(r.get("waitingperiod_month")),
+                ft=bool(r.get("ft")),
+                offer_ee_allmonth=bool(r.get("offer_ee_allmonth")),
+                affordable=bool(r.get("affordable_plan")),
+            ))
         df["line14_final"] = l14
         df["line16_final"] = l16
 
