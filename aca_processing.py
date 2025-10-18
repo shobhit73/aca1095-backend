@@ -218,31 +218,28 @@ def prepare_inputs(data: dict):
 
         elif sheet == "emp eligibility":
             # Base normalization
-            # (existing helpers)
             if "employeeid" in df.columns:
                 df["employeeid"] = df["employeeid"].astype(str).str.strip()
             for c in ("plancode","eligibilitytier","plancost"):
                 if c in df.columns:
                     df[c] = df[c].astype(str).str.strip()
 
-            # ---- NEW: handle common column-name variants from your workbook ----
+            # ---- Column-name variants from common workbooks ----
             # EligiblePlan  -> plancode
             if "eligibleplan" in df.columns and "plancode" not in df.columns:
                 df["plancode"] = df["eligibleplan"].astype(str).str.strip()
 
-            # EligibleTier -> eligibilitytier   (note the extra "ibili")
+            # EligibleTier -> eligibilitytier  (NOTE: normalized is 'eligibletier', not 'eligibletier')
             if "eligibletier" in df.columns and "eligibilitytier" not in df.columns:
                 df["eligibilitytier"] = df["eligibletier"].astype(str).str.strip()
 
-            # PlanCost already matches our expected name in your file
-            # but ensure numeric
+            # PlanCost -> numeric
             if "plancost" in df.columns:
                 df["plancost"] = pd.to_numeric(df["plancost"], errors="coerce")
 
             # Dates
             df = _parse_date_cols(df, ["eligibilitystartdate","eligibilityenddate"],
                                   default_end_cols=["eligibilityenddate"])
-
 
         elif sheet == "emp enrollment":
             df = _boolify(df, ["isenrolled"])
@@ -316,7 +313,7 @@ def _grid_for_year(employee_ids, year:int) -> pd.DataFrame:
     year = _int_year(year, datetime.now().year)
     recs=[]
     for emp in employee_ids:
-        for m in range(1,13):
+        for m in range(1,12+1):
             ms,me = month_bounds(year,m)
             recs.append({"employeeid":emp,"year":year,"monthnum":m,"month":ms.strftime("%b"),
                          "monthstart":ms,"monthend":me})
