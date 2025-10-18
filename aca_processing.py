@@ -217,13 +217,32 @@ def prepare_inputs(data: dict):
             df = _parse_date_cols(df, ["statusstartdate","statusenddate"], default_end_cols=["statusenddate"])
 
         elif sheet == "emp eligibility":
-            df = _boolify(df, ["iseligibleforcoverage"])
-            for c in ("plancode","eligibilitytier"):
+            # Base normalization
+            # (existing helpers)
+            if "employeeid" in df.columns:
+                df["employeeid"] = df["employeeid"].astype(str).str.strip()
+            for c in ("plancode","eligibilitytier","plancost"):
                 if c in df.columns:
                     df[c] = df[c].astype(str).str.strip()
+
+            # ---- NEW: handle common column-name variants from your workbook ----
+            # EligiblePlan  -> plancode
+            if "eligibleplan" in df.columns and "plancode" not in df.columns:
+                df["plancode"] = df["eligibleplan"].astype(str).str.strip()
+
+            # EligibleTier -> eligibilitytier   (note the extra "ibili")
+            if "eligibletier" in df.columns and "eligibilitytier" not in df.columns:
+                df["eligibilitytier"] = df["eligibletier"].astype(str).str.strip()
+
+            # PlanCost already matches our expected name in your file
+            # but ensure numeric
             if "plancost" in df.columns:
                 df["plancost"] = pd.to_numeric(df["plancost"], errors="coerce")
-            df = _parse_date_cols(df, ["eligibilitystartdate","eligibilityenddate"], default_end_cols=["eligibilityenddate"])
+
+            # Dates
+            df = _parse_date_cols(df, ["eligibilitystartdate","eligibilityenddate"],
+                                  default_end_cols=["eligibilityenddate"])
+
 
         elif sheet == "emp enrollment":
             df = _boolify(df, ["isenrolled"])
