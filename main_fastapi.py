@@ -37,29 +37,6 @@ async def require_api_key(request: Request):
 async def health():
     return {"ok": True}
 
-# ---------------- helpers ----------------
-def _find_empid_col(df: pd.DataFrame) -> str:
-    """
-    Find the employee id column even if the header varies, e.g. 'Employee ID', 'EmpID', etc.
-    """
-    if df is None or df.empty:
-        raise HTTPException(status_code=422, detail="Emp Demographic sheet is empty")
-
-    # exact match first
-    if "employeeid" in df.columns:
-        return "employeeid"
-
-    # normalized search
-    for c in df.columns:
-        norm = c.strip().lower().replace(" ", "").replace("-", "").replace("_", "")
-        if norm in {"employeeid", "employee_id", "empid", "emp_id", "id"}:
-            return c
-
-    raise HTTPException(
-        status_code=422,
-        detail=f"Emp Demographic sheet missing an EmployeeID column. Found columns: {list(df.columns)}"
-    )
-
 # -------- Excel -> Interim/Final (+Penalty Dashboard) --------
 @app.post("/process/excel", dependencies=[Depends(require_api_key)])
 async def process_excel(excel: UploadFile = File(...)):
@@ -69,24 +46,18 @@ async def process_excel(excel: UploadFile = File(...)):
     try:
         data = load_excel(excel_bytes)
         emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(data)
-
-        empid_col = _find_empid_col(emp_demo)
-
         year_used = choose_report_year(emp_elig)
-
-        # Option A: no pay_deductions kwarg
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
+            year=year_used, pay_deductions=pay_deductions
         )
         final_df   = build_final(interim_df)
-        penalty_df = build_penalty_dashboard(interim_df)
+        penalty_df = build_penalty_dashboard(interim_df)   # <-- NEW
 
         # Write 3 sheets: Final, Interim, Penalty Dashboard
         out_bytes = save_excel_outputs(
-            interim_df, final_df, year_used, penalty_dashboard=penalty_df
+            interim_df, final_df, year_used, penalty_dashboard=penalty_df  # <-- NEW
         )
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Failed to process Excel: {e}")
 
@@ -118,31 +89,24 @@ async def generate_single(
         if emp_demo.empty:
             raise HTTPException(status_code=422, detail="No employees in Emp Demographic")
 
-        empid_col = _find_empid_col(emp_demo)
-
         if not employee_id:
-            employee_id = _coerce_str(emp_demo[empid_col].iloc[0])
+            employee_id = _coerce_str(emp_demo["employeeid"].iloc[0])
 
-        row = emp_demo[emp_demo[empid_col].astype(str)==str(employee_id)]
+        row = emp_demo[emp_demo["employeeid"].astype(str)==str(employee_id)]
         if row.empty:
             raise HTTPException(status_code=404, detail=f"EmployeeID {employee_id} not found")
 
         year_used = choose_report_year(emp_elig)
-
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
+            year=year_used, pay_deductions=pay_deductions
         )
         final_df = build_final(interim_df)
 
         emp_final = final_df[final_df["EmployeeID"].astype(str)==str(employee_id)].copy()
         if emp_final.empty:
-            emp_final = pd.DataFrame({
-                "Month": MONTHS,
-                "Line14_Final": ["" for _ in MONTHS],
-                "Line16_Final": ["" for _ in MONTHS]
-            })
+            emp_final = pd.DataFrame({"Month": MONTHS, "Line14_Final": ["" for _ in MONTHS], "Line16_Final": ["" for _ in MONTHS]})
 
-        # You may optionally pass per-employee enrollment slices to fill Part III.
         editable_name, editable_bytes, flat_name, flat_bytes = fill_pdf_for_employee(
             pdf_bytes, row.iloc[0], emp_final, year_used
         )
@@ -183,10 +147,8 @@ async def generate_bulk(
         if emp_demo.empty:
             raise HTTPException(status_code=422, detail="No employees in Emp Demographic")
 
-        empid_col = _find_empid_col(emp_demo)
-
         year_used = choose_report_year(emp_elig)
-        all_ids = list(map(str, emp_demo[empid_col].astype(str).unique()))
+        all_ids = list(map(str, emp_demo["employeeid"].astype(str).unique()))
         if employee_ids:
             import json as _json
             ids = list(map(str, _json.loads(employee_ids)))
@@ -194,23 +156,20 @@ async def generate_bulk(
             ids = all_ids
 
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
+            year=year_used, pay_deductions=pay_deductions
         )
         final_df = build_final(interim_df)
 
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
             for eid in ids:
-                row = emp_demo[emp_demo[empid_col].astype(str)==eid]
+                row = emp_demo[emp_demo["employeeid"].astype(str)==eid]
                 if row.empty:
                     continue
                 emp_final = final_df[final_df["EmployeeID"].astype(str)==eid].copy()
                 if emp_final.empty:
-                    emp_final = pd.DataFrame({
-                        "Month": MONTHS,
-                        "Line14_Final": ["" for _ in MONTHS],
-                        "Line16_Final": ["" for _ in MONTHS]
-                    })
+                    emp_final = pd.DataFrame({"Month": MONTHS, "Line14_Final": ["" for _ in MONTHS], "Line16_Final": ["" for _ in MONTHS]})
                 _, _, flat_name, flat_bytes = fill_pdf_for_employee(pdf_bytes, row.iloc[0], emp_final, year_used)
                 z.writestr(flat_name, flat_bytes.getvalue())
         zip_buf.seek(0)
