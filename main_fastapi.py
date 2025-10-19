@@ -46,18 +46,22 @@ async def process_excel(excel: UploadFile = File(...)):
     try:
         data = load_excel(excel_bytes)
         emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(data)
+
         year_used = choose_report_year(emp_elig)
+
+        # Option A: no pay_deductions kwarg
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
-            year=year_used, pay_deductions=pay_deductions
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
         )
         final_df   = build_final(interim_df)
-        penalty_df = build_penalty_dashboard(interim_df)   # <-- NEW
+        penalty_df = build_penalty_dashboard(interim_df)
 
         # Write 3 sheets: Final, Interim, Penalty Dashboard
         out_bytes = save_excel_outputs(
-            interim_df, final_df, year_used, penalty_dashboard=penalty_df  # <-- NEW
+            interim_df, final_df, year_used, penalty_dashboard=penalty_df
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Failed to process Excel: {e}")
 
@@ -97,16 +101,22 @@ async def generate_single(
             raise HTTPException(status_code=404, detail=f"EmployeeID {employee_id} not found")
 
         year_used = choose_report_year(emp_elig)
+
+        # Option A: no pay_deductions kwarg
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
-            year=year_used, pay_deductions=pay_deductions
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
         )
         final_df = build_final(interim_df)
 
         emp_final = final_df[final_df["EmployeeID"].astype(str)==str(employee_id)].copy()
         if emp_final.empty:
-            emp_final = pd.DataFrame({"Month": MONTHS, "Line14_Final": ["" for _ in MONTHS], "Line16_Final": ["" for _ in MONTHS]})
+            emp_final = pd.DataFrame({
+                "Month": MONTHS,
+                "Line14_Final": ["" for _ in MONTHS],
+                "Line16_Final": ["" for _ in MONTHS]
+            })
 
+        # You may optionally pass per-employee enrollment slices to fill Part III.
         editable_name, editable_bytes, flat_name, flat_bytes = fill_pdf_for_employee(
             pdf_bytes, row.iloc[0], emp_final, year_used
         )
@@ -155,9 +165,9 @@ async def generate_bulk(
         else:
             ids = all_ids
 
+        # Option A: no pay_deductions kwarg
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
-            year=year_used, pay_deductions=pay_deductions
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
         )
         final_df = build_final(interim_df)
 
@@ -169,7 +179,11 @@ async def generate_bulk(
                     continue
                 emp_final = final_df[final_df["EmployeeID"].astype(str)==eid].copy()
                 if emp_final.empty:
-                    emp_final = pd.DataFrame({"Month": MONTHS, "Line14_Final": ["" for _ in MONTHS], "Line16_Final": ["" for _ in MONTHS]})
+                    emp_final = pd.DataFrame({
+                        "Month": MONTHS,
+                        "Line14_Final": ["" for _ in MONTHS],
+                        "Line16_Final": ["" for _ in MONTHS]
+                    })
                 _, _, flat_name, flat_bytes = fill_pdf_for_employee(pdf_bytes, row.iloc[0], emp_final, year_used)
                 z.writestr(flat_name, flat_bytes.getvalue())
         zip_buf.seek(0)
