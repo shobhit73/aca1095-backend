@@ -1,8 +1,11 @@
+Here’s the complete **`aca_processing.py`** with the CSV-in-one-cell fallback added to `load_excel` and everything else intact.
+
+```python
 # aca_processing.py
 # 1) Input ingestion & cleaning (stable)
 # 2) Shared helpers/constants used by aca_builder.py and aca_pdf.py
 
-import io, re
+import io, re, csv
 from datetime import datetime, date, timedelta
 import numpy as np
 import pandas as pd
@@ -149,10 +152,47 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def load_excel(file_bytes: bytes) -> dict:
+    """
+    Robust Excel loader:
+    - Normalizes headers and common aliases.
+    - Auto-expands sheets that accidentally contain a whole CSV in one column.
+    """
     xls = pd.ExcelFile(io.BytesIO(file_bytes))
     out = {}
     for raw in xls.sheet_names:
-        df = pd.read_excel(xls, raw)
+        # read with dtype=object to preserve strings; avoids unintended type coercion
+        df = pd.read_excel(xls, raw, dtype=object)
+
+        # ---- CSV-in-a-single-column fallback (user upload issue) ----
+        # If the sheet has exactly 1 column and that header looks like a CSV header,
+        # expand it using csv.reader.
+        if df.shape[1] == 1:
+            only_col_name = str(df.columns[0])
+            looks_like_csv_header = (
+                ("," in only_col_name or ";" in only_col_name or "|" in only_col_name)
+                and any(tok in only_col_name.lower() for tok in ["employeeid", "firstname", "lastname", "ssn"])
+            )
+            if looks_like_csv_header:
+                headers = next(csv.reader([only_col_name]))
+                headers = [h.strip().strip('"').strip("'") for h in headers]
+
+                rows = []
+                col_vals = df.iloc[:, 0].astype(str).tolist()
+                for v in col_vals:
+                    if v is None or v.strip().lower() in {"", "nan", "none"}:
+                        parsed = []
+                    else:
+                        parsed = next(csv.reader([v]))
+                    # pad/trim to header length
+                    if len(parsed) < len(headers):
+                        parsed = parsed + [""] * (len(headers) - len(parsed))
+                    elif len(parsed) > len(headers):
+                        parsed = parsed[:len(headers)]
+                    rows.append(parsed)
+
+                df = pd.DataFrame(rows, columns=headers)
+
+        # ---- existing normalization ----
         df = normalize_columns(df)
         df = df.rename(columns={k:v for k,v in CANON_ALIASES.items() if k in df.columns})
         if "employeeid" in df.columns:
@@ -224,16 +264,16 @@ def prepare_inputs(data: dict):
                 if c in df.columns:
                     df[c] = df[c].astype(str).str.strip()
 
-            # ---- Column-name variants from common workbooks ----
+            # Handle variants from user workbooks
             # EligiblePlan  -> plancode
             if "eligibleplan" in df.columns and "plancode" not in df.columns:
                 df["plancode"] = df["eligibleplan"].astype(str).str.strip()
 
-            # EligibleTier -> eligibilitytier  (NOTE: normalized is 'eligibletier', not 'eligibletier')
+            # EligibleTier -> eligibilitytier
             if "eligibletier" in df.columns and "eligibilitytier" not in df.columns:
                 df["eligibilitytier"] = df["eligibletier"].astype(str).str.strip()
 
-            # PlanCost -> numeric
+            # PlanCost numeric
             if "plancost" in df.columns:
                 df["plancost"] = pd.to_numeric(df["plancost"], errors="coerce")
 
@@ -313,7 +353,7 @@ def _grid_for_year(employee_ids, year:int) -> pd.DataFrame:
     year = _int_year(year, datetime.now().year)
     recs=[]
     for emp in employee_ids:
-        for m in range(1,12+1):
+        for m in range(1,13):
             ms,me = month_bounds(year,m)
             recs.append({"employeeid":emp,"year":year,"monthnum":m,"month":ms.strftime("%b"),
                          "monthstart":ms,"monthend":me})
@@ -337,3 +377,4 @@ def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
     st["_estatus_norm"] = st["employmentstatus"].map(_norm_token)
     st = _parse_date_cols(st, ["statusstartdate","statusenddate"], default_end_cols=["statusenddate"])
     return st
+```
