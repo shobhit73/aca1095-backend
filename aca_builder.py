@@ -135,22 +135,56 @@ def _tier_offered_any(
     return _any_overlap(df, start_col, end_col, ms, me, mask=mask)
 
 
+# NEW: Enrollment full-month checker for spouse/child
+def _tier_enrolled_full_month(
+    en_df: pd.DataFrame,
+    tokens: Tuple[str, ...],
+    ms, me
+) -> bool:
+    """
+    TRUE only if enrolled the ENTIRE month in any tier matching tokens.
+    - honors isenrolled=True if exists
+    - excludes WAIVE rows
+    - requires full-month coverage (no partials)
+    """
+    if en_df is None or en_df.empty or "enrollmenttier" not in en_df.columns:
+        return False
+
+    mask = pd.Series(True, index=en_df.index)
+
+    if "isenrolled" in en_df.columns:
+        mask &= en_df["isenrolled"].astype(bool)
+
+    # exclude Waive rows
+    waive_mask = pd.Series(False, index=en_df.index)
+    for col in ("plancode", "planname"):
+        if col in en_df.columns:
+            s = en_df[col].astype(str).str.upper().str.strip()
+            waive_mask |= s.eq("WAIVE")
+    mask &= ~waive_mask
+
+    tiers = en_df["enrollmenttier"].astype(str).str.upper().str.strip()
+    tok_mask = pd.Series(False, index=en_df.index)
+    for t in tokens:
+        tok_mask |= tiers.str.contains(t, na=False)
+    mask &= tok_mask
+
+    return _all_month(en_df, "enrollmentstartdate", "enrollmentenddate", ms, me, mask=mask)
+
+
 # ------------------------------------------------------------
 # Status helpers (FT/PT/employed)
 # ------------------------------------------------------------
 def _is_employed_month(st_emp: pd.DataFrame, ms, me) -> bool:
     """
-    Employed logic (per your spec):
+    Employed logic:
       - If NO status row overlaps this month → employed = False.
       - If ANY overlapping row has EmploymentStatus = Terminated → employed = False for the whole month.
       - Otherwise → employed = True.
-
-    This ignores FT/PT (handled separately).
     """
     if st_emp.empty:
         return False
 
-    # Filter to rows that overlap the month at all
     overlaps = (
         st_emp["statusenddate"].fillna(pd.Timestamp.max).dt.date >= ms
     ) & (
@@ -159,15 +193,12 @@ def _is_employed_month(st_emp: pd.DataFrame, ms, me) -> bool:
     if not overlaps.any():
         return False
 
-    # If we have normalized EmploymentStatus, check for any 'Terminated' among overlapping rows
     if "_estatus_norm" in st_emp.columns:
         s = st_emp.loc[overlaps, "_estatus_norm"].astype(str)
-        # match 'TERMINATED' or shorthand 'TERM'
         any_term = s.str.contains("TERMINAT", na=False) | s.str.fullmatch("TERM", na=False)
         if any_term.any():
             return False
 
-    # Otherwise (or if no termination among overlaps), considered employed
     return True
 
 
@@ -176,12 +207,10 @@ def _is_ft(st_emp: pd.DataFrame, ms, me) -> bool:
     Full-time only if:
       - there is NO 'Terminated' status overlapping the month, and
       - Role shows FT (or FULLTIME) covering the ENTIRE month.
-    We rely on normalized role column `_role_norm` created in processing.
     """
     if st_emp.empty or "_role_norm" not in st_emp.columns:
         return False
 
-    # If any overlapping row is Terminated, FT must be False for the month
     if "_estatus_norm" in st_emp.columns:
         overlaps = (
             st_emp["statusenddate"].fillna(pd.Timestamp.max).dt.date >= ms
@@ -208,7 +237,6 @@ def _is_pt(st_emp: pd.DataFrame, ms, me) -> bool:
     if st_emp.empty or "_role_norm" not in st_emp.columns:
         return False
 
-    # If any overlapping row is Terminated, PT must be False for the month
     if "_estatus_norm" in st_emp.columns:
         overlaps = (
             st_emp["statusenddate"].fillna(pd.Timestamp.max).dt.date >= ms
@@ -227,7 +255,7 @@ def _is_pt(st_emp: pd.DataFrame, ms, me) -> bool:
 
 
 # ------------------------------------------------------------
-# NEW: eligible_mv helper (Eligibility sheet only, full-month PlanA, EMP/EMPFAM/EMPCHILD/EMPSPOUSE)
+# eligible_mv (Eligibility sheet only, full-month PlanA in allowed tiers)
 # ------------------------------------------------------------
 _ALLOWED_TIERS = {"EMP", "EMPFAM", "EMPCHILD", "EMPSPOUSE"}
 
@@ -321,17 +349,12 @@ def build_interim(
     Returns a rich employee x month Interim with status/offer/enrollment/affordability flags
     and preliminary Line 14/16.
 
-    NOTE: eligible_mv now uses ONLY Eligibility:
+    NOTE: eligible_mv uses ONLY Eligibility:
       - full-month PlanA eligibility in EMP/EMPFAM/EMPCHILD/EMPSPOUSE tiers.
       - if no eligibility rows exist for an employee, eligible_mv = False.
 
-    Spouse/child logic (unchanged):
-      spouse_eligible  : Eligibility. eligibilitytier has EMPFAM or EMPSPOUSE (any overlap)
-      child_eligible   : Eligibility. eligibilitytier has EMPFAM or EMPCHILD  (any overlap)
-      spouse_enrolled  : Enrollment.  enrollmenttier has EMPFAM or EMPSPOUSE (any overlap, excluding WAIVE; honors isenrolled)
-      child_enrolled   : Enrollment.  enrollmenttier has EMPFAM or EMPCHILD  (any overlap, excluding WAIVE; honors isenrolled)
-      offer_spouse     : spouse_eligible OR spouse_enrolled
-      offer_dependents : child_eligible  OR child_enrolled
+    spouse_enrolled/child_enrolled are TRUE only if enrolled the ENTIRE month
+    in EMPFAM/EMPSPOUSE or EMPFAM/EMPCHILD (no partials; WAIVE excluded).
     """
 
     # Defensive aliasing for alternate headers
@@ -382,7 +405,7 @@ def build_interim(
 
             offer_ee_allmonth  = _offered_allmonth(el_emp, ms, me)
 
-            # ---- enrollment flags (for full-month enrollment, excluding "Waive")
+            # ---- enrollment full-month (excluding "Waive")
             enrolled_full = False
             if not en_emp.empty:
                 mask_en = pd.Series(True, index=en_emp.index)
@@ -398,7 +421,7 @@ def build_interim(
                     en_emp, "enrollmentstartdate","enrollmentenddate", ms, me, mask=mask_en
                 )
 
-            # ---- spouse/child eligibility from Emp Eligibility tiers
+            # ---- spouse/child eligibility from Emp Eligibility tiers (any overlap)
             spouse_eligible = _tier_offered_any(
                 el_emp, "eligibilitytier", ("EMPFAM", "EMPSPOUSE"),
                 "eligibilitystartdate", "eligibilityenddate", ms, me,
@@ -410,17 +433,9 @@ def build_interim(
                 require_enrolled=False
             )
 
-            # ---- spouse/child enrollment from Emp Enrollment tiers (exclude WAIVE, honor isenrolled)
-            spouse_enrolled = _tier_offered_any(
-                en_emp, "enrollmenttier", ("EMPFAM", "EMPSPOUSE"),
-                "enrollmentstartdate", "enrollmentenddate", ms, me,
-                require_enrolled=True
-            )
-            child_enrolled = _tier_offered_any(
-                en_emp, "enrollmenttier", ("EMPFAM", "EMPCHILD"),
-                "enrollmentstartdate", "enrollmentenddate", ms, me,
-                require_enrolled=True
-            )
+            # ---- spouse/child enrollment from Emp Enrollment tiers (FULL MONTH)
+            spouse_enrolled = _tier_enrolled_full_month(en_emp, ("EMPFAM", "EMPSPOUSE"), ms, me)
+            child_enrolled  = _tier_enrolled_full_month(en_emp, ("EMPFAM", "EMPCHILD"),  ms, me)
 
             # ---- final dependent/spouse offer flags (eligibility OR enrollment)
             offer_spouse     = spouse_eligible or spouse_enrolled
@@ -467,13 +482,12 @@ def build_interim(
                 "offer_ee_allmonth": bool(offer_ee_allmonth),
                 "enrolled_allmonth": bool(enrolled_full),
 
-                # spouse/child flags per your rules
+                "offer_spouse": bool(offer_spouse),
+                "offer_dependents": bool(offer_dependents),
                 "spouse_eligible": bool(spouse_eligible),
                 "child_eligible": bool(child_eligible),
                 "spouse_enrolled": bool(spouse_enrolled),
                 "child_enrolled": bool(child_enrolled),
-                "offer_spouse": bool(offer_spouse),
-                "offer_dependents": bool(offer_dependents),
 
                 "waitingperiod_month": bool(waiting),
                 "affordable_plan": bool(affordable),
@@ -489,8 +503,8 @@ def build_interim(
     #    - Employee was NOT full-time in ANY month (never FT all year), AND
     #    - They were enrolled in the employer's plan for AT LEAST ONE FULL MONTH.
     if not interim.empty:
-        ft_by_emp = interim.groupby("EmployeeID")["ft"].sum(min_count=0)              # how many months FT
-        any_enrolled_full = interim.groupby("EmployeeID")["enrolled_allmonth"].any()  # any full-month enrollment
+        ft_by_emp = interim.groupby("EmployeeID")["ft"].sum(min_count=0)
+        any_enrolled_full = interim.groupby("EmployeeID")["enrolled_allmonth"].any()
 
         def code_1g(emp_id: str) -> str:
             return "1G" if (ft_by_emp.get(emp_id, 0) == 0 and bool(any_enrolled_full.get(emp_id, False))) else ""
