@@ -298,7 +298,7 @@ def build_interim(
             ms, me = month_bounds(year, m)
 
             # ---- status flags
-            employed   = _is_employed_full_month(st_emp, ms, me)
+            employed   = _is_employed_month(st_emp, ms, me)
             ft         = _is_ft(st_emp, ms, me)
             parttime   = (not ft) and _is_pt(st_emp, ms, me)
 
