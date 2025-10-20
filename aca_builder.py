@@ -9,7 +9,7 @@ import pandas as pd
 from aca_processing import (
     MONTHS,
     FULL_MONTHS,
-    _collect_employee_ids, _grid_for_year, month_bounds,
+    _collect_employee_ids, month_bounds,
     _any_overlap, _all_month,
     _status_from_demographic,
 )
@@ -18,7 +18,6 @@ from aca_processing import (
 # Config
 # ------------------------------------------------------------
 AFFORDABILITY_THRESHOLD = 50.00  # < $50 => affordable   (change to <= if you want 50 to count)
-EMP_TIERS = ("EMP", "EMPFAM", "EMPSPOUSE")
 
 # Penalty amounts (per month)
 PENALTY_A_MONTHLY = 241.67  # No MEC offered
@@ -83,7 +82,7 @@ def _latest_emp_cost_for_month(el_df: pd.DataFrame, ms, me) -> Optional[float]:
 
 
 def _offered_allmonth(el_emp: pd.DataFrame, ms, me) -> bool:
-    """Employee-level offer for full month (any tier that includes employee)."""
+    """Employee-level MEC offer for full month (any tier that includes employee)."""
     if el_emp.empty or "eligibilitytier" not in el_emp.columns:
         return False
     tiers = el_emp["eligibilitytier"].astype(str).str.upper().str.strip()
@@ -137,15 +136,22 @@ def _tier_offered_any(
 
 
 # ------------------------------------------------------------
-# Status helpers (FT/PT)
+# Status helpers (FT/PT/employed)
 # ------------------------------------------------------------
-def _has_status_any(st_emp: pd.DataFrame, ms, me) -> bool:
-    if st_emp.empty: return False
-    return _any_overlap(st_emp, "statusstartdate","statusenddate", ms, me)
+def _is_employed_full_month(st_emp: pd.DataFrame, ms, me) -> bool:
+    """
+    Employed only if there is ANY status row that covers the ENTIRE month.
+    (We don't filter by role text; LOA etc. still counts as employed.)
+    """
+    if st_emp.empty:
+        return False
+    return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me)
+
 
 def _is_ft(st_emp: pd.DataFrame, ms, me) -> bool:
     """
     Full-time only if Role shows FT (or FULLTIME) for the ENTIRE month.
+    We rely on normalized role column `_role_norm` created in processing.
     """
     if st_emp.empty or "_role_norm" not in st_emp.columns:
         return False
@@ -163,7 +169,6 @@ def _is_pt(st_emp: pd.DataFrame, ms, me) -> bool:
     s = st_emp["_role_norm"].astype(str)
     mask = s.str.contains("PARTTIME", na=False) | s.str.fullmatch("PT", na=False)
     return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
-
 
 
 # ------------------------------------------------------------
@@ -186,6 +191,7 @@ def _month_line14(eligible_mv: bool, offer_ee_allmonth: bool, offer_spouse: bool
             return "1A" if affordable else "1E"
         return "1E"
     return "1F"
+
 
 def _month_line16(
     employed: bool,
@@ -236,12 +242,13 @@ def build_interim(
     NOTE: eligible_mv is TRUE if PlanA is present EITHER in Eligibility OR in Enrollment
     for the month (any overlap in the month).
 
-    spouse_eligible  : Eligibility. eligibilitytier has EMPFAM or EMPSPOUSE (any overlap)
-    child_eligible   : Eligibility. eligibilitytier has EMPFAM or EMPCHILD  (any overlap)
-    spouse_enrolled  : Enrollment.  enrollmenttier has EMPFAM or EMPSPOUSE (any overlap, excluding WAIVE; honors isenrolled)
-    child_enrolled   : Enrollment.  enrollmenttier has EMPFAM or EMPCHILD  (any overlap, excluding WAIVE; honors isenrolled)
-    offer_spouse     : spouse_eligible OR spouse_enrolled
-    offer_dependents : child_eligible  OR child_enrolled
+    Spouse/child logic (your spec):
+      spouse_eligible  : Eligibility. eligibilitytier has EMPFAM or EMPSPOUSE (any overlap)
+      child_eligible   : Eligibility. eligibilitytier has EMPFAM or EMPCHILD  (any overlap)
+      spouse_enrolled  : Enrollment.  enrollmenttier has EMPFAM or EMPSPOUSE (any overlap, excluding WAIVE; honors isenrolled)
+      child_enrolled   : Enrollment.  enrollmenttier has EMPFAM or EMPCHILD  (any overlap, excluding WAIVE; honors isenrolled)
+      offer_spouse     : spouse_eligible OR spouse_enrolled
+      offer_dependents : child_eligible  OR child_enrolled
     """
 
     # Defensive aliasing for alternate headers
@@ -260,9 +267,9 @@ def build_interim(
                 if c in df.columns and not pd.api.types.is_datetime64_any_dtype(df[c]):
                     df[c] = pd.to_datetime(df[c], errors="coerce")
 
-    # Status table (fallback to demographic if Emp Status sheet is missing)
-    st = emp_status
-    if st is None or st.empty:
+    # Status table (fallback to demographic if Emp Status is missing)
+    st = emp_status if emp_status is not None else pd.DataFrame()
+    if st.empty:
         st = _status_from_demographic(emp_demo)
 
     # Build monthly rows
@@ -279,7 +286,7 @@ def build_interim(
             ms, me = month_bounds(year, m)
 
             # ---- status flags
-            employed   = _has_status_any(st_emp, ms, me)
+            employed   = _is_employed_full_month(st_emp, ms, me)
             ft         = _is_ft(st_emp, ms, me)
             parttime   = (not ft) and _is_pt(st_emp, ms, me)
 
@@ -351,15 +358,11 @@ def build_interim(
             affordable = (emp_cost is not None) and (emp_cost < AFFORDABILITY_THRESHOLD)
             # To count $50 as affordable, change the comparator above to <=
 
+            # ---- waiting period (simple heuristic)
             waiting = False
             if employed and not elig_any and not el_emp.empty and "eligibilitystartdate" in el_emp.columns:
-                starts = el_emp["eligibilitystartdate"].dropna().dt.date
-                if len(starts) > 0:
-                    first_start = starts.min()
-                    # Waiting ONLY if this month is strictly BEFORE the first eligibility start.
-                    # If the employee had eligibility earlier in the year, gaps are NOT waiting.
-                    waiting = ms < first_start
-
+                future_starts = el_emp["eligibilitystartdate"].dropna()
+                waiting = (future_starts.dt.date > me).any()
 
             # ---- Line 14/16 (per month)
             l14 = _month_line14(eligible_mv, offer_ee_allmonth, offer_spouse, offer_dependents, affordable)
@@ -409,9 +412,9 @@ def build_interim(
     interim = pd.DataFrame(rows)
 
     # Year-level '1G' code:
-    # Report 1G only if:
-    #   - Employee was NOT full-time in ANY month (never FT all year), AND
-    #   - They were enrolled in the employer's plan for AT LEAST ONE FULL MONTH.
+    #  Report 1G only if:
+    #    - Employee was NOT full-time in ANY month (never FT all year), AND
+    #    - They were enrolled in the employer's plan for AT LEAST ONE FULL MONTH.
     if not interim.empty:
         ft_by_emp = interim.groupby("EmployeeID")["ft"].sum(min_count=0)              # how many months FT
         any_enrolled_full = interim.groupby("EmployeeID")["enrolled_allmonth"].any()  # any full-month enrollment
@@ -516,7 +519,6 @@ def build_penalty_dashboard(interim_df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = False if col != "MonthNum" else None
 
-    # helpers
     def money(x: float) -> str:
         return f"${x:,.2f}"
 
@@ -524,9 +526,7 @@ def build_penalty_dashboard(interim_df: pd.DataFrame) -> pd.DataFrame:
     threshold_txt = f"${thr:,.0f}" if thr.is_integer() else f"${thr:,.2f}"
 
     def fmt_month_list(idx_list: List[int]) -> str:
-        """Format 1-based month indexes as 'January and February' / 'January, February, and March'."""
-        from aca_processing import FULL_MONTHS as _FULL
-        names = [ _FULL[i-1] for i in idx_list ]
+        names = [FULL_MONTHS[i-1] for i in idx_list]
         if not names:
             return ""
         if len(names) == 1:
