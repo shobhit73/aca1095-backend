@@ -173,11 +173,26 @@ def _is_employed_month(st_emp: pd.DataFrame, ms, me) -> bool:
 
 def _is_ft(st_emp: pd.DataFrame, ms, me) -> bool:
     """
-    Full-time only if Role shows FT (or FULLTIME) for the ENTIRE month.
-    We rely on normalized role column `_role_norm` created in processing.
+    Full-time only if:
+      - there is NO 'Terminated' status overlapping the month, and
+      - Role shows FT (or FULLTIME) covering the ENTIRE month.
     """
     if st_emp.empty or "_role_norm" not in st_emp.columns:
         return False
+
+    # If any overlapping row is Terminated, FT must be False for the month
+    if "_estatus_norm" in st_emp.columns:
+        overlaps = (
+            st_emp["statusenddate"].fillna(pd.Timestamp.max).dt.date >= ms
+        ) & (
+            st_emp["statusstartdate"].fillna(pd.Timestamp.min).dt.date <= me
+        )
+        if overlaps.any():
+            s = st_emp.loc[overlaps, "_estatus_norm"].astype(str)
+            any_term = s.str.contains("TERMINAT", na=False) | s.str.fullmatch("TERM", na=False)
+            if any_term.any():
+                return False
+
     s = st_emp["_role_norm"].astype(str)
     mask = s.str.contains("FULLTIME", na=False) | s.str.fullmatch("FT", na=False)
     return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
@@ -185,13 +200,30 @@ def _is_ft(st_emp: pd.DataFrame, ms, me) -> bool:
 
 def _is_pt(st_emp: pd.DataFrame, ms, me) -> bool:
     """
-    Part-time only if Role shows PT (or PARTTIME) for the ENTIRE month.
+    Part-time only if:
+      - there is NO 'Terminated' status overlapping the month, and
+      - Role shows PT (or PARTTIME) covering the ENTIRE month.
     """
     if st_emp.empty or "_role_norm" not in st_emp.columns:
         return False
+
+    # If any overlapping row is Terminated, PT must be False for the month
+    if "_estatus_norm" in st_emp.columns:
+        overlaps = (
+            st_emp["statusenddate"].fillna(pd.Timestamp.max).dt.date >= ms
+        ) & (
+            st_emp["statusstartdate"].fillna(pd.Timestamp.min).dt.date <= me
+        )
+        if overlaps.any():
+            s = st_emp.loc[overlaps, "_estatus_norm"].astype(str)
+            any_term = s.str.contains("TERMINAT", na=False) | s.str.fullmatch("TERM", na=False)
+            if any_term.any():
+                return False
+
     s = st_emp["_role_norm"].astype(str)
     mask = s.str.contains("PARTTIME", na=False) | s.str.fullmatch("PT", na=False)
     return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
+
 
 
 # ------------------------------------------------------------
