@@ -140,26 +140,35 @@ def _tier_offered_any(
 # ------------------------------------------------------------
 def _is_employed_month(st_emp: pd.DataFrame, ms, me) -> bool:
     """
-    Employed = True unless EmploymentStatus is TERMINATED for the ENTIRE month.
-    If _estatus_norm is missing, fall back to 'any overlap' of any status row.
+    Employed logic (per your spec):
+      - If NO status row overlaps this month → employed = False.
+      - If ANY overlapping row has EmploymentStatus = Terminated → employed = False for the whole month.
+      - Otherwise → employed = True.
+
+    This ignores FT/PT (handled separately).
     """
     if st_emp.empty:
         return False
 
-    # Prefer normalized EmploymentStatus if present
-    if "_estatus_norm" in st_emp.columns:
-        s = st_emp["_estatus_norm"].astype(str)
-        term_mask = s.str.contains("TERMINATED", na=False) | s.str.fullmatch("TERM", na=False)
+    # Filter to rows that overlap the month at all
+    overlaps = (
+        st_emp["statusenddate"].fillna(pd.Timestamp.max).dt.date >= ms
+    ) & (
+        st_emp["statusstartdate"].fillna(pd.Timestamp.min).dt.date <= me
+    )
+    if not overlaps.any():
+        return False
 
-        # If TERMINATED covers the full month → NOT employed for that month
-        if _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=term_mask):
+    # If we have normalized EmploymentStatus, check for any 'Terminated' among overlapping rows
+    if "_estatus_norm" in st_emp.columns:
+        s = st_emp.loc[overlaps, "_estatus_norm"].astype(str)
+        # match 'TERMINATED' or shorthand 'TERM'
+        any_term = s.str.contains("TERMINAT", na=False) | s.str.fullmatch("TERM", na=False)
+        if any_term.any():
             return False
 
-        # Otherwise, as long as ANY status overlaps this month, consider employed
-        return _any_overlap(st_emp, "statusstartdate", "statusenddate", ms, me)
-
-    # Fallback when _estatus_norm doesn’t exist: any overlap means employed
-    return _any_overlap(st_emp, "statusstartdate", "statusenddate", ms, me)
+    # Otherwise (or if no termination among overlaps), considered employed
+    return True
 
 
 def _is_ft(st_emp: pd.DataFrame, ms, me) -> bool:
