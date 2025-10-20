@@ -351,11 +351,15 @@ def build_interim(
             affordable = (emp_cost is not None) and (emp_cost < AFFORDABILITY_THRESHOLD)
             # To count $50 as affordable, change the comparator above to <=
 
-            # ---- waiting period (simple heuristic)
             waiting = False
             if employed and not elig_any and not el_emp.empty and "eligibilitystartdate" in el_emp.columns:
-                future_starts = el_emp["eligibilitystartdate"].dropna()
-                waiting = (future_starts.dt.date > me).any()
+                starts = el_emp["eligibilitystartdate"].dropna().dt.date
+                if len(starts) > 0:
+                    first_start = starts.min()
+                    # Waiting ONLY if this month is strictly BEFORE the first eligibility start.
+                    # If the employee had eligibility earlier in the year, gaps are NOT waiting.
+                    waiting = ms < first_start
+
 
             # ---- Line 14/16 (per month)
             l14 = _month_line14(eligible_mv, offer_ee_allmonth, offer_spouse, offer_dependents, affordable)
