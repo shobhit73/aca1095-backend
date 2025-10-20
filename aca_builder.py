@@ -176,6 +176,7 @@ def _is_ft(st_emp: pd.DataFrame, ms, me) -> bool:
     Full-time only if:
       - there is NO 'Terminated' status overlapping the month, and
       - Role shows FT (or FULLTIME) covering the ENTIRE month.
+    We rely on normalized role column `_role_norm` created in processing.
     """
     if st_emp.empty or "_role_norm" not in st_emp.columns:
         return False
@@ -224,6 +225,32 @@ def _is_pt(st_emp: pd.DataFrame, ms, me) -> bool:
     mask = s.str.contains("PARTTIME", na=False) | s.str.fullmatch("PT", na=False)
     return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
 
+
+# ------------------------------------------------------------
+# NEW: eligible_mv helper (Eligibility sheet only, full-month PlanA, EMP/EMPFAM/EMPCHILD/EMPSPOUSE)
+# ------------------------------------------------------------
+_ALLOWED_TIERS = {"EMP", "EMPFAM", "EMPCHILD", "EMPSPOUSE"}
+
+def _eligible_mv_full_month(el_emp: pd.DataFrame, ms, me) -> bool:
+    """
+    True iff:
+      - employee has eligibility rows (else False),
+      - PlanCode == PlanA,
+      - eligibility tier in {EMP, EMPFAM, EMPCHILD, EMPSPOUSE},
+      - and the above holds for the ENTIRE month.
+    Enrollment is NOT considered here.
+    """
+    if el_emp is None or el_emp.empty:
+        return False
+    need = {"eligibilitystartdate","eligibilityenddate","plancode","eligibilitytier"}
+    if not need <= set(el_emp.columns):
+        return False
+
+    plan_u = el_emp["plancode"].astype(str).str.upper().str.strip()
+    tier_u = el_emp["eligibilitytier"].astype(str).str.upper().str.strip()
+
+    mask = plan_u.eq("PLANA") & tier_u.isin(_ALLOWED_TIERS)
+    return _all_month(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me, mask=mask)
 
 
 # ------------------------------------------------------------
@@ -294,10 +321,11 @@ def build_interim(
     Returns a rich employee x month Interim with status/offer/enrollment/affordability flags
     and preliminary Line 14/16.
 
-    NOTE: eligible_mv is TRUE if PlanA is present EITHER in Eligibility OR in Enrollment
-    for the month (any overlap in the month).
+    NOTE: eligible_mv now uses ONLY Eligibility:
+      - full-month PlanA eligibility in EMP/EMPFAM/EMPCHILD/EMPSPOUSE tiers.
+      - if no eligibility rows exist for an employee, eligible_mv = False.
 
-    Spouse/child logic:
+    Spouse/child logic (unchanged):
       spouse_eligible  : Eligibility. eligibilitytier has EMPFAM or EMPSPOUSE (any overlap)
       child_eligible   : Eligibility. eligibilitytier has EMPFAM or EMPCHILD  (any overlap)
       spouse_enrolled  : Enrollment.  enrollmenttier has EMPFAM or EMPSPOUSE (any overlap, excluding WAIVE; honors isenrolled)
@@ -349,18 +377,8 @@ def build_interim(
             elig_any   = _any_overlap(el_emp, "eligibilitystartdate","eligibilityenddate", ms, me) if not el_emp.empty else False
             elig_full  = _all_month(el_emp,  "eligibilitystartdate","eligibilityenddate", ms, me) if not el_emp.empty else False
 
-            # eligible_mv: TRUE if PlanA appears in Eligibility OR Enrollment for the month
-            eligible_mv = False
-            if "plancode" in el_emp.columns:
-                plan_u = el_emp["plancode"].astype(str).str.upper().str.strip()
-                eligible_mv |= _any_overlap(
-                    el_emp, "eligibilitystartdate","eligibilityenddate", ms, me, mask=plan_u.eq("PLANA")
-                )
-            if "plancode" in en_emp.columns:
-                plan_u2 = en_emp["plancode"].astype(str).str.upper().str.strip()
-                eligible_mv |= _any_overlap(
-                    en_emp, "enrollmentstartdate","enrollmentenddate", ms, me, mask=plan_u2.eq("PLANA")
-                )
+            # eligible_mv (Eligibility sheet only; full-month PlanA in allowed tiers)
+            eligible_mv = _eligible_mv_full_month(el_emp, ms, me)
 
             offer_ee_allmonth  = _offered_allmonth(el_emp, ms, me)
 
