@@ -1,5 +1,5 @@
 # aca_processing.py
-# 1) Input ingestion & cleaning (stable)
+# 1) Input ingestion & cleaning
 # 2) Shared helpers/constants used by aca_builder.py and aca_pdf.py
 
 import io, re
@@ -36,7 +36,7 @@ EXPECTED_SHEETS = {
     ],
     "emp enrollment": [
         "employeeid","isenrolled","enrollmentstartdate","enrollmentenddate",
-        "plancode","enrollmenttier"
+        "plancode","enrollmenttier","planname"
     ],
     "dep enrollment": [
         "employeeid","dependentrelationship","eligible","enrolled",
@@ -129,14 +129,14 @@ def month_bounds(year:int, month:int):
     return date(y, m, 1), _last_day_of_month(y, m)
 
 def _any_overlap(df, start_col, end_col, m_start, m_end, mask=None) -> bool:
-    if df.empty: return False
+    if df is None or df.empty: return False
     _m = mask if mask is not None else pd.Series(True, index=df.index)
     s = df.loc[_m, start_col].fillna(pd.Timestamp.min).dt.date
     e = df.loc[_m, end_col].fillna(pd.Timestamp.max).dt.date
     return bool(((e >= m_start) & (s <= m_end)).any())
 
 def _all_month(df, start_col, end_col, m_start, m_end, mask=None) -> bool:
-    if df.empty: return False
+    if df is None or df.empty: return False
     _m = mask if mask is not None else pd.Series(True, index=df.index)
     s = df.loc[_m, start_col].fillna(pd.Timestamp.min).dt.date
     e = df.loc[_m, end_col].fillna(pd.Timestamp.max).dt.date
@@ -220,30 +220,26 @@ def prepare_inputs(data: dict):
             # Base normalization
             if "employeeid" in df.columns:
                 df["employeeid"] = df["employeeid"].astype(str).str.strip()
+
             for c in ("plancode","eligibilitytier","plancost"):
                 if c in df.columns:
                     df[c] = df[c].astype(str).str.strip()
 
-            # ---- Column-name variants from common workbooks ----
-            # EligiblePlan  -> plancode
+            # Accept your workbook variants:
             if "eligibleplan" in df.columns and "plancode" not in df.columns:
                 df["plancode"] = df["eligibleplan"].astype(str).str.strip()
-
-            # EligibleTier -> eligibilitytier  (NOTE: normalized is 'eligibletier', not 'eligibletier')
             if "eligibletier" in df.columns and "eligibilitytier" not in df.columns:
                 df["eligibilitytier"] = df["eligibletier"].astype(str).str.strip()
 
-            # PlanCost -> numeric
             if "plancost" in df.columns:
                 df["plancost"] = pd.to_numeric(df["plancost"], errors="coerce")
 
-            # Dates
             df = _parse_date_cols(df, ["eligibilitystartdate","eligibilityenddate"],
                                   default_end_cols=["eligibilityenddate"])
 
         elif sheet == "emp enrollment":
             df = _boolify(df, ["isenrolled"])
-            for c in ("plancode","enrollmenttier"):
+            for c in ("plancode","enrollmenttier","planname"):
                 if c in df.columns:
                     df[c] = df[c].astype(str).str.strip()
             df = _parse_date_cols(df, ["enrollmentstartdate","enrollmentenddate"], default_end_cols=["enrollmentenddate"])
@@ -281,11 +277,9 @@ def choose_report_year(emp_elig: pd.DataFrame, fallback_to_current=True) -> int:
         s = pd.to_datetime(r.get("eligibilitystartdate"), errors="coerce")
         e = pd.to_datetime(r.get("eligibilityenddate"), errors="coerce")
 
-        # Skip rows with no bounds at all
         if pd.isna(s) and pd.isna(e):
             continue
 
-        # Establish safe year bounds
         if pd.isna(s) and not pd.isna(e):
             sy = ey = int(e.year)
         elif not pd.isna(s) and pd.isna(e):
@@ -313,7 +307,7 @@ def _grid_for_year(employee_ids, year:int) -> pd.DataFrame:
     year = _int_year(year, datetime.now().year)
     recs=[]
     for emp in employee_ids:
-        for m in range(1,12+1):
+        for m in range(1,13):
             ms,me = month_bounds(year,m)
             recs.append({"employeeid":emp,"year":year,"monthnum":m,"month":ms.strftime("%b"),
                          "monthstart":ms,"monthend":me})
