@@ -144,26 +144,42 @@ def _has_status_any(st_emp: pd.DataFrame, ms, me) -> bool:
     return _any_overlap(st_emp, "statusstartdate","statusenddate", ms, me)
 
 def _is_ft(st_emp: pd.DataFrame, ms, me) -> bool:
-    if st_emp.empty: return False
-    tok_cols = [c for c in ["_estatus_norm","_role_norm"] if c in st_emp.columns]
-    if not tok_cols:
+    """Prefer EmploymentStatus over Role. Only fall back to Role if EmploymentStatus is missing."""
+    if st_emp.empty:
         return False
-    mask = pd.Series(False, index=st_emp.index)
-    for c in tok_cols:
-        s = st_emp[c].astype(str)
-        mask |= s.str.contains("FULLTIME", na=False) | s.str.fullmatch("FT", na=False)
-    return _any_overlap(st_emp, "statusstartdate","statusenddate", ms, me, mask=mask)
+
+    # Prefer _estatus_norm if available
+    if "_estatus_norm" in st_emp.columns:
+        s = st_emp["_estatus_norm"].astype(str)
+        mask = s.str.contains("FULLTIME", na=False) | s.str.fullmatch("FT", na=False)
+        return _any_overlap(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
+
+    # Fallback to role, if no employment status text available
+    if "_role_norm" in st_emp.columns:
+        s = st_emp["_role_norm"].astype(str)
+        mask = s.str.contains("FULLTIME", na=False) | s.str.fullmatch("FT", na=False)
+        return _any_overlap(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
+
+    return False
+
 
 def _is_pt(st_emp: pd.DataFrame, ms, me) -> bool:
-    if st_emp.empty: return False
-    tok_cols = [c for c in ["_estatus_norm","_role_norm"] if c in st_emp.columns]
-    if not tok_cols:
+    """Prefer EmploymentStatus over Role for PT detection."""
+    if st_emp.empty:
         return False
-    mask = pd.Series(False, index=st_emp.index)
-    for c in tok_cols:
-        s = st_emp[c].astype(str)
-        mask |= s.str.contains("PARTTIME", na=False) | s.str.fullmatch("PT", na=False)
-    return _any_overlap(st_emp, "statusstartdate","statusenddate", ms, me, mask=mask)
+
+    if "_estatus_norm" in st_emp.columns:
+        s = st_emp["_estatus_norm"].astype(str)
+        mask = s.str.contains("PARTTIME", na=False) | s.str.fullmatch("PT", na=False)
+        return _any_overlap(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
+
+    if "_role_norm" in st_emp.columns:
+        s = st_emp["_role_norm"].astype(str)
+        mask = s.str.contains("PARTTIME", na=False) | s.str.fullmatch("PT", na=False)
+        return _any_overlap(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
+
+    return False
+
 
 
 # ------------------------------------------------------------
