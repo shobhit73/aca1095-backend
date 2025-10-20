@@ -2,31 +2,15 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-import io, zipfile, json, os
+import io, zipfile, os
 import pandas as pd
 
 from aca_processing import (
     load_excel, prepare_inputs, choose_report_year, MONTHS, _coerce_str
 )
-
-# ---- safe import of builder with fallback for build_final ----
-import aca_builder as _ab
-
-build_interim = _ab.build_interim
-build_penalty_dashboard = _ab.build_penalty_dashboard
-
-def _fallback_build_final(interim_df: pd.DataFrame) -> pd.DataFrame:
-    final_cols = ["EmployeeID","Month","line14_final","line16_final","line14_all12"]
-    out = interim_df.loc[:, final_cols].copy()
-    out = out.rename(columns={
-        "line14_final": "Line14_Final",
-        "line16_final": "Line16_Final",
-        "line14_all12": "Line14_All12",
-    })
-    return out
-
-build_final = getattr(_ab, "build_final", _fallback_build_final)
-
+from aca_builder import (
+    build_interim, build_final, build_penalty_dashboard
+)
 from aca_pdf import (
     save_excel_outputs, fill_pdf_for_employee
 )
@@ -38,7 +22,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["POST","GET","OPTIONS"],
+    allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -65,13 +49,13 @@ async def process_excel(excel: UploadFile = File(...)):
 
         year_used = choose_report_year(emp_elig)
 
+        # DO NOT pass pay_deductions here.
         interim_df = build_interim(
             emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
         )
         final_df   = build_final(interim_df)
         penalty_df = build_penalty_dashboard(interim_df)
 
-        # Write 3 sheets: Final, Interim, Penalty Dashboard
         out_bytes = save_excel_outputs(
             interim_df, final_df, year_used, penalty_dashboard=penalty_df
         )
@@ -111,7 +95,7 @@ async def generate_single(
         if not employee_id:
             employee_id = _coerce_str(emp_demo["employeeid"].iloc[0])
 
-        row = emp_demo[emp_demo["employeeid"].astype(str)==str(employee_id)]
+        row = emp_demo[emp_demo["employeeid"].astype(str) == str(employee_id)]
         if row.empty:
             raise HTTPException(status_code=404, detail=f"EmployeeID {employee_id} not found")
 
@@ -122,7 +106,7 @@ async def generate_single(
         )
         final_df = build_final(interim_df)
 
-        emp_final = final_df[final_df["EmployeeID"].astype(str)==str(employee_id)].copy()
+        emp_final = final_df[final_df["EmployeeID"].astype(str) == str(employee_id)].copy()
         if emp_final.empty:
             emp_final = pd.DataFrame({
                 "Month": MONTHS,
@@ -134,7 +118,7 @@ async def generate_single(
             pdf_bytes, row.iloc[0], emp_final, year_used
         )
 
-        if flattened_only.lower() in {"true","1","yes","y"}:
+        if flattened_only.lower() in {"true", "1", "yes", "y"}:
             headers = {"Content-Disposition": f'attachment; filename="{flat_name}"'}
             return StreamingResponse(io.BytesIO(flat_bytes.getvalue()), media_type="application/pdf", headers=headers)
 
@@ -143,7 +127,7 @@ async def generate_single(
             z.writestr(editable_name, editable_bytes.getvalue())
             z.writestr(flat_name, flat_bytes.getvalue())
         zip_buf.seek(0)
-        headers = {"Content-Disposition": f'attachment; filename="1095c_{employee_id}_{year_used}.zip"'}
+        headers = {"Content-Disposition": f'attachment; filename=\"1095c_{employee_id}_{year_used}.zip\"'}
         return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
 
     except HTTPException:
@@ -186,10 +170,10 @@ async def generate_bulk(
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
             for eid in ids:
-                row = emp_demo[emp_demo["employeeid"].astype(str)==eid]
+                row = emp_demo[emp_demo["employeeid"].astype(str) == eid]
                 if row.empty:
                     continue
-                emp_final = final_df[final_df["EmployeeID"].astype(str)==eid].copy()
+                emp_final = final_df[final_df["EmployeeID"].astype(str) == eid].copy()
                 if emp_final.empty:
                     emp_final = pd.DataFrame({
                         "Month": MONTHS,
@@ -199,7 +183,7 @@ async def generate_bulk(
                 _, _, flat_name, flat_bytes = fill_pdf_for_employee(pdf_bytes, row.iloc[0], emp_final, year_used)
                 z.writestr(flat_name, flat_bytes.getvalue())
         zip_buf.seek(0)
-        headers = {"Content-Disposition": f'attachment; filename="1095c_bulk_{year_used}.zip"'}
+        headers = {"Content-Disposition": f'attachment; filename=\"1095c_bulk_{year_used}.zip\"'}
         return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
 
     except HTTPException:
