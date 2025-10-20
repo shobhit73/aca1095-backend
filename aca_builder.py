@@ -145,32 +145,24 @@ def _has_status_any(st_emp: pd.DataFrame, ms, me) -> bool:
 
 def _is_ft(st_emp: pd.DataFrame, ms, me) -> bool:
     """
-    Full-time detection based on Role only.
-    Role examples: FT, FULLTIME. LOA/PT should NOT count as FT.
+    Full-time only if Role shows FT (or FULLTIME) for the ENTIRE month.
     """
-    if st_emp.empty:
-        return False
-    if "_role_norm" not in st_emp.columns:
+    if st_emp.empty or "_role_norm" not in st_emp.columns:
         return False
     s = st_emp["_role_norm"].astype(str)
-    # true if role indicates full-time
     mask = s.str.contains("FULLTIME", na=False) | s.str.fullmatch("FT", na=False)
-    return _any_overlap(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
+    return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
 
 
 def _is_pt(st_emp: pd.DataFrame, ms, me) -> bool:
     """
-    Part-time detection based on Role only.
-    Role examples: PT, PARTTIME.
+    Part-time only if Role shows PT (or PARTTIME) for the ENTIRE month.
     """
-    if st_emp.empty:
-        return False
-    if "_role_norm" not in st_emp.columns:
+    if st_emp.empty or "_role_norm" not in st_emp.columns:
         return False
     s = st_emp["_role_norm"].astype(str)
     mask = s.str.contains("PARTTIME", na=False) | s.str.fullmatch("PT", na=False)
-    return _any_overlap(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
-
+    return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
 
 
 
