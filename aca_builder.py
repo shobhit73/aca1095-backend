@@ -81,6 +81,19 @@ def _latest_emp_cost_for_month(el_df: pd.DataFrame, ms, me) -> Optional[float]:
     return float(v) if not pd.isna(v) else None
 
 
+    # If we have normalized employment statuses, check for month-long TERMINATED coverage
+    if "_estatus_norm" in st_emp.columns:
+        s = st_emp["_estatus_norm"].astype(str)
+        term_mask = s.str.contains("TERMINATED", na=False) | s.str.fullmatch("TERM", na=False)
+        # If TERMINATED covers the full month → NOT employed for that month
+        if _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=term_mask):
+            return False
+        # Otherwise, as long as there is any status overlap this month, consider employed
+        return _any_overlap(st_emp, "statusstartdate", "statusenddate", ms, me)
+
+    # Fallback: no status normalization available → employed if any overlap
+    return _any_overlap(st_emp, "statusstartdate", "statusenddate", ms, me)
+
 def _offered_allmonth(el_emp: pd.DataFrame, ms, me) -> bool:
     """Employee-level MEC offer for full month (any tier that includes employee)."""
     if el_emp.empty or "eligibilitytier" not in el_emp.columns:
@@ -138,15 +151,14 @@ def _tier_offered_any(
 # ------------------------------------------------------------
 # Status helpers (FT/PT/employed)
 # ------------------------------------------------------------
-def _is_employed_full_month(st_emp: pd.DataFrame, ms, me) -> bool:
+
+def _is_employed_month(st_emp: pd.DataFrame, ms, me) -> bool:
     """
-    Employed only if there is ANY status row that covers the ENTIRE month.
-    (We don't filter by role text; LOA etc. still counts as employed.)
+    Employed = True unless EmploymentStatus is TERMINATED for the ENTIRE month.
+    If _estatus_norm is missing, fall back to 'any overlap' of any status.
     """
     if st_emp.empty:
         return False
-    return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me)
-
 
 def _is_ft(st_emp: pd.DataFrame, ms, me) -> bool:
     """
