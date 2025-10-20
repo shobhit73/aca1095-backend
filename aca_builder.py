@@ -37,17 +37,26 @@ def _apply_aliases(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     df = df.copy()
-    cols = set(df.columns)
+
+    # Build a case-insensitive map of current columns
+    lower_map = {c.lower(): c for c in df.columns}
+    cols_lower = set(lower_map.keys())
 
     # EligiblePlan -> plancode
-    if "eligibleplan" in cols and "plancode" not in cols:
-        df["plancode"] = df["eligibleplan"].astype(str).str.strip()
+    if "eligibleplan" in cols_lower and "plancode" not in cols_lower:
+        df["plancode"] = df[lower_map["eligibleplan"]].astype(str).str.strip()
 
     # EligibleTier -> eligibilitytier
-    if "eligibletier" in cols and "eligibilitytier" not in cols:
-        df["eligibilitytier"] = df["eligibletier"].astype(str).str.strip()
+    if "eligibletier" in cols_lower and "eligibilitytier" not in cols_lower:
+        df["eligibilitytier"] = df[lower_map["eligibletier"]].astype(str).str.strip()
+
+    # Tier/TIER/tier -> enrollmenttier  (only if enrollmenttier not already present)
+    if "enrollmenttier" not in cols_lower and "tier" in cols_lower:
+        df["enrollmenttier"] = df[lower_map["tier"]].astype(str).str.strip()
 
     return df
+
+
 
 
 # ------------------------------------------------------------
@@ -146,8 +155,21 @@ def _tier_enrolled_full_month(
     - honors isenrolled=True if exists
     - excludes WAIVE rows
     - requires full-month coverage (no partials)
+    - accepts 'EnrollmentTier'/'enrollmenttier' or 'Tier'/'tier'
     """
-    if en_df is None or en_df.empty or "enrollmenttier" not in en_df.columns:
+    if en_df is None or en_df.empty:
+        return False
+
+    # find tier column case-insensitively
+    tier_col = None
+    for cand in ("enrollmenttier", "tier"):
+        for c in en_df.columns:
+            if c.lower() == cand:
+                tier_col = c
+                break
+        if tier_col:
+            break
+    if tier_col is None:
         return False
 
     mask = pd.Series(True, index=en_df.index)
@@ -163,13 +185,14 @@ def _tier_enrolled_full_month(
             waive_mask |= s.eq("WAIVE")
     mask &= ~waive_mask
 
-    tiers = en_df["enrollmenttier"].astype(str).str.upper().str.strip()
+    tiers = en_df[tier_col].astype(str).str.upper().str.strip()
     tok_mask = pd.Series(False, index=en_df.index)
     for t in tokens:
         tok_mask |= tiers.str.contains(t, na=False)
     mask &= tok_mask
 
-    return _all_month(en_df, "enrollmentstartdate", "enrollmentenddate", ms, me, mask=mask)
+    return _all_month(en_df, "enrollmentstartdate","enrollmentenddate", ms, me, mask=mask)
+
 
 
 # ------------------------------------------------------------
