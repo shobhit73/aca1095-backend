@@ -45,12 +45,15 @@ async def process_excel(excel: UploadFile = File(...)):
     excel_bytes = await excel.read()
     try:
         data = load_excel(excel_bytes)
-        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(data)
+        # NOTE: prepare_inputs now returns 7 values (includes Emp Wait Period)
+        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions, emp_wait = prepare_inputs(data)
+
         year_used = choose_report_year(emp_elig)
 
-        # build
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
+            year=year_used,
+            emp_wait=emp_wait,   # <-- pass wait-period table
         )
         final_df   = build_final(interim_df)
         penalty_df = build_penalty_dashboard(interim_df)
@@ -88,7 +91,7 @@ async def generate_single(
 
     try:
         data = load_excel(excel_bytes)
-        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(data)
+        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions, emp_wait = prepare_inputs(data)
         if emp_demo.empty:
             raise HTTPException(status_code=422, detail="No employees in Emp Demographic")
 
@@ -102,7 +105,9 @@ async def generate_single(
         year_used = choose_report_year(emp_elig)
 
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
+            year=year_used,
+            emp_wait=emp_wait,   # <-- pass wait-period table
         )
         final_df = build_final(interim_df)
 
@@ -150,7 +155,7 @@ async def generate_bulk(
 
     try:
         data = load_excel(excel_bytes)
-        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(data)
+        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions, emp_wait = prepare_inputs(data)
         if emp_demo.empty:
             raise HTTPException(status_code=422, detail="No employees in Emp Demographic")
 
@@ -163,7 +168,9 @@ async def generate_bulk(
             ids = all_ids
 
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
+            year=year_used,
+            emp_wait=emp_wait,   # <-- pass wait-period table
         )
         final_df = build_final(interim_df)
 
