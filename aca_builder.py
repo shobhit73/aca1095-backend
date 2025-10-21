@@ -247,6 +247,28 @@ def _enrolled_full_month_union(en_df: pd.DataFrame, ms, me) -> bool:
     return False
 
 
+def _month_in_wait_period(emp_wait_df: pd.DataFrame, ms, me) -> bool:
+    """
+    Return True if ANY wait-period interval overlaps [ms, me].
+    Each row defines an interval [EffectiveDate, EffectiveDate + wait_days - 1].
+    """
+    if emp_wait_df is None or emp_wait_df.empty:
+        return False
+    if "effectivedate" not in emp_wait_df.columns or "wait_days" not in emp_wait_df.columns:
+        return False
+
+    eff = emp_wait_df["effectivedate"]
+    days = emp_wait_df["wait_days"]
+    mask = eff.notna() & (pd.to_numeric(days, errors="coerce").fillna(0) > 0)
+    if not mask.any():
+        return False
+
+    starts = eff[mask].dt.date
+    ends = (eff[mask] + pd.to_timedelta(days[mask] - 1, unit="D")).dt.date
+
+    return bool(((ends >= ms) & (starts <= me)).any())
+
+
 # ------------------------------------------------------------
 # Status helpers (FT/PT/employed)
 # ------------------------------------------------------------
@@ -390,7 +412,7 @@ def _month_line16(
     Practical precedence:
       2A: not employed any day this month
       2C: enrolled in coverage for the entire month
-      2D: waiting period
+      2D: waiting period (applies only when there is NO full-month offer)
       2B: not full-time for the month
       2H: rate-of-pay safe harbor (use affordable flag)
       else: blank
@@ -399,7 +421,8 @@ def _month_line16(
         return "2A"
     if enrolled_full:
         return "2C"
-    if waiting:
+    # waiting only matters when there is no full-month offer
+    if waiting and (not offer_ee_allmonth):
         return "2D"
     if not ft:
         return "2B"
@@ -418,7 +441,7 @@ def build_interim(
     emp_enroll: pd.DataFrame,
     dep_enroll: pd.DataFrame,
     year: int,
-    **_kwargs,  # absorbs extras like pay_deductions
+    **_kwargs,  # absorbs extras
 ) -> pd.DataFrame:
     """
     Build the monthly Interim table.
@@ -429,7 +452,13 @@ def build_interim(
       - eligible_mv True only when Eligibility has full-month PlanA in EMP/EMPFAM/EMPCHILD/EMPSPOUSE.
       - spouse_enrolled / child_enrolled require full-month enrollment in the family tiers (no partials).
       - enrolled_allmonth uses UNION of enrollment rows (excluding WAIVE; honors isenrolled).
+      - waitingperiod_month uses the optional Emp Wait Period sheet if provided.
     """
+
+    # Optional wait-period sheet
+    emp_wait = _kwargs.get("emp_wait") or _kwargs.get("emp_wait_period")
+    if emp_wait is None:
+        emp_wait = pd.DataFrame()
 
     # Defensive aliasing
     emp_elig = _apply_aliases(emp_elig)
@@ -460,6 +489,7 @@ def build_interim(
         en_emp = emp_enroll[emp_enroll["employeeid"].astype(str) == str(emp)].copy() if not emp_enroll.empty else pd.DataFrame()
         de_emp = dep_enroll[dep_enroll["employeeid"].astype(str) == str(emp)].copy() if not dep_enroll.empty else pd.DataFrame()
         st_emp = st[st["employeeid"].astype(str) == str(emp)].copy() if not st.empty else pd.DataFrame()
+        wp_emp = emp_wait[emp_wait.get("employeeid","").astype(str) == str(emp)].copy() if not emp_wait.empty else pd.DataFrame()
 
         for m in range(1, 13):
             ms, me = month_bounds(year, m)
@@ -506,11 +536,14 @@ def build_interim(
             emp_cost = _latest_emp_cost_for_month(el_emp, ms, me)
             affordable = (emp_cost is not None) and (emp_cost < AFFORDABILITY_THRESHOLD)
 
-            # ---- waiting period heuristic
+            # ---- waiting period (explicit sheet first, then fallback)
             waiting = False
-            if employed and not elig_any and not el_emp.empty and "eligibilitystartdate" in el_emp.columns:
-                future_starts = el_emp["eligibilitystartdate"].dropna()
-                waiting = (future_starts.dt.date > me).any()
+            if not wp_emp.empty:
+                waiting = _month_in_wait_period(wp_emp, ms, me)
+            if not waiting:
+                if employed and not elig_any and not el_emp.empty and "eligibilitystartdate" in el_emp.columns:
+                    future_starts = el_emp["eligibilitystartdate"].dropna()
+                    waiting = (future_starts.dt.date > me).any()
 
             # ---- monthly codes
             l14 = _month_line14(eligible_mv, offer_ee_allmonth, offer_spouse, offer_dependents, affordable)
