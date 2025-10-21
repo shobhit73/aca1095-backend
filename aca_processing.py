@@ -2,22 +2,21 @@
 # 1) Input ingestion & cleaning
 # 2) Shared helpers/constants used by aca_builder.py and aca_pdf.py
 
+from __future__ import annotations
 import io, re
 from datetime import datetime, date, timedelta
 import numpy as np
 import pandas as pd
 
 # ---------- Shared constants ----------
-TRUTHY = {"y", "yes", "true", "t", "1", 1, True}
-FALSY  = {"n", "no", "false", "f", "0", 0, False, None, np.nan}
+TRUTHY = {"y","yes","true","t","1",1,True}
+FALSY  = {"n","no","false","f","0",0,False,None,np.nan}
 
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-FULL_MONTHS = [
-    "January","February","March","April","May","June",
-    "July","August","September","October","November","December"
-]
-MONTHNUM_TO_FULL = {i+1: m for i, m in enumerate(FULL_MONTHS)}
+FULL_MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"]
+MONTHNUM_TO_FULL = {i+1: m for i,m in enumerate(FULL_MONTHS)}
 
+# Accept common misspellings / variants
 CANON_ALIASES = {
     "mimimumvaluecoverage": "minimumvaluecoverage",
     "minimimvaluecoverage": "minimumvaluecoverage",
@@ -25,34 +24,33 @@ CANON_ALIASES = {
     "ssn (digits only)": "ssn",
 }
 
-# Expected sheets/columns (stable contract)
+# Expected sheets/columns (contract kept here so it remains stable)
 EXPECTED_SHEETS = {
     "emp demographic": [
         "employeeid","firstname","lastname","ssn","addressline1","addressline2",
         "city","state","zipcode","role","employmentstatus","statusstartdate","statusenddate"
     ],
     "emp status": ["employeeid","employmentstatus","role","statusstartdate","statusenddate"],  # optional
+    # Plan/tier/cost included to compute MV (PlanA) + EMP affordability from Eligibility
     "emp eligibility": [
         "employeeid","iseligibleforcoverage","eligibilitystartdate","eligibilityenddate",
         "plancode","eligibilitytier","plancost"
     ],
     "emp enrollment": [
         "employeeid","isenrolled","enrollmentstartdate","enrollmentenddate",
-        "plancode","enrollmenttier","planname","tier"
+        "plancode","planname","enrollmenttier"  # Tier alias normalized to enrollmenttier
     ],
     "dep enrollment": [
         "employeeid","dependentrelationship","eligible","enrolled",
         "eligiblestartdate","eligibleenddate","enrollmentstartdate","enrollmentenddate",
         "plancode"
     ],
-    "pay deductions": ["employeeid","amount","startdate","enddate"],
-    # NEW: explicit wait-period driver
-    "emp wait period": ["employeeid","effectivedate","wait period"],
+    # retained for compatibility (not used for affordability in current logic)
+    "pay deductions": ["employeeid","amount","startdate","enddate"]
 }
 
 # ---------- Small helpers ----------
 def _int_year(y, fallback=None):
-    """NaN-safe int year."""
     try:
         f = float(y)
         if np.isnan(f):  # type: ignore[arg-type]
@@ -62,7 +60,6 @@ def _int_year(y, fallback=None):
         return fallback if fallback is not None else datetime.now().year
 
 def _safe_int(x, default=None):
-    """Convert to int if possible; return default on NaN/None/errors."""
     try:
         f = float(x)
         if np.isnan(f):  # type: ignore[arg-type]
@@ -101,22 +98,19 @@ def to_bool(val) -> bool:
     return bool(val) and val not in FALSY
 
 def _last_day_of_month(y: int, m: int) -> date:
-    return date(y,12,31) if m == 12 else (date(y, m+1, 1) - timedelta(days=1))
+    return date(y,12,31) if m==12 else (date(y, m+1, 1) - timedelta(days=1))
 
 def parse_date_safe(d, default_end: bool=False):
-    """
-    Parse many date formats; return Python date or None.
-    If default_end=True, open-ended becomes month/year end.
-    """
+    """Parse many date formats; return Python date or None. If default_end, open-ended → month/year end."""
     if pd.isna(d): return None
     if isinstance(d, (datetime, np.datetime64)):
         dt = pd.to_datetime(d, errors="coerce");  return None if pd.isna(dt) else dt.date()
     s = str(d).strip()
     if not s: return None
     try:
-        if len(s) == 4 and s.isdigit():
+        if len(s)==4 and s.isdigit():
             y = int(s); return date(y,12,31) if default_end else date(y,1,1)
-        if len(s) == 7 and s[4] == "-":
+        if len(s)==7 and s[4]=="-":
             y,m = map(int, s.split("-"));  return _last_day_of_month(y,m) if default_end else date(y,m,1)
     except:
         pass
@@ -151,7 +145,7 @@ def _all_month(df, start_col, end_col, m_start, m_end, mask=None) -> bool:
 # ---------- Excel I/O & cleaning ----------
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = df.columns.str.strip().str.replace(r"\s+", " ", regex=True).str.lower()
+    df.columns = (df.columns.str.strip().str.replace(r"\s+", " ", regex=True).str.lower())
     return df
 
 def load_excel(file_bytes: bytes) -> dict:
@@ -197,8 +191,7 @@ def _boolify(df, cols):
 def prepare_inputs(data: dict):
     """
     Returns cleaned dataframes for:
-      Emp Demographic, Emp Status, Emp Eligibility, Emp Enrollment, Dep Enrollment,
-      Pay Deductions, Emp Wait Period
+      Emp Demographic, Emp Status, Emp Eligibility, Emp Enrollment, Dep Enrollment, Pay Deductions
     """
     cleaned = {}
     for sheet, cols in EXPECTED_SHEETS.items():
@@ -224,26 +217,35 @@ def prepare_inputs(data: dict):
             df = _parse_date_cols(df, ["statusstartdate","statusenddate"], default_end_cols=["statusenddate"])
 
         elif sheet == "emp eligibility":
-            for c in ("plancode","eligibilitytier"):
-                if c in df.columns:
-                    df[c] = df[c].astype(str).str.strip()
-            # Accept EligiblePlan/EligibleTier variants
+            # normalize IDs
+            if "employeeid" in df.columns:
+                df["employeeid"] = df["employeeid"].astype(str).str.strip()
+
+            # Handle common header variants
             if "eligibleplan" in df.columns and "plancode" not in df.columns:
                 df["plancode"] = df["eligibleplan"].astype(str).str.strip()
             if "eligibletier" in df.columns and "eligibilitytier" not in df.columns:
                 df["eligibilitytier"] = df["eligibletier"].astype(str).str.strip()
+
+            for c in ("plancode","eligibilitytier"):
+                if c in df.columns:
+                    df[c] = df[c].astype(str).str.strip()
+
             if "plancost" in df.columns:
                 df["plancost"] = pd.to_numeric(df["plancost"], errors="coerce")
+
             df = _parse_date_cols(df, ["eligibilitystartdate","eligibilityenddate"],
                                   default_end_cols=["eligibilityenddate"])
 
         elif sheet == "emp enrollment":
-            df = _boolify(df, ["isenrolled"])
-            for c in ("plancode","enrollmenttier","planname","tier"):
-                if c in df.columns:
-                    df[c] = df[c].astype(str).str.strip()
-            if "enrollmenttier" not in df.columns and "tier" in df.columns:
+            # Case-insensitive map Tier -> enrollmenttier
+            if "tier" in df.columns and "enrollmenttier" not in df.columns:
                 df["enrollmenttier"] = df["tier"]
+            if "enrollmenttier" in df.columns:
+                df["enrollmenttier"] = df["enrollmenttier"].astype(str).str.strip()
+            for c in ("plancode","planname"):
+                if c in df.columns: df[c] = df[c].astype(str).str.strip()
+            df = _boolify(df, ["isenrolled"])
             df = _parse_date_cols(df, ["enrollmentstartdate","enrollmentenddate"],
                                   default_end_cols=["enrollmentenddate"])
 
@@ -262,44 +264,27 @@ def prepare_inputs(data: dict):
         elif sheet == "pay deductions":
             df = _parse_date_cols(df, ["startdate","enddate"], default_end_cols=["enddate"])
 
-        elif sheet == "emp wait period":
-            if "employeeid" in df.columns:
-                df["employeeid"] = df["employeeid"].astype(str).str.strip()
-            df = _parse_date_cols(df, ["effectivedate"])
-            # normalize wait-days; accept common variants
-            wp_col = None
-            for cand in ["wait period", "waitperiod", "wait_days", "waitdays"]:
-                if cand in df.columns:
-                    wp_col = cand; break
-            if wp_col is None:
-                df["wait period"] = pd.Series(dtype="float")
-                wp_col = "wait period"
-            df["wait_days"] = pd.to_numeric(df[wp_col], errors="coerce").fillna(0).astype(int)
-
         cleaned[sheet] = df
 
-    return (
-        cleaned["emp demographic"],
-        cleaned["emp status"],
-        cleaned["emp eligibility"],
-        cleaned["emp enrollment"],
-        cleaned["dep enrollment"],
-        cleaned["pay deductions"],
-        cleaned["emp wait period"],   # NEW
-    )
+    return (cleaned["emp demographic"], cleaned["emp status"], cleaned["emp eligibility"],
+            cleaned["emp enrollment"], cleaned["dep enrollment"], cleaned["pay deductions"])
 
 # ---------- Year & grid ----------
 def choose_report_year(emp_elig: pd.DataFrame, fallback_to_current=True) -> int:
-    """NaN-safe year detection using eligibility ranges."""
+    """
+    NaN-safe year detection: looks at eligibility start/end ranges.
+    """
     if emp_elig.empty or not {"eligibilitystartdate","eligibilityenddate"} <= set(emp_elig.columns):
         return datetime.now().year if fallback_to_current else 2024
 
-    counts = {}
+    counts={}
     for _, r in emp_elig.iterrows():
         s = pd.to_datetime(r.get("eligibilitystartdate"), errors="coerce")
         e = pd.to_datetime(r.get("eligibilityenddate"), errors="coerce")
+
         if pd.isna(s) and pd.isna(e):
             continue
+
         if pd.isna(s) and not pd.isna(e):
             sy = ey = int(e.year)
         elif not pd.isna(s) and pd.isna(e):
@@ -316,7 +301,7 @@ def choose_report_year(emp_elig: pd.DataFrame, fallback_to_current=True) -> int:
     return datetime.now().year if fallback_to_current else 2024
 
 def _collect_employee_ids(*dfs):
-    ids = set()
+    ids=set()
     for df in dfs:
         if df is None or df.empty: continue
         if "employeeid" in df.columns:
@@ -325,24 +310,17 @@ def _collect_employee_ids(*dfs):
 
 def _grid_for_year(employee_ids, year:int) -> pd.DataFrame:
     year = _int_year(year, datetime.now().year)
-    recs = []
+    recs=[]
     for emp in employee_ids:
-        for m in range(1, 13):
-            ms, me = month_bounds(year, m)
-            recs.append({
-                "employeeid": emp,
-                "year": year,
-                "monthnum": m,
-                "month": ms.strftime("%b"),
-                "monthstart": ms,
-                "monthend": me
-            })
+        for m in range(1,13):
+            ms,me = month_bounds(year,m)
+            recs.append({"employeeid":emp,"year":year,"monthnum":m,"month":ms.strftime("%b"),
+                         "monthstart":ms,"monthend":me})
     g = pd.DataFrame.from_records(recs)
-    g["monthstart"] = pd.to_datetime(g["monthstart"])
-    g["monthend"]   = pd.to_datetime(g["monthend"])
+    g["monthstart"]=pd.to_datetime(g["monthstart"]); g["monthend"]=pd.to_datetime(g["monthend"])
     return g
 
-# ---------- Deriving status rows from demographic (fallback) ----------
+# ---------- Deriving status rows from demographic ----------
 def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
     """
     Build a dated status table from demographic if Emp Status sheet is missing.
