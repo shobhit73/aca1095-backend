@@ -159,6 +159,76 @@ def _tier_enrolled_full_month(
     """
     if en_df is None or en_df.empty:
         return False
+from datetime import timedelta
+
+def _enrolled_full_month_union(en_df: pd.DataFrame, ms, me) -> bool:
+    """
+    TRUE if, after filtering to enrolled (non-WAIVE) rows,
+    the UNION of enrollment intervals covers the entire month [ms, me].
+    - Honors isenrolled==True if present
+    - Excludes WAIVE rows
+    - Allows multiple rows stitched together (including adjacent days, e.g., end=11th & start=12th)
+    """
+    if en_df is None or en_df.empty:
+        return False
+
+    # Base mask: enrolled (if column exists) and not WAIVE
+    mask = pd.Series(True, index=en_df.index)
+    if "isenrolled" in en_df.columns:
+        mask &= en_df["isenrolled"].astype(bool)
+
+    waive_mask = pd.Series(False, index=en_df.index)
+    for col in ("plancode", "planname"):
+        if col in en_df.columns:
+            s = en_df[col].astype(str).str.upper().str.strip()
+            waive_mask |= s.eq("WAIVE")
+    mask &= ~waive_mask
+
+    # Keep only rows that overlap this month at all
+    if "enrollmentstartdate" not in en_df.columns or "enrollmentenddate" not in en_df.columns:
+        return False
+
+    S = en_df["enrollmentstartdate"].fillna(pd.Timestamp.min)
+    E = en_df["enrollmentenddate"].fillna(pd.Timestamp.max)
+    overlaps = (E.dt.date >= ms) & (S.dt.date <= me)
+    mask &= overlaps
+
+    df = en_df.loc[mask]
+    if df.empty:
+        return False
+
+    # Clip intervals to [ms, me] and collect as dates
+    intervals = []
+    for _, r in df.iterrows():
+        s = r["enrollmentstartdate"].date()
+        e = r["enrollmentenddate"].date()
+        s = ms if s < ms else s
+        e = me if e > me else e
+        if s <= e:
+            intervals.append((s, e))
+
+    if not intervals:
+        return False
+
+    # Merge intervals (inclusive). Treat adjacent days (prev_end + 1 == next_start) as continuous.
+    intervals.sort(key=lambda x: x[0])
+    merged = []
+    cur_s, cur_e = intervals[0]
+    for s, e in intervals[1:]:
+        if s <= (cur_e + timedelta(days=1)):  # overlaps or touches
+            if e > cur_e:
+                cur_e = e
+        else:
+            merged.append((cur_s, cur_e))
+            cur_s, cur_e = s, e
+    merged.append((cur_s, cur_e))
+
+    # Covered full month if any merged interval spans [ms, me]
+    for s, e in merged:
+        if s <= ms and e >= me:
+            return True
+    return False
+
 
     # find tier column case-insensitively
     tier_col = None
@@ -428,10 +498,11 @@ def build_interim(
 
             offer_ee_allmonth  = _offered_allmonth(el_emp, ms, me)
 
-            # ---- enrollment full-month (excluding "Waive")
+            # ---- enrollment full-month (union across rows; excluding "Waive")
             enrolled_full = False
-            if not en_emp.empty:
-                mask_en = pd.Series(True, index=en_emp.index)
+                if not en_emp.empty:
+                    enrolled_full = _enrolled_full_month_union(en_emp, ms, me)
+
                 if "isenrolled" in en_emp.columns:
                     mask_en &= en_emp["isenrolled"].astype(bool)
                 waive_mask = pd.Series(False, index=en_emp.index)
