@@ -362,20 +362,28 @@ def _eligible_mv_full_month(el_emp: pd.DataFrame, ms, me) -> bool:
 def _month_line14(eligible_mv: bool, offer_ee_allmonth: bool, offer_spouse: bool,
                   offer_dependents: bool, affordable: bool) -> str:
     """
-    Simplified mapping:
-      - If no full-month offer to employee → 1H
-      - If MV offered (PlanA) full-month:
-           if spouse+dependents also offered → 1A if affordable else 1E
-           else → 1E
-      - If no MV but full-month MEC offer → 1F
+    Correct mapping:
+      - 1H: No full-month offer to employee
+      - 1F: MEC (not MV) full-month offer to employee
+      - MV full-month offer to employee:
+          • 1A if spouse+dependents also offered AND affordable
+          • 1E if spouse+dependents also offered but NOT affordable
+          • 1D if spouse only
+          • 1C if dependents only
+          • 1B if employee only
     """
     if not offer_ee_allmonth:
         return "1H"
     if eligible_mv:
         if offer_spouse and offer_dependents:
             return "1A" if affordable else "1E"
-        return "1E"
+        if offer_spouse and not offer_dependents:
+            return "1D"
+        if offer_dependents and not offer_spouse:
+            return "1C"
+        return "1B"  # employee only
     return "1F"
+
 
 
 def _month_line16(
