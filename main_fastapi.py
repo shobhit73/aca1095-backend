@@ -14,8 +14,8 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-# ---- your modular stack
-from aca_processing import prepare_inputs, detect_year_from_inputs
+# ---- modular stack (NOTE: we only import prepare_inputs)
+from aca_processing import prepare_inputs
 from aca_builder import build_interim, build_final, build_penalty_dashboard
 from aca_pdf import fill_pdf_for_employee
 
@@ -37,8 +37,66 @@ def require_api_key(x_api_key: Optional[str]) -> None:
     # if no API key set in env, allow all (dev mode)
 
 
+# ---------- year detector (local helper to avoid importing it) ----------
+DATE_COLS_BY_SHEET = {
+    "emp_status": ["statusstartdate", "statusenddate", "hiredate", "terminationdate"],
+    "emp_elig": ["eligibilitystartdate", "eligibilityenddate"],
+    "emp_enroll": ["enrollmentstartdate", "enrollmentenddate"],
+}
+
+def _collect_years(df: pd.DataFrame, cols: List[str]) -> List[int]:
+    years: List[int] = []
+    if df is None or df.empty:
+        return years
+    for c in cols:
+        if c in df.columns:
+            s = pd.to_datetime(df[c], errors="coerce")
+            if hasattr(s, "dt"):
+                ys = s.dt.year.dropna().astype(int).tolist()
+                years.extend(ys)
+    return years
+
+def detect_year_from_inputs(
+    emp_status: pd.DataFrame,
+    emp_elig: pd.DataFrame,
+    emp_enroll: pd.DataFrame,
+    fallback: Optional[int] = None,
+) -> int:
+    """
+    Heuristic:
+      1) Gather years from known date columns across Status, Eligibility, Enrollment.
+      2) Prefer the mode (most frequent year) between now-1 and now+1.
+      3) Else fallback to the max seen, else current year or provided fallback.
+    """
+    now_year = datetime.utcnow().year
+    candidates: List[int] = []
+    candidates += _collect_years(emp_status, DATE_COLS_BY_SHEET["emp_status"])
+    candidates += _collect_years(emp_elig, DATE_COLS_BY_SHEET["emp_elig"])
+    candidates += _collect_years(emp_enroll, DATE_COLS_BY_SHEET["emp_enroll"])
+
+    if candidates:
+        # constrain to a sensible window (last year..next year) but keep a backup
+        window = [y for y in candidates if now_year - 1 <= y <= now_year + 1]
+        pool = window or candidates
+        if pool:
+            # mode with tie -> max
+            s = pd.Series(pool)
+            try:
+                mode_vals = s.mode()
+                if len(mode_vals) > 0:
+                    return int(mode_vals.iloc[-1])
+            except Exception:
+                pass
+            try:
+                return int(max(pool))
+            except Exception:
+                pass
+
+    return int(fallback or now_year)
+
+
 # ---------- app ----------
-app = FastAPI(title="ACA 1095-C Builder API (modular stack)", version="1.0.0")
+app = FastAPI(title="ACA 1095-C Builder API (modular stack)", version="1.0.1")
 
 # CORS (open-by-default; restrict if needed)
 app.add_middleware(
@@ -75,7 +133,7 @@ async def process_excel(
         raw = await file.read()
         data = io.BytesIO(raw)
 
-        # Prepare inputs (now returns 7 values including Emp Wait Period)
+        # Prepare inputs (7 values incl. Emp Wait Period)
         (
             emp_demo,
             emp_status,
@@ -97,7 +155,7 @@ async def process_excel(
             emp_enroll=emp_enroll,
             dep_enroll=dep_enroll,
             year=year_used,
-            emp_wait_period=emp_wait,  # <-- authoritative waiting window
+            emp_wait_period=emp_wait,  # authoritative waiting window
         )
 
         # Final + Penalty
@@ -107,7 +165,6 @@ async def process_excel(
         # Write to an xlsx in-memory
         out_buf = io.BytesIO()
         with pd.ExcelWriter(out_buf, engine="xlsxwriter") as writer:
-            # Order: Final first (what people expect), then Interim, then Penalty
             final_df.to_excel(writer, index=False, sheet_name="Final")
             interim_df.to_excel(writer, index=False, sheet_name="Interim")
             penalty_df.to_excel(writer, index=False, sheet_name="PenaltyDashboard")
@@ -187,7 +244,6 @@ async def generate_single_pdf(
             year=year_used,
         )
 
-        # Stream back the filled PDF
         headers = {
             "Content-Disposition": f'attachment; filename="1095C_{target_emp}.pdf"'
         }
@@ -262,13 +318,10 @@ async def generate_zip_pdfs(
                     )
                     zf.writestr(f"1095C_{eid}.pdf", pdf_bytes_filled)
                 except Exception as per_emp_err:
-                    # Still include a text note if a specific employee fails
                     zf.writestr(f"ERROR_{eid}.txt", f"Failed to build PDF for {eid}: {per_emp_err}")
 
         zip_buf.seek(0)
-        headers = {
-            "Content-Disposition": 'attachment; filename="1095C_PDFs.zip"'
-        }
+        headers = {"Content-Disposition": 'attachment; filename="1095C_PDFs.zip"'}
         return StreamingResponse(zip_buf, headers=headers, media_type="application/zip")
 
     except HTTPException:
@@ -279,11 +332,10 @@ async def generate_zip_pdfs(
 
 
 # =========================
-# Helpful dev note
+# Render notes
 # =========================
-# On Render:
-# 1) Set environment variable API_KEY (optional; if omitted, all requests are allowed).
-# 2) Start command:
-#    uvicorn main_fastapi:app --host 0.0.0.0 --port 10000
-# 3) If your v0 frontend runs on a different origin, set CORS_ALLOW_ORIGINS env, e.g.:
-#    https://your-frontend.vercel.app
+# Start command:
+#   uvicorn main_fastapi:app --host 0.0.0.0 --port 10000
+# Env:
+#   API_KEY=<your key>  (optional; if blank, all calls allowed)
+#   CORS_ALLOW_ORIGINS=https://your-frontend.vercel.app
