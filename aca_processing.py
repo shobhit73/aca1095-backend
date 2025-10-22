@@ -40,6 +40,7 @@ EXPECTED_SHEETS = {
         "employeeid","isenrolled","enrollmentstartdate","enrollmentenddate",
         "plancode","planname","enrollmenttier"  # Tier alias normalized to enrollmenttier
     ],
+    "emp wait period": ["employeeid", "effectivedate", "wait period"],
     "dep enrollment": [
         "employeeid","dependentrelationship","eligible","enrolled",
         "eligiblestartdate","eligibleenddate","enrollmentstartdate","enrollmentenddate",
@@ -236,6 +237,17 @@ def prepare_inputs(data: dict):
 
             df = _parse_date_cols(df, ["eligibilitystartdate","eligibilityenddate"],
                                   default_end_cols=["eligibilityenddate"])
+        
+        elif sheet == "emp wait period":
+            # normalize ids and parse
+            df = _ensure_employeeid_str(df)
+            # uniform header (allow variants)
+        for miss, canon in [("effective date", "effectivedate"), ("waitperiod", "wait period")]:
+            if miss in df.columns and canon not in df.columns:
+                df = df.rename(columns={miss: canon})
+        df = _parse_date_cols(df, ["effectivedate"])
+        if "wait period" in df.columns:
+            df["wait period"] = pd.to_numeric(df["wait period"], errors="coerce").fillna(0).astype(int)
 
         elif sheet == "emp enrollment":
             # Case-insensitive map Tier -> enrollmenttier
@@ -267,8 +279,9 @@ def prepare_inputs(data: dict):
         cleaned[sheet] = df
 
     return (cleaned["emp demographic"], cleaned["emp status"], cleaned["emp eligibility"],
-            cleaned["emp enrollment"], cleaned["dep enrollment"], cleaned["pay deductions"])
-
+        cleaned["emp enrollment"], cleaned["dep enrollment"], cleaned["pay deductions"],
+        cleaned.get("emp wait period", pd.DataFrame(columns=["employeeid","effectivedate","wait period"])))
+    
 # ---------- Year & grid ----------
 def choose_report_year(emp_elig: pd.DataFrame, fallback_to_current=True) -> int:
     """
