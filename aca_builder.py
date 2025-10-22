@@ -86,19 +86,6 @@ def _latest_emp_cost_for_month(el_df: pd.DataFrame, ms, me) -> Optional[float]:
     v = pd.to_numeric(df.iloc[0]["plancost"], errors="coerce")
     return float(v) if not pd.isna(v) else None
 
-def _is_wait_period_month(wait_df_emp: pd.DataFrame, ms, me) -> bool:
-    """Month is waiting if any [effectivedate, effectivedate+waitperiod-1] overlaps the month."""
-    if wait_df_emp is None or wait_df_emp.empty:
-        return False
-    df = wait_df_emp.copy()
-    if "effectivedate" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["effectivedate"]):
-        df["effectivedate"] = pd.to_datetime(df["effectivedate"], errors="coerce")
-    if "waitperiod" not in df.columns:
-        return False
-    wp = pd.to_numeric(df["waitperiod"], errors="coerce").fillna(0).astype(int)
-    df["_wait_end"] = df["effectivedate"] + pd.to_timedelta(wp - 1, unit="D")
-    mstart, mend = pd.Timestamp(ms), pd.Timestamp(me)
-    return bool(((df["_wait_end"] >= mstart) & (df["effectivedate"] <= mend) & (wp > 0)).any())
 
 def _offered_allmonth(el_emp: pd.DataFrame, ms, me) -> bool:
     """Employee-level MEC offer for full month (any EMP* tier)."""
@@ -424,9 +411,15 @@ def _month_line16(
 # ------------------------------------------------------------
 # Public: build_interim / build_final / build_penalty_dashboard
 # ------------------------------------------------------------
-def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
-                  year, pay_deductions=None, emp_wait=None) -> pd.DataFrame:
-
+def build_interim(
+    emp_demo: pd.DataFrame,
+    emp_status: pd.DataFrame,
+    emp_elig: pd.DataFrame,
+    emp_enroll: pd.DataFrame,
+    dep_enroll: pd.DataFrame,
+    year: int,
+    **_kwargs,  # absorbs extras like pay_deductions
+) -> pd.DataFrame:
     """
     Build the monthly Interim table.
 
@@ -513,13 +506,7 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll,
             emp_cost = _latest_emp_cost_for_month(el_emp, ms, me)
             affordable = (emp_cost is not None) and (emp_cost < AFFORDABILITY_THRESHOLD)
 
-            
-            # ---- waiting period detection
-        if (emp_wait is not None) and (not emp_wait.empty):
-            wp_emp = emp_wait[emp_wait["employeeid"].astype(str) == str(emp)]
-            waiting = _is_wait_period_month(wp_emp, ms, me)
-        else:
-    # fallback: legacy heuristic (only if no wait-period sheet)
+            # ---- waiting period heuristic
             waiting = False
             if employed and not elig_any and not el_emp.empty and "eligibilitystartdate" in el_emp.columns:
                 future_starts = el_emp["eligibilitystartdate"].dropna()
