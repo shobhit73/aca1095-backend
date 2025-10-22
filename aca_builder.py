@@ -403,10 +403,10 @@ def _month_line16(
       2H: rate-of-pay safe harbor (use affordable flag)
       else: blank
     """
-    if not employed:
-        return "2A"
     if enrolled_full:
         return "2C"
+    if not employed:
+        return "2A"
     if waiting:
         return "2D"
     if not ft:
@@ -414,7 +414,6 @@ def _month_line16(
     if offer_ee_allmonth and affordable:
         return "2H"
     return ""
-
 
 # ------------------------------------------------------------
 # Public: build_interim / build_final / build_penalty_dashboard
