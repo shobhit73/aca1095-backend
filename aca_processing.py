@@ -46,9 +46,7 @@ EXPECTED_SHEETS = {
         "plancode"
     ],
     # retained for compatibility (not used for affordability in current logic)
-    "pay deductions": ["employeeid","amount","startdate","enddate"],
-    "emp wait period": ["employeeid", "effectivedate", "wait period"]
-
+    "pay deductions": ["employeeid","amount","startdate","enddate"]
 }
 
 # ---------- Small helpers ----------
@@ -222,16 +220,6 @@ def prepare_inputs(data: dict):
             # normalize IDs
             if "employeeid" in df.columns:
                 df["employeeid"] = df["employeeid"].astype(str).str.strip()
-        
-        elif sheet == "emp wait period":
-            df = _ensure_employeeid_str(df)
-            df = _parse_date_cols(df, ["effectivedate"])
-            if "wait period" in df.columns:
-                df = df.rename(columns={"wait period": "waitperiod"})
-                df["waitperiod"] = pd.to_numeric(df["waitperiod"], errors="coerce").astype("Int64")
-            cleaned[sheet] = df
-            continue
-
 
             # Handle common header variants
             if "eligibleplan" in df.columns and "plancode" not in df.columns:
@@ -279,9 +267,7 @@ def prepare_inputs(data: dict):
         cleaned[sheet] = df
 
     return (cleaned["emp demographic"], cleaned["emp status"], cleaned["emp eligibility"],
-        cleaned["emp enrollment"], cleaned["dep enrollment"], cleaned["pay deductions"],
-        cleaned.get("emp wait period", pd.DataFrame(columns=["employeeid","effectivedate","waitperiod"])))
-
+            cleaned["emp enrollment"], cleaned["dep enrollment"], cleaned["pay deductions"])
 
 # ---------- Year & grid ----------
 def choose_report_year(emp_elig: pd.DataFrame, fallback_to_current=True) -> int:
