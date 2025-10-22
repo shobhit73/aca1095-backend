@@ -1,195 +1,194 @@
 # main_fastapi.py
-# FastAPI for ACA 1095 processing — Render ready (with /health and /healthz)
+from __future__ import annotations
 
-import io
-import os
-import importlib
-from typing import Optional, List
-
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+import io, zipfile, json, os
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Query
-from fastapi.responses import StreamingResponse, JSONResponse
-from starlette.middleware.cors import CORSMiddleware
 
-from aca_processing import load_excel, prepare_inputs, choose_report_year
-from aca_builder import build_interim, build_final, build_penalty_dashboard
+from aca_processing import (
+    load_excel, prepare_inputs, choose_report_year, MONTHS, _coerce_str
+)
+from aca_builder import (
+    build_interim, build_final, build_penalty_dashboard
+)
+from aca_pdf import (
+    save_excel_outputs, fill_pdf_for_employee
+)
 
-# -----------------------------
-# App setup
-# -----------------------------
-API_KEY = os.getenv("API_KEY", "")
-app = FastAPI(title="ACA Processor")
+app = FastAPI(title="ACA-1095 Builder API", version="1.0.0")
 
+# CORS (tighten allow_origins for prod)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],
+    allow_credentials=True,
+    allow_methods=["POST","GET","OPTIONS"],
     allow_headers=["*"],
 )
 
-def _check_key(x_api_key: Optional[str]):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+API_KEYS = set(filter(None, os.getenv("API_KEYS", "supersecret-key-123").split(",")))
 
-# Root route (avoids 404 on HEAD /)
-@app.get("/", include_in_schema=False)
-def root():
-    return {"ok": True, "service": "aca-processor"}
+async def require_api_key(request: Request):
+    key = request.headers.get("x-api-key")
+    if key not in API_KEYS:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-# -----------------------------
-# Read Emp Wait Period
-# -----------------------------
-def _read_emp_wait_period(file_bytes: bytes) -> pd.DataFrame:
-    try:
-        xls = pd.ExcelFile(io.BytesIO(file_bytes))
-    except Exception:
-        return pd.DataFrame()
-
-    wp_sheet = None
-    for n in xls.sheet_names:
-        name = n.strip().lower()
-        if name == "emp wait period" or ("wait" in name and "period" in name):
-            wp_sheet = n
-            break
-    if not wp_sheet:
-        return pd.DataFrame()
-
-    try:
-        return pd.read_excel(xls, wp_sheet)
-    except Exception:
-        return pd.DataFrame()
-
-# -----------------------------
-# PDF function lookup
-# -----------------------------
-def _pdf_funcs():
-    try:
-        mod = importlib.import_module("aca_pdf")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not import aca_pdf: {e}")
-
-    singles = ["generate_single_pdf", "generate_single"]
-    bulks = ["generate_bulk_pdfs", "generate_bulk"]
-
-    fn_single = next((getattr(mod, n, None) for n in singles if callable(getattr(mod, n, None))), None)
-    fn_bulk = next((getattr(mod, n, None) for n in bulks if callable(getattr(mod, n, None))), None)
-
-    if not fn_single or not fn_bulk:
-        raise HTTPException(status_code=500, detail="Missing PDF functions in aca_pdf.")
-    return fn_single, fn_bulk
-
-# -----------------------------
-# /process/excel
-# -----------------------------
-@app.post("/process/excel")
-async def process_excel(file: UploadFile = File(...), x_api_key: Optional[str] = Header(default=None)):
-    _check_key(x_api_key)
-    try:
-        file_bytes = await file.read()
-        raw = load_excel(file_bytes)
-        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(raw)
-        year = choose_report_year(emp_elig)
-
-        emp_wait_df = _read_emp_wait_period(file_bytes)
-
-        interim = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year,
-            pay_deductions=pay_deductions, emp_wait_period=emp_wait_df
-        )
-        final = build_final(interim)
-        penalty = build_penalty_dashboard(interim)
-
-        out = io.BytesIO()
-        with pd.ExcelWriter(out, engine="xlsxwriter") as w:
-            final.to_excel(w, sheet_name="Final", index=False)
-            interim.to_excel(w, sheet_name="Interim", index=False)
-            penalty.to_excel(w, sheet_name="Penalty Dashboard", index=False)
-        out.seek(0)
-        return StreamingResponse(
-            out,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f'attachment; filename="final_interim_penalty_{year}.xlsx"'}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# -----------------------------
-# /generate/single
-# -----------------------------
-@app.post("/generate/single")
-async def generate_single(
-    file: UploadFile = File(...),
-    employee_id: str = Query(..., alias="employeeId"),
-    flatten_pdf: bool = Query(False, alias="flattenPdf"),
-    x_api_key: Optional[str] = Header(default=None),
-):
-    _check_key(x_api_key)
-    try:
-        file_bytes = await file.read()
-        raw = load_excel(file_bytes)
-        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(raw)
-        year = choose_report_year(emp_elig)
-        emp_wait_df = _read_emp_wait_period(file_bytes)
-
-        interim = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year,
-            pay_deductions=pay_deductions, emp_wait_period=emp_wait_df
-        )
-        final = build_final(interim)
-
-        fn_single, _ = _pdf_funcs()
-        pdf_bytes = fn_single(final, interim, employee_id, year, flatten_pdf)
-
-        return StreamingResponse(
-            io.BytesIO(pdf_bytes),
-            media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="1095C_{employee_id}_{year}.pdf"'}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# -----------------------------
-# /generate/bulk
-# -----------------------------
-@app.post("/generate/bulk")
-async def generate_bulk(
-    file: UploadFile = File(...),
-    employee_ids: Optional[List[str]] = Query(default=None, alias="employeeIds"),
-    flatten_pdf: bool = Query(False, alias="flattenPdf"),
-    x_api_key: Optional[str] = Header(default=None),
-):
-    _check_key(x_api_key)
-    try:
-        file_bytes = await file.read()
-        raw = load_excel(file_bytes)
-        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(raw)
-        year = choose_report_year(emp_elig)
-        emp_wait_df = _read_emp_wait_period(file_bytes)
-
-        interim = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year,
-            pay_deductions=pay_deductions, emp_wait_period=emp_wait_df
-        )
-        final = build_final(interim)
-
-        _, fn_bulk = _pdf_funcs()
-        zip_bytes = fn_bulk(final, interim, employee_ids, year, flatten_pdf)
-
-        return StreamingResponse(
-            io.BytesIO(zip_bytes),
-            media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="1095C_PDFs.zip"'}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# -----------------------------
-# Health checks — expose BOTH paths
-# -----------------------------
 @app.get("/health")
-def health_plain():
-    return JSONResponse({"ok": True})
+async def health():
+    return {"ok": True}
 
-@app.get("/healthz")
-def healthz():
-    return JSONResponse({"ok": True})
+# -------- Excel -> Interim/Final (+Penalty Dashboard) --------
+@app.post("/process/excel", dependencies=[Depends(require_api_key)])
+async def process_excel(excel: UploadFile = File(...)):
+    if not excel.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Upload a .xlsx file")
+    excel_bytes = await excel.read()
+    try:
+        data = load_excel(excel_bytes)
+        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, _pay_deductions, emp_wait = prepare_inputs(data)
+
+
+        year_used = choose_report_year(emp_elig)
+
+        interim_df = build_interim(
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+        )
+        final_df   = build_final(interim_df)
+        penalty_df = build_penalty_dashboard(interim_df)
+
+        # Write 3 sheets: Final, Interim, Penalty Dashboard
+        out_bytes = save_excel_outputs(
+            interim_df, final_df, year_used, penalty_dashboard=penalty_df
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Failed to process Excel: {e}")
+
+    fname = f"final_interim_penalty_{year_used}.xlsx"
+    headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
+    return StreamingResponse(
+        io.BytesIO(out_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers
+    )
+
+# -------- Single PDF fill --------
+@app.post("/generate/single", dependencies=[Depends(require_api_key)])
+async def generate_single(
+    excel: UploadFile = File(...),
+    pdf: UploadFile = File(...),
+    employee_id: str = Form(None),
+    flattened_only: str = Form("true")
+):
+    if not excel.filename.lower().endswith(".xlsx") or not pdf.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Upload .xlsx and .pdf")
+
+    excel_bytes = await excel.read()
+    pdf_bytes = await pdf.read()
+
+    try:
+        data = load_excel(excel_bytes)
+        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, _pay_deductions = prepare_inputs(data)
+        if emp_demo.empty:
+            raise HTTPException(status_code=422, detail="No employees in Emp Demographic")
+
+        if not employee_id:
+            employee_id = _coerce_str(emp_demo["employeeid"].iloc[0])
+
+        row = emp_demo[emp_demo["employeeid"].astype(str)==str(employee_id)]
+        if row.empty:
+            raise HTTPException(status_code=404, detail=f"EmployeeID {employee_id} not found")
+
+        year_used = choose_report_year(emp_elig)
+
+        interim_df = build_interim(
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+        )
+        final_df = build_final(interim_df)
+
+        emp_final = final_df[final_df["EmployeeID"].astype(str)==str(employee_id)].copy()
+        if emp_final.empty:
+            emp_final = pd.DataFrame({
+                "Month": MONTHS,
+                "Line14_Final": ["" for _ in MONTHS],
+                "Line16_Final": ["" for _ in MONTHS]
+            })
+
+        editable_name, editable_bytes, flat_name, flat_bytes = fill_pdf_for_employee(
+            pdf_bytes, row.iloc[0], emp_final, year_used
+        )
+
+        if flattened_only.lower() in {"true","1","yes","y"}:
+            headers = {"Content-Disposition": f'attachment; filename="{flat_name}"'}
+            return StreamingResponse(io.BytesIO(flat_bytes.getvalue()), media_type="application/pdf", headers=headers)
+
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr(editable_name, editable_bytes.getvalue())
+            z.writestr(flat_name, flat_bytes.getvalue())
+        zip_buf.seek(0)
+        headers = {"Content-Disposition": f'attachment; filename="1095c_{employee_id}_{year_used}.zip"'}
+        return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"PDF generation failed: {e}")
+
+# -------- Bulk PDF fill --------
+@app.post("/generate/bulk", dependencies=[Depends(require_api_key)])
+async def generate_bulk(
+    excel: UploadFile = File(...),
+    pdf: UploadFile = File(...),
+    employee_ids: str = Form(None)  # JSON array or None=ALL
+):
+    if not excel.filename.lower().endswith(".xlsx") or not pdf.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Upload .xlsx and .pdf")
+
+    excel_bytes = await excel.read()
+    pdf_bytes = await pdf.read()
+
+    try:
+        data = load_excel(excel_bytes)
+        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, _pay_deductions = prepare_inputs(data)
+        if emp_demo.empty:
+            raise HTTPException(status_code=422, detail="No employees in Emp Demographic")
+
+        year_used = choose_report_year(emp_elig)
+        all_ids = list(map(str, emp_demo["employeeid"].astype(str).unique()))
+        if employee_ids:
+            ids = list(map(str, json.loads(employee_ids)))
+        else:
+            ids = all_ids
+
+        interim_df = build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, _pay_deductions, emp_wait = prepare_inputs(data)
+)
+
+        final_df = build_final(interim_df)
+
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            for eid in ids:
+                row = emp_demo[emp_demo["employeeid"].astype(str)==eid]
+                if row.empty:
+                    continue
+                emp_final = final_df[final_df["EmployeeID"].astype(str)==eid].copy()
+                if emp_final.empty:
+                    emp_final = pd.DataFrame({
+                        "Month": MONTHS,
+                        "Line14_Final": ["" for _ in MONTHS],
+                        "Line16_Final": ["" for _ in MONTHS]
+                    })
+                _, _, flat_name, flat_bytes = fill_pdf_for_employee(pdf_bytes, row.iloc[0], emp_final, year_used)
+                z.writestr(flat_name, flat_bytes.getvalue())
+        zip_buf.seek(0)
+        headers = {"Content-Disposition": f'attachment; filename="1095c_bulk_{year_used}.zip"'}
+        return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(statusemp_wait_code=422, detail=f"Bulk generation failed: {e}")
