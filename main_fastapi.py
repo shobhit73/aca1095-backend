@@ -47,8 +47,7 @@ async def process_excel(excel: UploadFile = File(...)):
     excel_bytes = await excel.read()
     try:
         data = load_excel(excel_bytes)
-        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, _pay_deductions, emp_wait = prepare_inputs(data)
-
+        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, _pay_deductions = prepare_inputs(data)
 
         year_used = choose_report_year(emp_elig)
 
@@ -164,9 +163,9 @@ async def generate_bulk(
         else:
             ids = all_ids
 
-        interim_df = build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, _pay_deductions, emp_wait = prepare_inputs(data)
-)
-
+        interim_df = build_interim(
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+        )
         final_df = build_final(interim_df)
 
         zip_buf = io.BytesIO()
@@ -191,4 +190,4 @@ async def generate_bulk(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(statusemp_wait_code=422, detail=f"Bulk generation failed: {e}")
+        raise HTTPException(status_code=422, detail=f"Bulk generation failed: {e}")
