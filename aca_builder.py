@@ -513,7 +513,13 @@ def build_interim(
                 waiting = (future_starts.dt.date > me).any()
 
             # ---- monthly codes
+            # FEEDBACK 2025-10-21:
+            # If no eligibility data exists for this month (elig_any=False) but the employee is
+            # ENROLLED for the entire month (enrolled_full=True), assume employee-only cost is > $50
+            # and force Line 14 to 1E. This mirrors the decision for cases like Emp 1007.
             l14 = _month_line14(eligible_mv, offer_ee_allmonth, offer_spouse, offer_dependents, affordable)
+            if (not bool(elig_any)) and bool(enrolled_full):
+                l14 = "1E"
             l16 = _month_line16(
                 employed=bool(employed),
                 enrolled_full=bool(enrolled_full),
