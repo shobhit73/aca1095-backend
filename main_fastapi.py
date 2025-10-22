@@ -1,38 +1,23 @@
 # main_fastapi.py
-# FastAPI surface for ACA processing.
-# NOTE: Only change vs earlier versions is reading the optional
-# "Emp Wait Period" sheet and passing it into build_interim().
+# FastAPI surface for ACA processing, with tolerant PDF function lookup.
+# Start command on Render:
+#   uvicorn main_fastapi:app --host 0.0.0.0 --port $PORT
 
 import io
 import os
+import importlib
 from typing import Optional, List
 
+import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Query
 from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 
-import pandas as pd
+from aca_processing import load_excel, prepare_inputs, choose_report_year
+from aca_builder import build_interim, build_final, build_penalty_dashboard
 
-from aca_processing import (
-    load_excel,
-    prepare_inputs,
-    choose_report_year,
-)
-from aca_builder import (
-    build_interim,
-    build_final,
-    build_penalty_dashboard,
-)
-from aca_pdf import (
-    generate_single_pdf,     # your existing single-PDF function
-    generate_bulk_pdfs,      # your existing bulk ZIP function
-)
-
-# ------------------------------
-# App + simple API key guard
-# ------------------------------
-API_KEY = os.getenv("API_KEY", "")  # if you require one; empty means "off"
-
+# ---------- App & API key ----------
+API_KEY = os.getenv("API_KEY", "")  # leave empty to disable
 app = FastAPI(title="ACA Processor")
 app.add_middleware(
     CORSMiddleware,
@@ -40,20 +25,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 def _check_key(x_api_key: Optional[str]):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-# ------------------------------
-# Small helper: read Emp Wait Period sheet if present
-# ------------------------------
+# ---------- Optional: read Emp Wait Period sheet ----------
 def _read_emp_wait_period(file_bytes: bytes) -> pd.DataFrame:
-    """
-    Tolerant reader for the 'Emp Wait Period' sheet.
-    Accepts exact name or variants containing both 'wait' and 'period'.
-    Returns empty DataFrame if not found; builder will fallback to old behavior.
-    """
     try:
         xls = pd.ExcelFile(io.BytesIO(file_bytes))
     except Exception:
@@ -65,39 +42,81 @@ def _read_emp_wait_period(file_bytes: bytes) -> pd.DataFrame:
         if name == "emp wait period" or ("wait" in name and "period" in name):
             wp_sheet = n
             break
-
     if not wp_sheet:
         return pd.DataFrame()
 
     try:
-        df = pd.read_excel(xls, wp_sheet)
-        return df
+        return pd.read_excel(xls, wp_sheet)
     except Exception:
         return pd.DataFrame()
 
-# ------------------------------
-# /process/excel
-# ------------------------------
+# ---------- Tolerant PDF function lookup ----------
+def _pdf_funcs():
+    """
+    Lazily import aca_pdf and find usable functions.
+    Accepts several common function names so you don't have to rename your aca_pdf.py.
+    """
+    try:
+        mod = importlib.import_module("aca_pdf")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not import aca_pdf: {e}")
+
+    single_candidates = [
+        "generate_single_pdf", "generate_single", "render_single_pdf",
+        "fill_single_pdf", "create_single_pdf", "make_single_pdf",
+    ]
+    bulk_candidates = [
+        "generate_bulk_pdfs", "generate_bulk", "render_bulk_pdfs",
+        "fill_bulk_zip", "create_bulk_zip", "make_bulk_zip", "generate_zip",
+    ]
+
+    fn_single = None
+    for name in single_candidates:
+        fn_single = getattr(mod, name, None)
+        if callable(fn_single):
+            break
+
+    fn_bulk = None
+    for name in bulk_candidates:
+        fn_bulk = getattr(mod, name, None)
+        if callable(fn_bulk):
+            break
+
+    if fn_single is None:
+        raise HTTPException(
+            status_code=500,
+            detail="aca_pdf is missing a supported single-PDF function. "
+                   "Define one of: generate_single_pdf / generate_single / render_single_pdf / "
+                   "fill_single_pdf / create_single_pdf / make_single_pdf"
+        )
+    if fn_bulk is None:
+        raise HTTPException(
+            status_code=500,
+            detail="aca_pdf is missing a supported bulk-PDF function. "
+                   "Define one of: generate_bulk_pdfs / generate_bulk / render_bulk_pdfs / "
+                   "fill_bulk_zip / create_bulk_zip / make_bulk_zip / generate_zip"
+        )
+    return fn_single, fn_bulk
+
+# ---------- /process/excel ----------
 @app.post("/process/excel")
 async def process_excel(
     file: UploadFile = File(...),
     x_api_key: Optional[str] = Header(default=None),
 ):
     _check_key(x_api_key)
-
     try:
         file_bytes = await file.read()
-        # Load & normalize (same as before)
+
+        # Load + clean
         raw = load_excel(file_bytes)
         emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(raw)
-
-        # Report year (same logic)
         year = choose_report_year(emp_elig)
 
-        # NEW: read Emp Wait Period (optional)
+        # Optional Emp Wait Period
         emp_wait_df = _read_emp_wait_period(file_bytes)
 
-        # Build sheets (only change is passing emp_wait_period=emp_wait_df)
+        # Build
         interim = build_interim(
             emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year,
             pay_deductions=pay_deductions,
@@ -106,19 +125,17 @@ async def process_excel(
         final = build_final(interim)
         penalty = build_penalty_dashboard(interim)
 
-        # Return combined workbook as stream
-        out_bytes = io.BytesIO()
-        with pd.ExcelWriter(out_bytes, engine="xlsxwriter") as writer:
-            final.to_excel(writer, sheet_name="Final", index=False)
-            interim.to_excel(writer, sheet_name="Interim", index=False)
-            penalty.to_excel(writer, sheet_name="Penalty Dashboard", index=False)
-        out_bytes.seek(0)
-
-        filename = f"final_interim_penalty_{year}.xlsx"
+        # Return workbook
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="xlsxwriter") as w:
+            final.to_excel(w, sheet_name="Final", index=False)
+            interim.to_excel(w, sheet_name="Interim", index=False)
+            penalty.to_excel(w, sheet_name="Penalty Dashboard", index=False)
+        out.seek(0)
         return StreamingResponse(
-            out_bytes,
+            out,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+            headers={"Content-Disposition": f'attachment; filename="final_interim_penalty_{year}.xlsx"'}
         )
 
     except HTTPException:
@@ -126,9 +143,7 @@ async def process_excel(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Processing error: {e}")
 
-# ------------------------------
-# /generate/single  (returns one filled 1095-C)
-# ------------------------------
+# ---------- /generate/single ----------
 @app.post("/generate/single")
 async def generate_single(
     file: UploadFile = File(...),
@@ -137,14 +152,12 @@ async def generate_single(
     x_api_key: Optional[str] = Header(default=None),
 ):
     _check_key(x_api_key)
-
     try:
         file_bytes = await file.read()
+
         raw = load_excel(file_bytes)
         emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(raw)
         year = choose_report_year(emp_elig)
-
-        # Optional Emp Wait Period usage here as well, so the Interim used for PDF matches /process
         emp_wait_df = _read_emp_wait_period(file_bytes)
 
         interim = build_interim(
@@ -154,8 +167,8 @@ async def generate_single(
         )
         final = build_final(interim)
 
-        # Your existing PDF function — keep the same signature you already had
-        pdf_bytes = generate_single_pdf(final, interim, employee_id, year, flatten_pdf)
+        fn_single, _ = _pdf_funcs()
+        pdf_bytes = fn_single(final, interim, employee_id, year, flatten_pdf)
 
         return StreamingResponse(
             io.BytesIO(pdf_bytes),
@@ -168,9 +181,7 @@ async def generate_single(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF generation error: {e}")
 
-# ------------------------------
-# /generate/bulk  (returns ZIP of PDFs)
-# ------------------------------
+# ---------- /generate/bulk ----------
 @app.post("/generate/bulk")
 async def generate_bulk(
     file: UploadFile = File(...),
@@ -179,13 +190,12 @@ async def generate_bulk(
     x_api_key: Optional[str] = Header(default=None),
 ):
     _check_key(x_api_key)
-
     try:
         file_bytes = await file.read()
+
         raw = load_excel(file_bytes)
         emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_deductions = prepare_inputs(raw)
         year = choose_report_year(emp_elig)
-
         emp_wait_df = _read_emp_wait_period(file_bytes)
 
         interim = build_interim(
@@ -195,8 +205,8 @@ async def generate_bulk(
         )
         final = build_final(interim)
 
-        # Your existing ZIP function — keep your internal behavior the same
-        zip_bytes = generate_bulk_pdfs(final, interim, employee_ids, year, flatten_pdf)
+        _, fn_bulk = _pdf_funcs()
+        zip_bytes = fn_bulk(final, interim, employee_ids, year, flatten_pdf)
 
         return StreamingResponse(
             io.BytesIO(zip_bytes),
@@ -209,7 +219,7 @@ async def generate_bulk(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Bulk PDF generation error: {e}")
 
-# Health check (optional)
+# ---------- Health ----------
 @app.get("/healthz")
 def health():
     return JSONResponse({"ok": True})
