@@ -52,7 +52,7 @@ async def process_excel(excel: UploadFile = File(...)):
         year_used = choose_report_year(emp_elig)
 
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used, emp_wait_period=emp_wait
         )
         final_df   = build_final(interim_df)
         penalty_df = build_penalty_dashboard(interim_df)
