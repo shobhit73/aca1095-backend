@@ -1,5 +1,5 @@
 # main_fastapi.py
-# FastAPI for ACA 1095 processing — Render ready
+# FastAPI for ACA 1095 processing — Render ready (with /health and /healthz)
 
 import io
 import os
@@ -30,6 +30,11 @@ app.add_middleware(
 def _check_key(x_api_key: Optional[str]):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+# Root route (avoids 404 on HEAD /)
+@app.get("/", include_in_schema=False)
+def root():
+    return {"ok": True, "service": "aca-processor"}
 
 # -----------------------------
 # Read Emp Wait Period
@@ -179,8 +184,12 @@ async def generate_bulk(
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------
-# /healthz
+# Health checks — expose BOTH paths
 # -----------------------------
+@app.get("/health")
+def health_plain():
+    return JSONResponse({"ok": True})
+
 @app.get("/healthz")
-def health():
+def healthz():
     return JSONResponse({"ok": True})
