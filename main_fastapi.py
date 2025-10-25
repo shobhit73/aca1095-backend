@@ -163,7 +163,7 @@ async def generate_single(
         raise HTTPException(status_code=400, detail="Upload a 1095-C base PDF")
 
     excel_bytes = await excel.read()
-    pdf_bytes   = io.BytesIO(await pdf.read())
+    pdf_bytes   = await pdf.read()  # IMPORTANT: pass raw bytes to fill_pdf_for_employee
     log.info("generate_single: files received", extra={"extra_data": {"xlsx": excel.filename, "pdf": pdf.filename}})
 
     try:
@@ -241,7 +241,7 @@ async def generate_bulk(
         raise HTTPException(status_code=400, detail="Upload a 1095-C base PDF")
 
     excel_bytes = await excel.read()
-    pdf_bytes   = io.BytesIO(await pdf.read())
+    pdf_bytes   = await pdf.read()  # IMPORTANT: raw bytes (reused for each employee)
     log.info("generate_bulk: files received", extra={"extra_data": {"xlsx": excel.filename, "pdf": pdf.filename}})
 
     try:
