@@ -163,6 +163,45 @@ def month_bounds(year:int, month:int) -> tuple[date, date]:
 def _norm_token(x) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(x).upper())
 
+def _any_overlap(df: pd.DataFrame, start_col: str, end_col: str, ms: date, me: date, *, mask=None) -> bool:
+    """
+    True if ANY row overlaps the month [ms, me].
+    Optional `mask` filters rows first (boolean Series aligned to df.index).
+    """
+    if df is None or df.empty:
+        return False
+    if start_col not in df.columns or end_col not in df.columns:
+        return False
+
+    if mask is None:
+        mask = pd.Series(True, index=df.index)
+
+    s = pd.to_datetime(df[start_col], errors="coerce").dt.date.fillna(date(1900, 1, 1))
+    e = pd.to_datetime(df[end_col], errors="coerce").dt.date.fillna(date(9999, 12, 31))
+
+    hits = (e >= ms) & (s <= me) & mask
+    return bool(hits.any())
+
+
+def _all_month(df: pd.DataFrame, start_col: str, end_col: str, ms: date, me: date, *, mask=None) -> bool:
+    """
+    True if ANY row covers the ENTIRE month [ms, me] (i.e., start <= ms AND end >= me).
+    Optional `mask` filters rows first (boolean Series aligned to df.index).
+    """
+    if df is None or df.empty:
+        return False
+    if start_col not in df.columns or end_col not in df.columns:
+        return False
+
+    if mask is None:
+        mask = pd.Series(True, index=df.index)
+
+    s = pd.to_datetime(df[start_col], errors="coerce").dt.date.fillna(date(1900, 1, 1))
+    e = pd.to_datetime(df[end_col], errors="coerce").dt.date.fillna(date(9999, 12, 31))
+
+    covers = mask & (s <= ms) & (e >= me)
+    return bool(covers.any()))
+
 def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
     need = {"employeeid","role","employmentstatus","statusstartdate","statusenddate"}
     if emp_demo.empty or not need <= set(emp_demo.columns):
