@@ -21,11 +21,9 @@ from PyPDF2.generic import (
 from aca_processing import MONTHS, _coerce_str, month_bounds
 
 
-# =============== utilities ===============
+# ----------------- helpers -----------------
 
 def _to_int_safe(val, default=9999):
-    """Extract first integer from strings like 'f1_10', 'Row[12]', 'f1_[10]'.
-    Returns default if none found."""
     try:
         if isinstance(val, (int, float)):
             return int(val)
@@ -36,7 +34,6 @@ def _to_int_safe(val, default=9999):
 
 
 def normalize_ssn_digits(s: str) -> str:
-    """Keep digits only; if already masked like 'XXX-XX-1234' leave as-is."""
     s = (s or "").strip()
     if not s:
         return ""
@@ -49,7 +46,6 @@ def normalize_ssn_digits(s: str) -> str:
 
 
 def _all_fields(reader: PdfReader) -> Dict[str, dict]:
-    """Return a mapping of field name -> field dict (PyPDF2 get_fields-compatible)."""
     fields: Dict[str, dict] = {}
     try:
         raw = reader.get_fields()
@@ -67,10 +63,9 @@ def _all_fields(reader: PdfReader) -> Dict[str, dict]:
     return fields
 
 
-# =============== low-level PDF writes (across *all* pages) ===============
+# -------- PDF write utilities (all pages) --------
 
 def _find_on_value(annot_obj) -> NameObject:
-    """The 'on' appearance name for a checkbox."""
     try:
         ap = annot_obj.get("/AP")
         if ap and "/N" in ap:
@@ -85,10 +80,6 @@ def _find_on_value(annot_obj) -> NameObject:
 
 
 def _update_text_any_page(writer: PdfWriter, name_to_value: Dict[str, str]):
-    """
-    Update text fields by name across *all* pages.
-    Uses both update_page_form_field_values and direct widget /V set (TextStringObject).
-    """
     for page in writer.pages:
         try:
             writer.update_page_form_field_values(page, name_to_value)
@@ -103,14 +94,12 @@ def _update_text_any_page(writer: PdfWriter, name_to_value: Dict[str, str]):
                         obj = annot
                     nm = obj.get("/T")
                     if nm in name_to_value:
-                        val = TextStringObject(str(name_to_value[nm]))
-                        obj.update({NameObject("/V"): val})
+                        obj.update({NameObject("/V"): TextStringObject(str(name_to_value[nm]))})
         except Exception:
             pass
 
 
 def _set_checkbox_on_any(writer: PdfWriter, field_name: str):
-    """Turn on a checkbox by name across *all* pages."""
     for page in writer.pages:
         try:
             if "/Annots" not in page:
@@ -129,53 +118,68 @@ def _set_checkbox_on_any(writer: PdfWriter, field_name: str):
             pass
 
 
-def _set_need_appearances(writer: PdfWriter):
-    """Ensure NeedAppearances is a proper PDF boolean (not a raw string)."""
+def _attach_acroform_from_reader(reader: PdfReader, writer: PdfWriter):
+    """Copy source /AcroForm (including /Fields) into writer and set NeedAppearances."""
+    try:
+        src_root = reader.trailer["/Root"]
+        if "/AcroForm" in src_root:
+            acro = src_root["/AcroForm"]
+            # import the object into writer
+            acro_ref = writer._add_object(acro)  # type: ignore[attr-defined]
+            writer._root_object.update({NameObject("/AcroForm"): acro_ref})
+            # also set flag on the imported dict
+            try:
+                acro.update({NameObject("/NeedAppearances"): BooleanObject(True)})
+            except Exception:
+                pass
+        else:
+            # fallback: minimal AcroForm so values render
+            writer._root_object.update({
+                NameObject("/AcroForm"): DictionaryObject({
+                    NameObject("/NeedAppearances"): BooleanObject(True)
+                })
+            })
+    except Exception:
+        # last resort: create minimal AcroForm
+        writer._root_object.update({
+            NameObject("/AcroForm"): DictionaryObject({
+                NameObject("/NeedAppearances"): BooleanObject(True)
+            })
+        })
+
+
+def _finalize_bytes(writer: PdfWriter) -> bytes:
+    """
+    Write the filled PDF. We do NOT delete /AcroForm or /Annots; many viewers require
+    them present to render the values (with NeedAppearances=True).
+    """
+    out = io.BytesIO()
+    # ensure flag is present
     try:
         root = writer._root_object  # type: ignore[attr-defined]
         if "/AcroForm" in root:
             acro = root["/AcroForm"]
             acro.update({NameObject("/NeedAppearances"): BooleanObject(True)})
         else:
-            root.update({
-                NameObject("/AcroForm"): DictionaryObject({
-                    NameObject("/NeedAppearances"): BooleanObject(True)
-                })
-            })
+            _attach_acroform_from_reader  # no-op; already attached earlier
     except Exception:
         pass
 
-
-def _flatten(writer: PdfWriter) -> bytes:
-    """
-    Write a 'flattened' copy that still preserves field values.
-    IMPORTANT: Do **not** delete /AcroForm or /Annots here, otherwise values vanish.
-    Rely on NeedAppearances so viewers render the text.
-    """
-    _set_need_appearances(writer)
-    out = io.BytesIO()
     writer.write(out)
     out.seek(0)
     return out.getvalue()
 
 
-# =============== Part III discovery ===============
+# -------- Part III discovery --------
 
 @dataclass
 class Part3RowRefs:
-    text_fields: List[str]   # 5 fields: Last, First, MI, SSN, DOB
-    month_boxes: List[str]   # 13 boxes: All12, Jan..Dec
+    text_fields: List[str]   # Last, First, MI, SSN, DOB (5)
+    month_boxes: List[str]   # All12 + Jan..Dec (13)
 
 
 def _discover_part3_rows(reader: PdfReader) -> List[Part3RowRefs]:
-    """
-    Group Part III fields by parents 'Row1[0]'..'RowN[0]'.
-    Within each row:
-      - text fields are 'f3_*' (5 per row)
-      - month checkboxes are 'c3_*' (13 per row)
-    """
     fields = _all_fields(reader)
-
     by_parent: Dict[str, List[str]] = {}
     for name, meta in fields.items():
         parent = meta.get("parent_T")
@@ -192,7 +196,7 @@ def _discover_part3_rows(reader: PdfReader) -> List[Part3RowRefs]:
     return rows
 
 
-# =============== Public API ===============
+# ----------------- Public API -----------------
 
 def fill_pdf_for_employee(
     pdf_bytes: bytes,
@@ -203,17 +207,22 @@ def fill_pdf_for_employee(
     dep_enroll_emp: Optional[pd.DataFrame] = None,
 ):
     """
-    Fill 1095-C PDF (Parts I, II, and PART III).
+    Fill 1095-C PDF (Parts I, II, PART III).
     Returns: (editable_name, editable_bytes, flattened_name, flattened_bytes)
     """
     reader = PdfReader(io.BytesIO(pdf_bytes))
     writer = PdfWriter()
+
+    # copy pages first
     for p in reader.pages:
         writer.add_page(p)
 
+    # **CRITICAL**: copy the AcroForm (with Fields) into the writer
+    _attach_acroform_from_reader(reader, writer)
+
     fields_meta = _all_fields(reader)
 
-    # ---------- Part I: Employee info ----------
+    # ---- Part I: Employee info (EmployeeName[0] group: f1_1..f1_8) ----
     first = _coerce_str(emp_row.get("firstname"))
     mi    = _coerce_str(emp_row.get("middleinitial"))
     last  = _coerce_str(emp_row.get("lastname"))
@@ -226,56 +235,46 @@ def fill_pdf_for_employee(
     state = _coerce_str(emp_row.get("state"))
     zipcode = _coerce_str(emp_row.get("zipcode"))
 
-    # EmployeeName group exposes 8 fields: f1_1..f1_8 (Name, SSN, Addr, City, State, ZIP, etc.)
     employee_fields = sorted(
         [k for k, v in fields_meta.items()
          if k.startswith("f1_") and v.get("parent_T") == "EmployeeName[0]"],
         key=_to_int_safe,
     )
-    named: Dict[str, str] = {}
+
+    tx: Dict[str, str] = {}
     if employee_fields:
-        # 0: Name
-        named[employee_fields[0]] = full_name
-        # 1: SSN
+        # best-effort mapping by slot
+        tx[employee_fields[0]] = full_name
         if len(employee_fields) > 1:
-            named[employee_fields[1]] = ssn
-        # 2: Address
+            tx[employee_fields[1]] = ssn
         if len(employee_fields) > 2:
-            addr = addr1 if not addr2 else f"{addr1} {addr2}"
-            named[employee_fields[2]] = addr
-        # 3..5: City / State / ZIP (best-effort)
+            tx[employee_fields[2]] = addr1 if not addr2 else f"{addr1} {addr2}"
         if len(employee_fields) > 3:
-            named[employee_fields[3]] = city
+            tx[employee_fields[3]] = city
         if len(employee_fields) > 4:
-            named[employee_fields[4]] = state
+            tx[employee_fields[4]] = state
         if len(employee_fields) > 5:
-            named[employee_fields[5]] = zipcode
+            tx[employee_fields[5]] = zipcode
 
-    _update_text_any_page(writer, named)
+    _update_text_any_page(writer, tx)
 
-    # ---------- Part II: Line 14 & Line 16 ----------
-    # Your current PDF revision doesn't expose explicit L14/L16 text fields in the dump
-    # (the grid is printed). We skip writing them unless fields are present.
-
+    # ---- Part II (grid printed on this template) ----
     month_to_code14 = {row["Month"]: _coerce_str(row.get("Line14_Final")) for _, row in final_df_emp.iterrows()}
     vals14 = [month_to_code14.get(m, "") for m in MONTHS]
     all14_same = len(set(vals14)) == 1 and (vals14[0] or "") != ""
 
-    # ---------- Part III: Covered individuals ----------
+    # ---- Part III: Covered Individuals ----
     rows = _discover_part3_rows(reader)
     if rows:
-        # Employee as first row (common)
         r0 = rows[0]
         if len(r0.text_fields) >= 5:
-            last_first_mi_ssn_dob = {
-                r0.text_fields[0]: last,        # Last
-                r0.text_fields[1]: first,       # First
-                r0.text_fields[2]: mi,          # MI
-                r0.text_fields[3]: ssn,         # SSN
-                r0.text_fields[4]: "",          # DOB if you have it
-            }
-            _update_text_any_page(writer, last_first_mi_ssn_dob)
-
+            _update_text_any_page(writer, {
+                r0.text_fields[0]: last,
+                r0.text_fields[1]: first,
+                r0.text_fields[2]: mi,
+                r0.text_fields[3]: ssn,
+                r0.text_fields[4]: "",  # DOB if available
+            })
         if r0.month_boxes:
             if all14_same and (vals14[0] or "") != "":
                 _set_checkbox_on_any(writer, r0.month_boxes[0])  # All 12
@@ -284,16 +283,12 @@ def fill_pdf_for_employee(
                     if month_to_code14.get(m, ""):
                         _set_checkbox_on_any(writer, r0.month_boxes[i])
 
-    # ---------- finalize ----------
-    _set_need_appearances(writer)
-
-    # Editable (form intact)
+    # ---- finalize & bytes ----
     editable = io.BytesIO()
     writer.write(editable)
     editable.seek(0)
 
-    # “Flattened” (non-destructive so values remain visible)
-    flat_bytes = _flatten(writer)
+    flat_bytes = _finalize_bytes(writer)  # non-destructive “flatten” so values remain visible
     flattened = io.BytesIO(flat_bytes)
     flattened.seek(0)
 
@@ -306,7 +301,7 @@ def fill_pdf_for_employee(
     )
 
 
-# =============== Excel outputs (unchanged) ===============
+# ------------- Excel outputs (unchanged) -------------
 
 def save_excel_outputs(
     interim: pd.DataFrame,
