@@ -36,8 +36,8 @@ from aca_pdf import (
 )
 
 # ---------- App & Logging ----------
-app = FastAPI(title="ACA 1095 Service", version="1.4.0")
-setup_logging()                      # reads LOG_LEVEL / LOG_JSON / LOG_FILE
+app = FastAPI(title="ACA 1095 Service", version="1.4.1")
+setup_logging()
 log = get_logger("api")
 
 # ---------- CORS ----------
@@ -111,7 +111,7 @@ async def process_excel(
             interim_df = build_interim(
                 emp_demo, emp_elig, emp_enroll, dep_enroll,
                 year=year_used,
-                emp_wait=emp_wait,                           # Emp Wait Period
+                emp_wait=emp_wait,
                 affordability_threshold=affordability_threshold,
             )
         log_df(log, interim_df, "interim")
@@ -163,7 +163,7 @@ async def generate_single(
         raise HTTPException(status_code=400, detail="Upload a 1095-C base PDF")
 
     excel_bytes = await excel.read()
-    pdf_bytes   = io.BytesIO(await pdf.read())
+    pdf_raw     = await pdf.read()  # NOTE: your PDF filler expects BYTES, not BytesIO
     log.info("generate_single: files received", extra={"extra_data": {"xlsx": excel.filename, "pdf": pdf.filename}})
 
     try:
@@ -191,6 +191,7 @@ async def generate_single(
             )
         final_df = build_final(interim_df)
 
+        # rows for this employee
         emp_final = final_df[final_df["EmployeeID"].astype(str)==str(employee_id)].copy()
         if emp_final.empty:
             emp_final = pd.DataFrame({
@@ -199,8 +200,11 @@ async def generate_single(
                 "Line16_Final": ["" for _ in MONTHS]
             })
 
+        en_emp  = emp_enroll[emp_enroll["employeeid"].astype(str)==str(employee_id)].copy() if not emp_enroll.empty else None
+        dep_emp = dep_enroll[dep_enroll["employeeid"].astype(str)==str(employee_id)].copy() if not dep_enroll.empty else None
+
         editable_name, editable_bytes, flat_name, flat_bytes = fill_pdf_for_employee(
-            pdf_bytes, row.iloc[0], emp_final, year_used
+            pdf_raw, row.iloc[0], emp_final, year_used, en_emp, dep_emp
         )
 
         if flattened_only.lower() in {"true","1","yes","y"}:
@@ -241,7 +245,7 @@ async def generate_bulk(
         raise HTTPException(status_code=400, detail="Upload a 1095-C base PDF")
 
     excel_bytes = await excel.read()
-    pdf_bytes   = io.BytesIO(await pdf.read())
+    pdf_raw     = await pdf.read()
     log.info("generate_bulk: files received", extra={"extra_data": {"xlsx": excel.filename, "pdf": pdf.filename}})
 
     try:
@@ -277,8 +281,12 @@ async def generate_bulk(
                         "Line14_Final": ["" for _ in MONTHS],
                         "Line16_Final": ["" for _ in MONTHS]
                     })
+
+                en_emp  = emp_enroll[emp_enroll["employeeid"].astype(str)==eid].copy() if not emp_enroll.empty else None
+                dep_emp = dep_enroll[dep_enroll["employeeid"].astype(str)==eid].copy() if not dep_enroll.empty else None
+
                 _, _, flat_name, flat_bytes = fill_pdf_for_employee(
-                    pdf_bytes, row.iloc[0], emp_final, year_used
+                    pdf_raw, row.iloc[0], emp_final, year_used, en_emp, dep_emp
                 )
                 z.writestr(flat_name, flat_bytes.getvalue())
         zip_buf.seek(0)
