@@ -6,6 +6,7 @@ import io, re
 from dataclasses import dataclass
 from datetime import date
 from typing import Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -336,6 +337,31 @@ def fill_pdf_for_employee(
     editable_name = f"1095c_filled_fields_{first_last}_{year_used}.pdf"
     flattened_name = f"1095c_filled_flattened_{first_last}_{year_used}.pdf"
     return editable_name, editable, flattened_name, flattened
+# --- DEBUG: list PDF form fields ---
+def list_pdf_fields(pdf_bytes: bytes) -> dict[str, dict[str, Any]]:
+    """
+    Return a dict of all AcroForm fields in the PDF.
+    If this returns {}, your PDF likely has no AcroForm fields (or is XFA-only).
+    """
+    import io
+    from PyPDF2 import PdfReader
+
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        fields = reader.get_fields() or {}
+        out: dict[str, dict[str, Any]] = {}
+        for full_name, rec in fields.items():
+            parent = rec.get("/Parent", {})
+            row = None
+            if isinstance(parent, dict):
+                row = parent.get("/T")
+            out[full_name] = {
+                "parent_T": str(row) if row is not None else None,
+                "FT": str(rec.get("/FT")) if "/FT" in rec else None,   # field type
+            }
+        return out
+    except Exception as e:
+        return {"__error__": {"message": str(e)}}
 
 
 # ---------------- Excel writer (needed by main_fastapi) ----------------
