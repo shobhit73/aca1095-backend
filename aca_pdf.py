@@ -1,4 +1,4 @@
-# aca_pdf.py  (robust field matching, keeps your original behavior)
+# aca_pdf.py  (robust field matching + save_excel_outputs)
 
 from __future__ import annotations
 
@@ -142,8 +142,7 @@ def _discover_part3_rows(reader: PdfReader) -> List[Part3RowRefs]:
     box_by_row: Dict[str, List[str]] = {}
 
     for name, rec in fields.items():
-        # accept f3_/c3_ anywhere in the name (not only startswith)
-        if "f3_" in name:
+        if "f3_" in name:  # allow prefixes
             parent = rec.get("/Parent", {})
             row = parent.get("/T") if isinstance(parent, dict) else str(parent.get("/T"))
             row = str(row) if row else "Row?"
@@ -223,7 +222,6 @@ def fill_pdf_for_employee(
     f1_index = _index_f1_fields(reader)
 
     def _name_for(num: int) -> Optional[str]:
-        # Exact number (handles zero-padding/prefixing)
         return f1_index.get(num)
 
     part1_map = {}
@@ -238,10 +236,10 @@ def fill_pdf_for_employee(
     if part1_map:
         _update_text(writer.pages[0], part1_map)
 
-    # Part II — Line 14 and Line 16 (robust)
+    # Part II — Line 14 and Line 16
     l14_all12_name = _name_for(17)  # All 12
-    l14_month_fields = [ _name_for(n) for n in range(18, 30) ]  # 18..29 (12)
-    l16_month_fields = [ _name_for(n) for n in range(44, 56) ]  # 44..55 (12)
+    l14_month_fields = [ _name_for(n) for n in range(18, 30) ]  # 18..29
+    l16_month_fields = [ _name_for(n) for n in range(44, 56) ]  # 44..55
 
     m_to_l14: Dict[str, str] = {}
     m_to_l16: Dict[str, str] = {}
@@ -251,7 +249,6 @@ def fill_pdf_for_employee(
         m_to_l14[m] = _coerce_str(r.get("Line14_Final"))
         m_to_l16[m] = _coerce_str(r.get("Line16_Final"))
 
-    # Line 14
     l14_vals = [m_to_l14.get(m, "") for m in MONTHS]
     if l14_all12_name and l14_vals and all(v == l14_vals[0] and v for v in l14_vals):
         _update_text(writer.pages[0], {l14_all12_name: l14_vals[0]})
@@ -260,13 +257,12 @@ def fill_pdf_for_employee(
         if updates:
             _update_text(writer.pages[0], updates)
 
-    # Line 16
     l16_vals = [m_to_l16.get(m, "") for m in MONTHS]
     updates = {fld: val for fld, val in zip(l16_month_fields, l16_vals) if fld}
     if updates:
         _update_text(writer.pages[0], updates)
 
-    # Part III — Covered Individuals (same logic; robust row discovery)
+    # Part III — Covered Individuals
     covered_rows: List[Tuple[str, str, str, str, Tuple[bool, List[bool]]]] = []
 
     emp_months_enrolled = [False] * 12
@@ -290,7 +286,6 @@ def fill_pdf_for_employee(
             all12 = all(emp_months_enrolled)
             covered_rows.append((first, mi, last, ssn, (all12, emp_months_enrolled)))
 
-    # Dependents
     if dep_enroll_emp is not None and not dep_enroll_emp.empty:
         for _, rr in dep_enroll_emp.iterrows():
             plan_code = _coerce_str(rr.get("plancode") or rr.get("PlanCode"))
@@ -341,3 +336,20 @@ def fill_pdf_for_employee(
     editable_name = f"1095c_filled_fields_{first_last}_{year_used}.pdf"
     flattened_name = f"1095c_filled_flattened_{first_last}_{year_used}.pdf"
     return editable_name, editable, flattened_name, flattened
+
+
+# ---------------- Excel writer (needed by main_fastapi) ----------------
+def save_excel_outputs(
+    interim: pd.DataFrame,
+    final: pd.DataFrame,
+    year: int,
+    penalty_dashboard: Optional[pd.DataFrame] = None,
+) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as xw:
+        final.to_excel(xw, index=False, sheet_name=f"Final {year}")
+        interim.to_excel(xw, index=False, sheet_name=f"Interim {year}")
+        if penalty_dashboard is not None and not penalty_dashboard.empty:
+            penalty_dashboard.to_excel(xw, index=False, sheet_name=f"Penalty Dashboard {year}")
+    buf.seek(0)
+    return buf.getvalue()
