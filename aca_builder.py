@@ -302,4 +302,25 @@ def build_final(interim: pd.DataFrame) -> pd.DataFrame:
                 out.append({"EmployeeID": emp, "Month": r["Month"], "Line14_Final": r["line14_final"], "Line16_Final": r["line16_final"]})
     return pd.DataFrame.from_records(out)
 
-def build_penalty_dashboard(interim: pd.DataFrame) -> pd.D
+def build_penalty_dashboard(interim: pd.DataFrame) -> pd.DataFrame:
+    if interim is None or interim.empty:
+        return pd.DataFrame(columns=["EmployeeID", "Reason"] + FULL_MONTHS)
+    def month_reason(row) -> str:
+        if not row["offer_ee_allmonth"]:
+            if not row["employed"]: return "Not employed"
+            if row["waitingperiod_month"]: return "Waiting period"
+            if not row["eligibleforcoverage"]: return "Not eligible"
+            return "No MEC offer"
+        if (not row["enrolled_allmonth"]) and (not row["affordable_plan"]): return "Offered but not affordable (B)"
+        return "–"
+    df = interim.copy()
+    out_rows = []
+    for emp, g in df.groupby("EmployeeID", sort=False):
+        rec = {"EmployeeID": emp}
+        reasons = [month_reason(r) for _, r in g.sort_values("MonthNum").iterrows()]
+        for i, m in enumerate(FULL_MONTHS):
+            rec[m] = reasons[i] if i < len(reasons) else "–"
+        rec["Reason"] = next((x for x in reasons if x != "–"), "–")
+        out_rows.append(rec)
+    cols = ["EmployeeID", "Reason"] + FULL_MONTHS
+    return pd.DataFrame.from_records(out_rows, columns=cols)
