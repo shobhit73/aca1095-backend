@@ -4,6 +4,9 @@ from typing import Optional, Dict, Any, List, Tuple
 from datetime import timedelta
 import pandas as pd
 
+from debug_logging import get_logger, log_df, log_time, log_call
+log = get_logger("builder")
+
 from aca_processing import (
     MONTHS, FULL_MONTHS,
     _collect_employee_ids, month_bounds,
@@ -141,6 +144,7 @@ def _month_line16(*, employed: bool, enrolled_full: bool, waiting: bool, ft: boo
     if offer_ee_allmonth and affordable: return "2H"
     return ""
 
+@log_call(log)
 def build_interim(
     emp_demo: pd.DataFrame,
     emp_elig: pd.DataFrame,
@@ -148,179 +152,186 @@ def build_interim(
     dep_enroll: pd.DataFrame,
     year: int,
     *,
-    emp_wait: pd.DataFrame | None = None,   # NEW
+    emp_wait: pd.DataFrame | None = None,   # Emp Wait Period
     affordability_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
-    """Main rules engine. waitingperiod_month comes ONLY from Emp Wait Period."""
-    emp_demo   = _apply_aliases(_df_or_empty(emp_demo))
-    emp_elig   = _apply_aliases(_df_or_empty(emp_elig))
-    emp_enroll = _apply_aliases(_df_or_empty(emp_enroll))
-    dep_enroll = _apply_aliases(_df_or_empty(dep_enroll))
-    emp_wait   = _df_or_empty(emp_wait)
+    """Rules engine. waitingperiod_month comes ONLY from Emp Wait Period."""
+    with log_time(log, "build_interim"):
+        emp_demo   = _apply_aliases(_df_or_empty(emp_demo))
+        emp_elig   = _apply_aliases(_df_or_empty(emp_elig))
+        emp_enroll = _apply_aliases(_df_or_empty(emp_enroll))
+        dep_enroll = _apply_aliases(_df_or_empty(dep_enroll))
+        emp_wait   = _df_or_empty(emp_wait)
 
-    for df, sc, ec in (
-        (emp_elig, "eligibilitystartdate", "eligibilityenddate"),
-        (emp_enroll, "enrollmentstartdate", "enrollmentenddate"),
-        (dep_enroll, "enrollmentstartdate", "enrollmentenddate"),
-    ):
-        if not df.empty:
-            for c in (sc, ec):
-                if c in df.columns and not pd.api.types.is_datetime64_any_dtype(df[c]):
-                    df[c] = pd.to_datetime(df[c], errors="coerce")
+        for df, sc, ec in (
+            (emp_elig, "eligibilitystartdate", "eligibilityenddate"),
+            (emp_enroll, "enrollmentstartdate", "enrollmentenddate"),
+            (dep_enroll, "enrollmentstartdate", "enrollmentenddate"),
+        ):
+            if not df.empty:
+                for c in (sc, ec):
+                    if c in df.columns and not pd.api.types.is_datetime64_any_dtype(df[c]):
+                        df[c] = pd.to_datetime(df[c], errors="coerce")
 
-    st = _status_from_demographic(emp_demo)
-    employee_ids = _collect_employee_ids(emp_demo, st, emp_elig, emp_enroll, dep_enroll, emp_wait)
-    rows: List[Dict[str, Any]] = []
-    thresh = AFFORDABILITY_THRESHOLD_DEFAULT if affordability_threshold is None else float(affordability_threshold)
+        st = _status_from_demographic(emp_demo)
+        employee_ids = _collect_employee_ids(emp_demo, st, emp_elig, emp_enroll, dep_enroll, emp_wait)
+        rows: List[Dict[str, Any]] = []
+        thresh = AFFORDABILITY_THRESHOLD_DEFAULT if affordability_threshold is None else float(affordability_threshold)
 
-    def _is_employed_month(st_emp: pd.DataFrame, ms, me) -> bool:
-        if st_emp is None or st_emp.empty:
-            return False
-        for c in ("statusstartdate", "statusenddate"):
-            if c in st_emp.columns and not pd.api.types.is_datetime64_any_dtype(st_emp[c]):
-                st_emp[c] = pd.to_datetime(st_emp[c], errors="coerce")
-        overlaps = (st_emp["statusenddate"].fillna(pd.Timestamp.max).dt.date >= ms) & \
-                   (st_emp["statusstartdate"].fillna(pd.Timestamp.min).dt.date <= me)
-        if not overlaps.any():
-            return False
-        if "_estatus_norm" in st_emp.columns:
-            s = st_emp.loc[overlaps, "_estatus_norm"].astype(str)
-            any_term = s.str.contains("TERMINAT", na=False) | s.str.fullmatch("TERM", na=False)
-            return not bool(any_term.any())
-        return True
-
-    def _is_ft(st_emp: pd.DataFrame, ms, me) -> bool:
-        if st_emp.empty or "_role_norm" not in st_emp.columns:
-            return False
-        if "_estatus_norm" in st_emp.columns:
+        def _is_employed_month(st_emp: pd.DataFrame, ms, me) -> bool:
+            if st_emp is None or st_emp.empty:
+                return False
+            for c in ("statusstartdate", "statusenddate"):
+                if c in st_emp.columns and not pd.api.types.is_datetime64_any_dtype(st_emp[c]):
+                    st_emp[c] = pd.to_datetime(st_emp[c], errors="coerce")
             overlaps = (st_emp["statusenddate"].fillna(pd.Timestamp.max).dt.date >= ms) & \
                        (st_emp["statusstartdate"].fillna(pd.Timestamp.min).dt.date <= me)
-            if overlaps.any():
+            if not overlaps.any():
+                return False
+            if "_estatus_norm" in st_emp.columns:
                 s = st_emp.loc[overlaps, "_estatus_norm"].astype(str)
                 any_term = s.str.contains("TERMINAT", na=False) | s.str.fullmatch("TERM", na=False)
-                if any_term.any():
-                    return False
-        s = st_emp["_role_norm"].astype(str)
-        mask = s.str.contains("FULLTIME", na=False) | s.str.fullmatch("FT", na=False)
-        return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
+                return not bool(any_term.any())
+            return True
 
-    def _is_pt(st_emp: pd.DataFrame, ms, me) -> bool:
-        if st_emp.empty or "_role_norm" not in st_emp.columns:
-            return False
-        if "_estatus_norm" in st_emp.columns:
-            overlaps = (st_emp["statusenddate"].fillna(pd.Timestamp.max).dt.date >= ms) & \
-                       (st_emp["statusstartdate"].fillna(pd.Timestamp.min).dt.date <= me)
-            if overlaps.any():
-                s = st_emp.loc[overlaps, "_estatus_norm"].astype(str)
-                any_term = s.str.contains("TERMINAT", na=False) | s.str.fullmatch("TERM", na=False)
-                if any_term.any():
-                    return False
-        s = st_emp["_role_norm"].astype(str)
-        mask = s.str.contains("PARTTIME", na=False) | s.str.fullmatch("PT", na=False)
-        return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
+        def _is_ft(st_emp: pd.DataFrame, ms, me) -> bool:
+            if st_emp.empty or "_role_norm" not in st_emp.columns:
+                return False
+            if "_estatus_norm" in st_emp.columns:
+                overlaps = (st_emp["statusenddate"].fillna(pd.Timestamp.max).dt.date >= ms) & \
+                           (st_emp["statusstartdate"].fillna(pd.Timestamp.min).dt.date <= me)
+                if overlaps.any():
+                    s = st_emp.loc[overlaps, "_estatus_norm"].astype(str)
+                    any_term = s.str.contains("TERMINAT", na=False) | s.str.fullmatch("TERM", na=False)
+                    if any_term.any():
+                        return False
+            s = st_emp["_role_norm"].astype(str)
+            mask = s.str.contains("FULLTIME", na=False) | s.str.fullmatch("FT", na=False)
+            return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
 
-    for emp in employee_ids:
-        el_emp = emp_elig[emp_elig["employeeid"].astype(str) == str(emp)].copy() if not emp_elig.empty else pd.DataFrame()
-        en_emp = emp_enroll[emp_enroll["employeeid"].astype(str) == str(emp)].copy() if not emp_enroll.empty else pd.DataFrame()
-        st_emp = st[st["employeeid"].astype(str) == str(emp)].copy() if not st.empty else pd.DataFrame()
-        wt_emp = emp_wait[emp_wait["employeeid"].astype(str) == str(emp)].copy() if not emp_wait.empty else pd.DataFrame()
+        def _is_pt(st_emp: pd.DataFrame, ms, me) -> bool:
+            if st_emp.empty or "_role_norm" not in st_emp.columns:
+                return False
+            if "_estatus_norm" in st_emp.columns:
+                overlaps = (st_emp["statusenddate"].fillna(pd.Timestamp.max).dt.date >= ms) & \
+                           (st_emp["statusstartdate"].fillna(pd.Timestamp.min).dt.date <= me)
+                if overlaps.any():
+                    s = st_emp.loc[overlaps, "_estatus_norm"].astype(str)
+                    any_term = s.str.contains("TERMINAT", na=False) | s.str.fullmatch("TERM", na=False)
+                    if any_term.any():
+                        return False
+            s = st_emp["_role_norm"].astype(str)
+            mask = s.str.contains("PARTTIME", na=False) | s.str.fullmatch("PT", na=False)
+            return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
 
-        for m in range(1, 13):
-            ms, me = month_bounds(year, m)
-            employed = _is_employed_month(st_emp, ms, me)
-            ft = _is_ft(st_emp, ms, me)
-            parttime = (not ft) and _is_pt(st_emp, ms, me)
+        for emp in employee_ids:
+            el_emp = emp_elig[emp_elig["employeeid"].astype(str) == str(emp)].copy() if not emp_elig.empty else pd.DataFrame()
+            en_emp = emp_enroll[emp_enroll["employeeid"].astype(str) == str(emp)].copy() if not emp_enroll.empty else pd.DataFrame()
+            st_emp = st[st["employeeid"].astype(str) == str(emp)].copy() if not st.empty else pd.DataFrame()
+            wt_emp = emp_wait[emp_wait["employeeid"].astype(str) == str(emp)].copy() if not emp_wait.empty else pd.DataFrame()
 
-            elig_any  = _any_overlap(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me) if not el_emp.empty else False
-            elig_full = _all_month(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me) if not el_emp.empty else False
+            for m in range(1, 13):
+                ms, me = month_bounds(year, m)
+                employed = _is_employed_month(st_emp, ms, me)
+                ft = _is_ft(st_emp, ms, me)
+                parttime = (not ft) and _is_pt(st_emp, ms, me)
 
-            eligible_mv = False
-            if not el_emp.empty and "plancode" in el_emp.columns:
-                mask_mv = el_emp["plancode"].astype(str).str.upper().str.strip().eq("PLANA")
-                eligible_mv = _all_month(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me, mask=mask_mv)
+                elig_any  = _any_overlap(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me) if not el_emp.empty else False
+                elig_full = _all_month(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me) if not el_emp.empty else False
 
-            offer_ee_allmonth = _offered_allmonth(el_emp, ms, me)
+                eligible_mv = False
+                if not el_emp.empty and "plancode" in el_emp.columns:
+                    mask_mv = el_emp["plancode"].astype(str).str.upper().str.strip().eq("PLANA")
+                    eligible_mv = _all_month(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me, mask=mask_mv)
 
-            offer_spouse = _tier_offered_any(el_emp, "eligibilitytier", ("EMPFAM","EMPSPOUSE"), "eligibilitystartdate", "eligibilityenddate", ms, me) \
-                           or _tier_offered_any(en_emp, "enrollmenttier", ("EMPFAM","EMPSPOUSE"), "enrollmentstartdate", "enrollmentenddate", ms, me, require_enrolled=True)
-            offer_dependents = _tier_offered_any(el_emp, "eligibilitytier", ("EMPFAM","EMPCHILD"), "eligibilitystartdate", "eligibilityenddate", ms, me) \
-                               or _tier_offered_any(en_emp, "enrollmenttier", ("EMPFAM","EMPCHILD"), "enrollmentstartdate", "enrollmentenddate", ms, me, require_enrolled=True)
+                offer_ee_allmonth = _offered_allmonth(el_emp, ms, me)
 
-            enrolled_full = _enrolled_full_month_union(en_emp, ms, me)
+                offer_spouse = _tier_offered_any(el_emp, "eligibilitytier", ("EMPFAM","EMPSPOUSE"), "eligibilitystartdate", "eligibilityenddate", ms, me) \
+                               or _tier_offered_any(en_emp, "enrollmenttier", ("EMPFAM","EMPSPOUSE"), "enrollmentstartdate", "enrollmentenddate", ms, me, require_enrolled=True)
+                offer_dependents = _tier_offered_any(el_emp, "eligibilitytier", ("EMPFAM","EMPCHILD"), "eligibilitystartdate", "eligibilityenddate", ms, me) \
+                                   or _tier_offered_any(en_emp, "enrollmenttier", ("EMPFAM","EMPCHILD"), "enrollmentstartdate", "enrollmentenddate", ms, me, require_enrolled=True)
 
-            emp_cost = _latest_emp_cost_for_month(el_emp, ms, me)
-            affordable = (emp_cost is not None) and (emp_cost < (AFFORDABILITY_THRESHOLD_DEFAULT if affordability_threshold is None else float(affordability_threshold)))
+                enrolled_full = _enrolled_full_month_union(en_emp, ms, me)
 
-            # NEW: waiting solely from Emp Wait Period
-            waiting = _waiting_in_month(wt_emp, ms, me)
+                emp_cost = _latest_emp_cost_for_month(el_emp, ms, me)
+                affordable = (emp_cost is not None) and (emp_cost < (AFFORDABILITY_THRESHOLD_DEFAULT if affordability_threshold is None else float(affordability_threshold)))
 
-            l14 = _month_line14(eligible_mv, offer_ee_allmonth, offer_spouse, offer_dependents, affordable)
-            if (not bool(elig_any)) and bool(enrolled_full):
-                l14 = "1E"
-            l16 = _month_line16(
-                employed=bool(employed),
-                enrolled_full=bool(enrolled_full),
-                waiting=bool(waiting),
-                ft=bool(ft),
-                offer_ee_allmonth=bool(offer_ee_allmonth),
-                affordable=bool(affordable),
-            )
+                waiting = _waiting_in_month(wt_emp, ms, me)  # ONLY from Emp Wait Period
 
-            rows.append({
-                "EmployeeID": str(emp),
-                "Year": int(year),
-                "MonthNum": int(m),
-                "Month": MONTHS[m-1],
-                "MonthStart": ms,
-                "MonthEnd": me,
-                "employed": bool(employed),
-                "ft": bool(ft),
-                "parttime": bool(parttime),
-                "eligibleforcoverage": bool(elig_any),
-                "eligible_allmonth": bool(elig_full),
-                "eligible_mv": bool(eligible_mv),
-                "offer_ee_allmonth": bool(offer_ee_allmonth),
-                "enrolled_allmonth": bool(enrolled_full),
-                "offer_spouse": bool(offer_spouse),
-                "offer_dependents": bool(offer_dependents),
-                "spouse_eligible": bool(offer_spouse),
-                "child_eligible": bool(offer_dependents),
-                "spouse_enrolled": False,
-                "child_enrolled": False,
-                "waitingperiod_month": bool(waiting),
-                "affordable_plan": bool(affordable),
-                "line14_final": l14,
-                "line16_final": l16,
-                "line14_all12": "",
-            })
+                l14 = _month_line14(eligible_mv, offer_ee_allmonth, offer_spouse, offer_dependents, affordable)
+                if (not bool(elig_any)) and bool(enrolled_full):
+                    l14 = "1E"
+                l16 = _month_line16(
+                    employed=bool(employed),
+                    enrolled_full=bool(enrolled_full),
+                    waiting=bool(waiting),
+                    ft=bool(ft),
+                    offer_ee_allmonth=bool(offer_ee_allmonth),
+                    affordable=bool(affordable),
+                )
 
-    interim = pd.DataFrame.from_records(rows)
+                rows.append({
+                    "EmployeeID": str(emp),
+                    "Year": int(year),
+                    "MonthNum": int(m),
+                    "Month": MONTHS[m-1],
+                    "MonthStart": ms,
+                    "MonthEnd": me,
+                    "employed": bool(employed),
+                    "ft": bool(ft),
+                    "parttime": bool(parttime),
+                    "eligibleforcoverage": bool(elig_any),
+                    "eligible_allmonth": bool(elig_full),
+                    "eligible_mv": bool(eligible_mv),
+                    "offer_ee_allmonth": bool(offer_ee_allmonth),
+                    "enrolled_allmonth": bool(enrolled_full),
+                    "offer_spouse": bool(offer_spouse),
+                    "offer_dependents": bool(offer_dependents),
+                    "spouse_eligible": bool(offer_spouse),
+                    "child_eligible": bool(offer_dependents),
+                    "spouse_enrolled": False,
+                    "child_enrolled": False,
+                    "waitingperiod_month": bool(waiting),
+                    "affordable_plan": bool(affordable),
+                    "line14_final": l14,
+                    "line16_final": l16,
+                    "line14_all12": "",
+                })
 
-    # 1G handling
-    one_g_emp_ids = []
-    for emp in interim["EmployeeID"].unique():
-        it = interim[interim["EmployeeID"] == emp]
-        any_ft = bool(it["ft"].any())
-        any_enrolled_full = bool(it["enrolled_allmonth"].any())
-        if (not any_ft) and any_enrolled_full:
-            one_g_emp_ids.append(emp)
-    if one_g_emp_ids:
-        interim.loc[interim["EmployeeID"].isin(one_g_emp_ids), "line14_all12"] = "1G"
-        interim.loc[interim["EmployeeID"].isin(one_g_emp_ids), "line14_final"] = ""
+        interim = pd.DataFrame.from_records(rows)
 
-    order = [
-        "EmployeeID","Year","MonthNum","Month","MonthStart","MonthEnd",
-        "employed","ft","parttime",
-        "eligibleforcoverage","eligible_allmonth","eligible_mv",
-        "offer_ee_allmonth","enrolled_allmonth",
-        "offer_spouse","offer_dependents",
-        "spouse_eligible","child_eligible","spouse_enrolled","child_enrolled",
-        "waitingperiod_month","affordable_plan",
-        "line14_final","line16_final","line14_all12",
-    ]
-    cols = [c for c in order if c in interim.columns] + [c for c in interim.columns if c not in order]
-    return interim.loc[:, cols]
+        # Code 1G handling
+        one_g_emp_ids = []
+        if not interim.empty:
+            for emp in interim["EmployeeID"].unique():
+                it = interim[interim["EmployeeID"] == emp]
+                any_ft = bool(it["ft"].any())
+                any_enrolled_full = bool(it["enrolled_allmonth"].any())
+                if (not any_ft) and any_enrolled_full:
+                    one_g_emp_ids.append(emp)
+            if one_g_emp_ids:
+                interim.loc[interim["EmployeeID"].isin(one_g_emp_ids), "line14_all12"] = "1G"
+                interim.loc[interim["EmployeeID"].isin(one_g_emp_ids), "line14_final"] = ""
 
+        order = [
+            "EmployeeID","Year","MonthNum","Month","MonthStart","MonthEnd",
+            "employed","ft","parttime",
+            "eligibleforcoverage","eligible_allmonth","eligible_mv",
+            "offer_ee_allmonth","enrolled_allmonth",
+            "offer_spouse","offer_dependents",
+            "spouse_eligible","child_eligible","spouse_enrolled","child_enrolled",
+            "waitingperiod_month","affordable_plan",
+            "line14_final","line16_final","line14_all12",
+        ]
+        cols = [c for c in order if c in interim.columns] + [c for c in interim.columns if c not in order]
+
+        log_df(log, interim, "interim")
+        log.info("interim summary", extra={"extra_data": {
+            "employees": int(interim["EmployeeID"].nunique()) if not interim.empty else 0,
+            "rows": int(interim.shape[0]) if hasattr(interim, "shape") else 0
+        }})
+
+        return interim.loc[:, cols]
 
 def build_final(interim: pd.DataFrame) -> pd.DataFrame:
     if interim is None or interim.empty:
@@ -335,7 +346,6 @@ def build_final(interim: pd.DataFrame) -> pd.DataFrame:
             for _, r in g.iterrows():
                 out.append({"EmployeeID": emp, "Month": r["Month"], "Line14_Final": r["line14_final"], "Line16_Final": r["line16_final"]})
     return pd.DataFrame.from_records(out)
-
 
 def build_penalty_dashboard(interim: pd.DataFrame) -> pd.DataFrame:
     if interim is None or interim.empty:
