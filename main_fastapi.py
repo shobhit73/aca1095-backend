@@ -1,4 +1,4 @@
-# main_fastapi.py  — ACA 1095-C backend (positional build_interim call)
+# main_fastapi.py — ACA 1095-C backend (robust form parsing + correct build_interim kwargs)
 from __future__ import annotations
 
 import io
@@ -10,13 +10,14 @@ from fastapi import FastAPI, File, Form, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-# Project modules
+# Your project modules
 from aca_builder import build_interim, build_final, build_penalty_dashboard
 from aca_pdf import fill_pdf_for_employee, save_excel_outputs, list_pdf_fields
 
-app = FastAPI(title="ACA 1095-C Backend", version="1.0.3")
 
-# ─────────────── CORS (tighten for prod) ───────────────
+app = FastAPI(title="ACA 1095-C Backend", version="1.0.4")
+
+# ────────────────────────── CORS (tighten in prod) ──────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,12 +26,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ───────────────────────────── health ─────────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True}
 
-# ─────────────── helpers ───────────────
+
+# ──────────────────────────── helpers ────────────────────────────
 def _to_plain_dict(m: Mapping[str, Any]) -> dict[str, Any]:
+    """Flatten a starlette FormData/QueryParams to a plain dict (keep original keys)."""
     return {str(k): m[k] for k in m}
 
 def _try_int(x: Any) -> Optional[int]:
@@ -58,9 +62,10 @@ def _try_float(x: Any) -> Optional[float]:
 def _truthy(x: Any, default: bool = False) -> bool:
     if x is None:
         return default
-    return str(x).strip().lower() in {"1","true","t","yes","y","on"}
+    return str(x).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 def _detect_year(form: Mapping[str, Any], explicit: Optional[int] = None) -> Optional[int]:
+    """Prefer explicit year, otherwise pick any key containing 'year'."""
     if explicit is not None:
         return explicit
     for k, v in form.items():
@@ -71,9 +76,10 @@ def _detect_year(form: Mapping[str, Any], explicit: Optional[int] = None) -> Opt
     return None
 
 def _detect_threshold(form: Mapping[str, Any], explicit: Optional[float] = None) -> Optional[float]:
+    """Prefer explicit threshold, otherwise search common keys / any '*threshold*' key."""
     if explicit is not None:
         return explicit
-    for key in ("affordabilityThreshold","affordability_threshold","threshold","aff_threshold"):
+    for key in ("affordabilityThreshold", "affordability_threshold", "threshold", "aff_threshold"):
         if key in form:
             t = _try_float(form[key])
             if t is not None:
@@ -86,6 +92,7 @@ def _detect_threshold(form: Mapping[str, Any], explicit: Optional[float] = None)
     return None
 
 def _xlsx_from_upload(file: UploadFile) -> dict[str, pd.DataFrame]:
+    """Read an uploaded Excel into {sheet_name: DataFrame} with lower-cased columns."""
     with io.BytesIO(file.file.read()) as buf:
         buf.seek(0)
         xl = pd.ExcelFile(buf)
@@ -97,6 +104,7 @@ def _xlsx_from_upload(file: UploadFile) -> dict[str, pd.DataFrame]:
         return out
 
 def _get_sheet(sheets: dict[str, pd.DataFrame], *candidates: str) -> pd.DataFrame:
+    """Case/space-tolerant sheet fetch. Returns empty DataFrame if not found."""
     norm = {k.strip().lower(): v for k, v in sheets.items()}
     for cand in candidates:
         key = cand.strip().lower()
@@ -111,28 +119,37 @@ def _build_everything(
     include_penalty: bool,
 ):
     """
-    Extract the three inputs and call build_interim POSITIONALLY to avoid signature mismatch.
+    Extract inputs → build interim → build final → (optional) penalty dashboard.
+    IMPORTANT: We call build_interim with **keyword args** to avoid ordering mistakes.
     """
+
+    # Core three inputs expected by your pipeline
     emp_elig  = _get_sheet(
         sheets,
-        "emp eligibility","employee eligibility","eligibility","emp_eligibility"
+        "emp eligibility", "employee eligibility", "eligibility", "emp_eligibility"
     )
     emp_enroll = _get_sheet(
         sheets,
-        "emp enrollment","employee enrollment","emp_enrollment","employee enrolment"
+        "emp enrollment", "employee enrollment", "emp_enrollment", "employee enrolment"
     )
     dep_enroll = _get_sheet(
         sheets,
-        "dep enrollment","dependent enrollment","dep_enrollment","dependent enrolment"
+        "dep enrollment", "dependent enrollment", "dep_enrollment", "dependent enrolment"
     )
 
-    # POSITONAL call (important): build_interim(emp_elig, emp_enroll, dep_enroll, year, threshold)
+    # If your build_interim also accepts an Emp Wait Period sheet (e.g., emp_wait=...),
+    # you can uncomment the next two lines and add the kwarg below.
+    # emp_wait = _get_sheet(sheets, "emp wait period", "wait period", "emp_wait_period")
+    # ... then pass emp_wait=emp_wait in the call.
+
+    # Keyword-based call (prevents the float→int error you saw when order was swapped)
     interim = build_interim(
-        emp_elig,
-        emp_enroll,
-        dep_enroll,
-        int(year),
-        float(threshold),
+        emp_elig=emp_elig,
+        emp_enroll=emp_enroll,
+        dep_enroll=dep_enroll,
+        affordability_threshold=float(threshold),
+        year=int(year),
+        # emp_wait=emp_wait,  # ← only if your function signature includes it
     )
 
     final = build_final(interim, year=int(year))
@@ -146,9 +163,11 @@ def _build_everything(
 
     return interim, final, penalty
 
-# ─────────────── debug ───────────────
+
+# ───────────────────────── Debug endpoint ─────────────────────────
 @app.post("/debug/pdf_fields")
 async def debug_pdf_fields(pdf: UploadFile = File(...)):
+    """Upload a blank 1095-C PDF to list its AcroForm fields (helps mapping)."""
     try:
         pdf_bytes = await pdf.read()
         fields = list_pdf_fields(pdf_bytes)
@@ -156,19 +175,25 @@ async def debug_pdf_fields(pdf: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
 
-# ─────────────── endpoints ───────────────
+
+# ───────────────────────── Main endpoints ─────────────────────────
 @app.post("/generate/single")
 async def generate_single(
     request: Request,
     excel: UploadFile = File(..., description="Input XLSX"),
     pdf: UploadFile | None = File(None, description="Blank 1095-C PDF"),
     employee_id: Optional[str] = Form(None, alias="employeeId"),
+
+    # common aliases from the UI
     filing_year: Optional[int] = Form(None, alias="filingYear"),
     year: Optional[int] = Form(None),
+
     affordability_threshold: Optional[float] = Form(None, alias="affordabilityThreshold"),
     threshold: Optional[float] = Form(None),
+
     include_penalty_dashboard: Optional[str] = Form(None, alias="includePenaltyDashboard"),
     includePenalty: Optional[str] = Form(None),
+
     mode: Optional[str] = Form(None),
 ):
     try:
@@ -180,14 +205,14 @@ async def generate_single(
 
         used_threshold = affordability_threshold if affordability_threshold is not None else threshold
         if used_threshold is None:
-            used_threshold = _detect_threshold(raw_form, None)
+            used_threshold = _detect_threshold(raw_form)
         if used_threshold is None:
-            used_threshold = 50.0
+            used_threshold = 50.0  # UAT default
 
         include_penalty = _truthy(
             raw_form.get("includePenaltyDashboard", include_penalty_dashboard)
             or raw_form.get("includePenalty", includePenalty),
-            default=False
+            default=False,
         )
 
         sheets = _xlsx_from_upload(excel)
@@ -198,6 +223,7 @@ async def generate_single(
             sheets=sheets, year=int(used_year), threshold=float(used_threshold), include_penalty=include_penalty
         )
 
+        # If EmployeeID is not provided → return processed Excel bundle
         if not employee_id:
             out_bytes = save_excel_outputs(
                 interim=interim, final=final, year=int(used_year), penalty_dashboard=penalty
@@ -209,6 +235,7 @@ async def generate_single(
                 headers={"Content-Disposition": f'attachment; filename="{filename}"'},
             )
 
+        # Generate ONE employee’s PDF
         emp_id_str = str(employee_id).strip()
         final_emp = final[final["EmployeeID"].astype(str) == emp_id_str]
         if final_emp.empty:
@@ -218,10 +245,17 @@ async def generate_single(
             return JSONResponse({"error": "Blank 1095-C PDF is required when EmployeeID is provided"}, status_code=422)
         pdf_bytes = await pdf.read()
 
+        # Optional enrollments for Part III logic in PDF
         emp_enroll = sheets.get("Emp Enrollment") or sheets.get("emp enrollment")
         dep_enroll = sheets.get("Dep Enrollment") or sheets.get("dep enrollment")
 
-        demo = sheets.get("EmployeeID") or sheets.get("employeeid") or sheets.get("demographics") or sheets.get("Demographics")
+        # Try demographics/EmployeeID sheet to fill Part I; fallback to Final row
+        demo = (
+            sheets.get("EmployeeID")
+            or sheets.get("employeeid")
+            or sheets.get("demographics")
+            or sheets.get("Demographics")
+        )
         if demo is not None and not demo.empty:
             dem_row = demo[demo["employeeid"].astype(str) == emp_id_str]
             emp_row = dem_row.iloc[0] if not dem_row.empty else final_emp.iloc[0]
@@ -242,14 +276,16 @@ async def generate_single(
             media_type="application/pdf",
             headers={"Content-Disposition": f'attachment; filename="{flattened_name}"'},
         )
+
     except Exception as e:
         return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
+
 
 @app.post("/generate/bulk")
 async def generate_bulk(
     request: Request,
     excel: UploadFile = File(...),
-    pdf: UploadFile = File(...),
+    pdf: UploadFile = File(...),  # kept for future expansion
     filing_year: Optional[int] = Form(None, alias="filingYear"),
     year: Optional[int] = Form(None),
     affordability_threshold: Optional[float] = Form(None, alias="affordabilityThreshold"),
@@ -257,28 +293,31 @@ async def generate_bulk(
     include_penalty_dashboard: Optional[str] = Form(None, alias="includePenaltyDashboard"),
     includePenalty: Optional[str] = Form(None),
 ):
+    """Processes Excel and returns the Interim/Final (and optional Penalty) workbook."""
     try:
         raw_form = _to_plain_dict(await request.form())
+
         used_year = _detect_year(raw_form, filing_year or year)
         if used_year is None:
             return JSONResponse({"error": "Missing filing year"}, status_code=422)
 
         used_threshold = affordability_threshold if affordability_threshold is not None else threshold
         if used_threshold is None:
-            used_threshold = _detect_threshold(raw_form, None)
+            used_threshold = _detect_threshold(raw_form)
         if used_threshold is None:
             used_threshold = 50.0
 
         include_penalty = _truthy(
             raw_form.get("includePenaltyDashboard", include_penalty_dashboard)
             or raw_form.get("includePenalty", includePenalty),
-            default=False
+            default=False,
         )
 
         sheets = _xlsx_from_upload(excel)
         interim, final, penalty = _build_everything(
             sheets=sheets, year=int(used_year), threshold=float(used_threshold), include_penalty=include_penalty
         )
+
         out_bytes = save_excel_outputs(interim=interim, final=final, year=int(used_year), penalty_dashboard=penalty)
         filename = f"ACA_outputs_{used_year}.xlsx"
         return Response(
@@ -288,6 +327,7 @@ async def generate_bulk(
         )
     except Exception as e:
         return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
+
 
 @app.post("/process/excel")
 async def process_excel(
@@ -300,28 +340,31 @@ async def process_excel(
     include_penalty_dashboard: Optional[str] = Form(None, alias="includePenaltyDashboard"),
     includePenalty: Optional[str] = Form(None),
 ):
+    """Returns an Excel workbook with Interim + Final (+ Penalty if requested)."""
     try:
         raw_form = _to_plain_dict(await request.form())
+
         used_year = _detect_year(raw_form, filing_year or year)
         if used_year is None:
             return JSONResponse({"error": "Missing filing year"}, status_code=422)
 
         used_threshold = affordability_threshold if affordability_threshold is not None else threshold
         if used_threshold is None:
-            used_threshold = _detect_threshold(raw_form, None)
+            used_threshold = _detect_threshold(raw_form)
         if used_threshold is None:
             used_threshold = 50.0
 
         include_penalty = _truthy(
             raw_form.get("includePenaltyDashboard", include_penalty_dashboard)
             or raw_form.get("includePenalty", includePenalty),
-            default=False
+            default=False,
         )
 
         sheets = _xlsx_from_upload(excel)
         interim, final, penalty = _build_everything(
             sheets=sheets, year=int(used_year), threshold=float(used_threshold), include_penalty=include_penalty
         )
+
         out_bytes = save_excel_outputs(interim=interim, final=final, year=int(used_year), penalty_dashboard=penalty)
         filename = f"ACA_outputs_{used_year}.xlsx"
         return Response(
