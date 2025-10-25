@@ -249,3 +249,13 @@ def _waiting_in_month(wait_df_emp: pd.DataFrame, ms: date, me: date) -> bool:
     e = s + pd.to_timedelta((d.clip(lower=0) - 1).astype(int), unit="D")
     e = e.where(d > 0, s - timedelta(days=1))  # 0-day → non-wait
     return bool(((e >= ms) & (s <= me)).any())
+
+# --- compatibility shim for main_fastapi.py ---
+def preprocess_inputs(sheets: dict) -> dict:
+    """
+    Passthrough normalize hook.
+    If you later need column aliasing / 'Emp Wait Period' merging, implement it here.
+    For now it just returns the uploaded sheets unchanged.
+    """
+    return sheets
+
