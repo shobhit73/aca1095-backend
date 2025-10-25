@@ -5,24 +5,18 @@ from datetime import timedelta
 import pandas as pd
 
 from aca_processing import (
-    MONTHS,
-    FULL_MONTHS,
+    MONTHS, FULL_MONTHS,
     _collect_employee_ids, month_bounds,
     _any_overlap, _all_month,
-    _status_from_demographic,
-    _waiting_in_month,              # NEW
+    _status_from_demographic, _waiting_in_month,
 )
 
 __all__ = ["build_interim","build_final","build_penalty_dashboard"]
 
-AFFORDABILITY_THRESHOLD_DEFAULT = 50.0  # dollars (employee-only)
-PENALTY_A_MONTHLY = 241.67
-PENALTY_B_MONTHLY = 362.50
+AFFORDABILITY_THRESHOLD_DEFAULT = 50.0
 
 def _df_or_empty(df: pd.DataFrame | None) -> pd.DataFrame:
-    if isinstance(df, pd.DataFrame) and not df.empty:
-        return df
-    return pd.DataFrame()
+    return df if isinstance(df, pd.DataFrame) and not df.empty else pd.DataFrame()
 
 def _apply_aliases(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -45,11 +39,8 @@ def _latest_emp_cost_for_month(el_df: pd.DataFrame, ms, me) -> Optional[float]:
     for c in ("eligibilitystartdate", "eligibilityenddate"):
         if c in df.columns and not pd.api.types.is_datetime64_any_dtype(df[c]):
             df[c] = pd.to_datetime(df[c], errors="coerce")
-    mask = (
-        df["eligibilityenddate"].fillna(pd.Timestamp.max).dt.date >= ms
-    ) & (
-        df["eligibilitystartdate"].fillna(pd.Timestamp.min).dt.date <= me
-    )
+    mask = (df["eligibilityenddate"].fillna(pd.Timestamp.max).dt.date >= ms) & \
+           (df["eligibilitystartdate"].fillna(pd.Timestamp.min).dt.date <= me)
     df = df[mask]
     if df.empty or "eligibilitytier" not in df.columns:
         return None
@@ -157,11 +148,10 @@ def build_interim(
     dep_enroll: pd.DataFrame,
     year: int,
     *,
-    emp_wait: pd.DataFrame | None = None,                # NEW
+    emp_wait: pd.DataFrame | None = None,   # NEW
     affordability_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
-    """Main rules engine. Only change: waitingperiod_month now comes from Emp Wait Period sheet."""
-
+    """Main rules engine. waitingperiod_month comes ONLY from Emp Wait Period."""
     emp_demo   = _apply_aliases(_df_or_empty(emp_demo))
     emp_elig   = _apply_aliases(_df_or_empty(emp_elig))
     emp_enroll = _apply_aliases(_df_or_empty(emp_enroll))
@@ -181,19 +171,62 @@ def build_interim(
     st = _status_from_demographic(emp_demo)
     employee_ids = _collect_employee_ids(emp_demo, st, emp_elig, emp_enroll, dep_enroll, emp_wait)
     rows: List[Dict[str, Any]] = []
+    thresh = AFFORDABILITY_THRESHOLD_DEFAULT if affordability_threshold is None else float(affordability_threshold)
 
-    thresh = 50.0 if affordability_threshold is None else float(affordability_threshold)
+    def _is_employed_month(st_emp: pd.DataFrame, ms, me) -> bool:
+        if st_emp is None or st_emp.empty:
+            return False
+        for c in ("statusstartdate", "statusenddate"):
+            if c in st_emp.columns and not pd.api.types.is_datetime64_any_dtype(st_emp[c]):
+                st_emp[c] = pd.to_datetime(st_emp[c], errors="coerce")
+        overlaps = (st_emp["statusenddate"].fillna(pd.Timestamp.max).dt.date >= ms) & \
+                   (st_emp["statusstartdate"].fillna(pd.Timestamp.min).dt.date <= me)
+        if not overlaps.any():
+            return False
+        if "_estatus_norm" in st_emp.columns:
+            s = st_emp.loc[overlaps, "_estatus_norm"].astype(str)
+            any_term = s.str.contains("TERMINAT", na=False) | s.str.fullmatch("TERM", na=False)
+            return not bool(any_term.any())
+        return True
+
+    def _is_ft(st_emp: pd.DataFrame, ms, me) -> bool:
+        if st_emp.empty or "_role_norm" not in st_emp.columns:
+            return False
+        if "_estatus_norm" in st_emp.columns:
+            overlaps = (st_emp["statusenddate"].fillna(pd.Timestamp.max).dt.date >= ms) & \
+                       (st_emp["statusstartdate"].fillna(pd.Timestamp.min).dt.date <= me)
+            if overlaps.any():
+                s = st_emp.loc[overlaps, "_estatus_norm"].astype(str)
+                any_term = s.str.contains("TERMINAT", na=False) | s.str.fullmatch("TERM", na=False)
+                if any_term.any():
+                    return False
+        s = st_emp["_role_norm"].astype(str)
+        mask = s.str.contains("FULLTIME", na=False) | s.str.fullmatch("FT", na=False)
+        return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
+
+    def _is_pt(st_emp: pd.DataFrame, ms, me) -> bool:
+        if st_emp.empty or "_role_norm" not in st_emp.columns:
+            return False
+        if "_estatus_norm" in st_emp.columns:
+            overlaps = (st_emp["statusenddate"].fillna(pd.Timestamp.max).dt.date >= ms) & \
+                       (st_emp["statusstartdate"].fillna(pd.Timestamp.min).dt.date <= me)
+            if overlaps.any():
+                s = st_emp.loc[overlaps, "_estatus_norm"].astype(str)
+                any_term = s.str.contains("TERMINAT", na=False) | s.str.fullmatch("TERM", na=False)
+                if any_term.any():
+                    return False
+        s = st_emp["_role_norm"].astype(str)
+        mask = s.str.contains("PARTTIME", na=False) | s.str.fullmatch("PT", na=False)
+        return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
 
     for emp in employee_ids:
         el_emp = emp_elig[emp_elig["employeeid"].astype(str) == str(emp)].copy() if not emp_elig.empty else pd.DataFrame()
         en_emp = emp_enroll[emp_enroll["employeeid"].astype(str) == str(emp)].copy() if not emp_enroll.empty else pd.DataFrame()
-        de_emp = dep_enroll[dep_enroll["employeeid"].astype(str) == str(emp)].copy() if not dep_enroll.empty else pd.DataFrame()
         st_emp = st[st["employeeid"].astype(str) == str(emp)].copy() if not st.empty else pd.DataFrame()
         wt_emp = emp_wait[emp_wait["employeeid"].astype(str) == str(emp)].copy() if not emp_wait.empty else pd.DataFrame()
 
         for m in range(1, 13):
             ms, me = month_bounds(year, m)
-
             employed = _is_employed_month(st_emp, ms, me)
             ft = _is_ft(st_emp, ms, me)
             parttime = (not ft) and _is_pt(st_emp, ms, me)
@@ -202,9 +235,9 @@ def build_interim(
             elig_full = _all_month(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me) if not el_emp.empty else False
 
             eligible_mv = False
-            if not el_emp.empty:
-                el_mv_mask = el_emp["plancode"].astype(str).str.upper().str.strip().eq("PLANA") if "plancode" in el_emp.columns else pd.Series(False, index=el_emp.index)
-                eligible_mv = _all_month(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me, mask=el_mv_mask)
+            if not el_emp.empty and "plancode" in el_emp.columns:
+                mask_mv = el_emp["plancode"].astype(str).str.upper().str.strip().eq("PLANA")
+                eligible_mv = _all_month(el_emp, "eligibilitystartdate", "eligibilityenddate", ms, me, mask=mask_mv)
 
             offer_ee_allmonth = _offered_allmonth(el_emp, ms, me)
 
@@ -216,9 +249,9 @@ def build_interim(
             enrolled_full = _enrolled_full_month_union(en_emp, ms, me)
 
             emp_cost = _latest_emp_cost_for_month(el_emp, ms, me)
-            affordable = (emp_cost is not None) and (emp_cost < thresh)
+            affordable = (emp_cost is not None) and (emp_cost < (AFFORDABILITY_THRESHOLD_DEFAULT if affordability_threshold is None else float(affordability_threshold)))
 
-            # NEW: waiting period only from Emp Wait Period sheet
+            # NEW: waiting solely from Emp Wait Period
             waiting = _waiting_in_month(wt_emp, ms, me)
 
             l14 = _month_line14(eligible_mv, offer_ee_allmonth, offer_spouse, offer_dependents, affordable)
@@ -263,6 +296,7 @@ def build_interim(
 
     interim = pd.DataFrame.from_records(rows)
 
+    # 1G handling
     one_g_emp_ids = []
     for emp in interim["EmployeeID"].unique():
         it = interim[interim["EmployeeID"] == emp]
@@ -287,7 +321,7 @@ def build_interim(
     cols = [c for c in order if c in interim.columns] + [c for c in interim.columns if c not in order]
     return interim.loc[:, cols]
 
-# build_final & build_penalty_dashboard unchanged from the last working version
+
 def build_final(interim: pd.DataFrame) -> pd.DataFrame:
     if interim is None or interim.empty:
         return pd.DataFrame(columns=["EmployeeID", "Month", "Line14_Final", "Line16_Final"])
@@ -301,6 +335,7 @@ def build_final(interim: pd.DataFrame) -> pd.DataFrame:
             for _, r in g.iterrows():
                 out.append({"EmployeeID": emp, "Month": r["Month"], "Line14_Final": r["line14_final"], "Line16_Final": r["line16_final"]})
     return pd.DataFrame.from_records(out)
+
 
 def build_penalty_dashboard(interim: pd.DataFrame) -> pd.DataFrame:
     if interim is None or interim.empty:
