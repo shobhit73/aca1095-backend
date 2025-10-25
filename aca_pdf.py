@@ -49,10 +49,7 @@ def normalize_ssn_digits(s: str) -> str:
 
 
 def _all_fields(reader: PdfReader) -> Dict[str, dict]:
-    """
-    Return a mapping: field_name -> { 'parent_T': '...', 'FT': '/Tx'|'/Btn', ... }
-    (based on your dumped JSON structure).
-    """
+    """Return a mapping of field name -> field dict (PyPDF2 get_fields-compatible)."""
     fields: Dict[str, dict] = {}
     try:
         raw = reader.get_fields()
@@ -70,7 +67,7 @@ def _all_fields(reader: PdfReader) -> Dict[str, dict]:
     return fields
 
 
-# =============== low-level PDF writes (now across ALL pages) ===============
+# =============== low-level PDF writes (across *all* pages) ===============
 
 def _find_on_value(annot_obj) -> NameObject:
     """The 'on' appearance name for a checkbox."""
@@ -150,25 +147,19 @@ def _set_need_appearances(writer: PdfWriter):
 
 
 def _flatten(writer: PdfWriter) -> bytes:
-    """Write a flattened copy (no AcroForm/Annots)."""
-    try:
-        root = writer._root_object  # type: ignore[attr-defined]
-        if "/AcroForm" in root:
-            del root["/AcroForm"]
-        for i in range(len(writer.pages)):
-            page = writer.pages[i]
-            if "/Annots" in page:
-                del page["/Annots"]
-    except Exception:
-        pass
-
+    """
+    Write a 'flattened' copy that still preserves field values.
+    IMPORTANT: Do **not** delete /AcroForm or /Annots here, otherwise values vanish.
+    Rely on NeedAppearances so viewers render the text.
+    """
+    _set_need_appearances(writer)
     out = io.BytesIO()
     writer.write(out)
     out.seek(0)
     return out.getvalue()
 
 
-# =============== Part III discovery (Works with your template) ===============
+# =============== Part III discovery ===============
 
 @dataclass
 class Part3RowRefs:
@@ -178,14 +169,13 @@ class Part3RowRefs:
 
 def _discover_part3_rows(reader: PdfReader) -> List[Part3RowRefs]:
     """
-    Your template groups Part III by parents 'Row1[0]'..'RowN[0]'.
-    Inside a Row:
+    Group Part III fields by parents 'Row1[0]'..'RowN[0]'.
+    Within each row:
       - text fields are 'f3_*' (5 per row)
       - month checkboxes are 'c3_*' (13 per row)
     """
     fields = _all_fields(reader)
 
-    # Build index by parent
     by_parent: Dict[str, List[str]] = {}
     for name, meta in fields.items():
         parent = meta.get("parent_T")
@@ -193,7 +183,7 @@ def _discover_part3_rows(reader: PdfReader) -> List[Part3RowRefs]:
             by_parent.setdefault(parent, []).append(name)
 
     rows: List[Part3RowRefs] = []
-    for parent in sorted([p for p in by_parent if p.startswith("Row")], key=_to_int_safe):
+    for parent in sorted([p for p in by_parent if p and p.startswith("Row")], key=_to_int_safe):
         names = by_parent[parent]
         texts = sorted([n for n in names if n.startswith("f3_")], key=_to_int_safe)
         boxes = sorted([n for n in names if n.startswith("c3_")], key=_to_int_safe)
@@ -213,7 +203,7 @@ def fill_pdf_for_employee(
     dep_enroll_emp: Optional[pd.DataFrame] = None,
 ):
     """
-    Fill 1095-C PDF (Parts I, II, and PART III) using your form's actual groups.
+    Fill 1095-C PDF (Parts I, II, and PART III).
     Returns: (editable_name, editable_bytes, flattened_name, flattened_bytes)
     """
     reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -236,14 +226,12 @@ def fill_pdf_for_employee(
     state = _coerce_str(emp_row.get("state"))
     zipcode = _coerce_str(emp_row.get("zipcode"))
 
-    # In your template, Part I employee fields live under parent 'EmployeeName[0]' as f1_*.
+    # EmployeeName group exposes 8 fields: f1_1..f1_8 (Name, SSN, Addr, City, State, ZIP, etc.)
     employee_fields = sorted(
         [k for k, v in fields_meta.items()
          if k.startswith("f1_") and v.get("parent_T") == "EmployeeName[0]"],
         key=_to_int_safe,
     )
-    # We don't assume exact order—write sensibly to the first few slots.
-    # (This works well across different 1095-C PDFs that split Part I into multiple text boxes.)
     named: Dict[str, str] = {}
     if employee_fields:
         # 0: Name
@@ -255,7 +243,7 @@ def fill_pdf_for_employee(
         if len(employee_fields) > 2:
             addr = addr1 if not addr2 else f"{addr1} {addr2}"
             named[employee_fields[2]] = addr
-        # 3..5: City / State / ZIP
+        # 3..5: City / State / ZIP (best-effort)
         if len(employee_fields) > 3:
             named[employee_fields[3]] = city
         if len(employee_fields) > 4:
@@ -266,20 +254,12 @@ def fill_pdf_for_employee(
     _update_text_any_page(writer, named)
 
     # ---------- Part II: Line 14 & Line 16 ----------
-    # Your template does not expose explicit L14/L16 field groups in the dump
-    # (only 'PartII[0]' with a single field, likely Plan Start Month).
-    # We'll still try to fill monthly codes if present by using month-ordered
-    # fields named 'f1_*' under a dedicated group. If none exist, we skip cleanly.
+    # Your current PDF revision doesn't expose explicit L14/L16 text fields in the dump
+    # (the grid is printed). We skip writing them unless fields are present.
 
     month_to_code14 = {row["Month"]: _coerce_str(row.get("Line14_Final")) for _, row in final_df_emp.iterrows()}
-    month_to_code16 = {row["Month"]: _coerce_str(row.get("Line16_Final")) for _, row in final_df_emp.iterrows()}
     vals14 = [month_to_code14.get(m, "") for m in MONTHS]
-    vals16 = [month_to_code16.get(m, "") for m in MONTHS]
     all14_same = len(set(vals14)) == 1 and (vals14[0] or "") != ""
-    all16_same = len(set(vals16)) == 1 and (vals16[0] or "") != ""
-
-    # If your PDF ever includes named L14/L16 fields, add a small mapping here.
-    # Current template appears to have the table printed lines, so nothing to write.
 
     # ---------- Part III: Covered individuals ----------
     rows = _discover_part3_rows(reader)
@@ -296,7 +276,6 @@ def fill_pdf_for_employee(
             }
             _update_text_any_page(writer, last_first_mi_ssn_dob)
 
-        # MEC months: use L14 presence as a proxy
         if r0.month_boxes:
             if all14_same and (vals14[0] or "") != "":
                 _set_checkbox_on_any(writer, r0.month_boxes[0])  # All 12
@@ -313,7 +292,7 @@ def fill_pdf_for_employee(
     writer.write(editable)
     editable.seek(0)
 
-    # Flattened
+    # “Flattened” (non-destructive so values remain visible)
     flat_bytes = _flatten(writer)
     flattened = io.BytesIO(flat_bytes)
     flattened.seek(0)
