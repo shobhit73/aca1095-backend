@@ -1,12 +1,11 @@
 # aca_pdf.py
-# Fill 1095-C PDFs (robust field matching + proper AcroForm handling)
+
 from __future__ import annotations
 
 import io
-import re
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,7 +15,7 @@ from PyPDF2.generic import NameObject
 from aca_processing import MONTHS, _coerce_str, month_bounds
 
 
-# ───────────────────────────── Helpers ─────────────────────────────
+# ----------------------------- small helpers -----------------------------
 def _safe_int(x, default=None):
     try:
         f = float(x)
@@ -40,8 +39,8 @@ def normalize_ssn_digits(s: str) -> str:
     return s
 
 
+# ----------------------------- PDF field helpers -----------------------------
 def _all_fields(reader: PdfReader) -> Dict[str, dict]:
-    """Return the raw field dict as a plain mapping."""
     fields = reader.get_fields() or {}
     out: Dict[str, dict] = {}
     for k, v in fields.items():
@@ -51,7 +50,9 @@ def _all_fields(reader: PdfReader) -> Dict[str, dict]:
 
 
 def _checkbox_on_name(widget: dict) -> NameObject:
-    """Find the ON appearance name for a checkbox widget. Fallback '/Yes'."""
+    """
+    Find the ON appearance name for a checkbox widget. If unknown, default to '/Yes'.
+    """
     try:
         ap = widget.get("/AP")
         if ap and "/N" in ap:
@@ -65,7 +66,9 @@ def _checkbox_on_name(widget: dict) -> NameObject:
 
 
 def _set_checkbox_on(page, field_name: str):
-    """Turn a checkbox ON by updating both /V and /AS for its widget annot."""
+    """
+    Turn a checkbox ON by updating both /V and /AS for its widget annotation.
+    """
     if "/Annots" not in page:
         return
     for annot in page["/Annots"]:
@@ -95,82 +98,76 @@ def _update_text(page, name_to_value: Dict[str, str]):
                     obj.update({NameObject("/V"): name_to_value[nm]})
 
 
-def _ensure_acroform(writer: PdfWriter, reader: PdfReader):
-    """
-    Copy the source /AcroForm into the writer and set NeedAppearances=true.
-    Without this, many viewers show 'blank' even if values were written.
-    """
+def _set_need_appearances(writer: PdfWriter):
     try:
-        root = reader.trailer["/Root"]
+        root = writer._root_object  # type: ignore[attr-defined]
         if "/AcroForm" in root:
-            writer._root_object.update({NameObject("/AcroForm"): root["/AcroForm"]})
-            try:
-                writer._root_object["/AcroForm"].update(
-                    {NameObject("/NeedAppearances"): NameObject("/true")}
-                )
-            except Exception:
-                pass
+            root["/AcroForm"].update({NameObject("/NeedAppearances"): NameObject("/true")})
     except Exception:
         pass
 
 
-# ────────────────────── Part III row discovery ──────────────────────
+def _flatten(writer: PdfWriter) -> PdfWriter:
+    """Lightweight 'flatten': drop AcroForm & annotations, keeping filled values where possible."""
+    out = PdfWriter()
+    for p in writer.pages:
+        page = p
+        if "/Annots" in page:
+            del page[NameObject("/Annots")]
+        out.add_page(page)
+    if "/AcroForm" in out._root_object:
+        del out._root_object[NameObject("/AcroForm")]
+    return out
+
+
+# ----------------------------- Part III discovery -----------------------------
 @dataclass
 class Part3RowRefs:
-    text_fields: List[str]   # last, first, mi, ssn, (dob) – order inferred
-    month_boxes: List[str]   # [All12, Jan..Dec]
+    # Text fields (5): last, first, mi, ssn, dob  (actual order determined at runtime)
+    text_fields: List[str]
+    # Month checkboxes (13): [all12, Jan..Dec]
+    month_boxes: List[str]
 
 
 def _discover_part3_rows(reader: PdfReader) -> List[Part3RowRefs]:
     """
-    Inspect AcroForm and return row references for Part III (Covered Individuals).
-    Works with IRS 'Row1/Row2/...' labels and vendor variants.
+    Inspect the PDF's AcroForm and return row references for Part III (Covered Individuals).
+    Relies on /Parent '/T' like 'Row1', 'Row2', ... (present in the IRS form).
     """
     fields = _all_fields(reader)
     text_by_row: Dict[str, List[str]] = {}
     box_by_row: Dict[str, List[str]] = {}
-
     for name, rec in fields.items():
-        if "f3_" in name:  # text inputs
+        if name.startswith("f3_"):  # text inputs
             parent = rec.get("/Parent", {})
             row = parent.get("/T") if isinstance(parent, dict) else str(parent.get("/T"))
             row = str(row) if row else "Row?"
             text_by_row.setdefault(row, []).append(name)
-        elif "c3_" in name:  # checkboxes
+        elif name.startswith("c3_"):  # checkboxes
             parent = rec.get("/Parent", {})
             row = parent.get("/T") if isinstance(parent, dict) else str(parent.get("/T"))
             row = str(row) if row else "Row?"
             box_by_row.setdefault(row, []).append(name)
 
-    def _field_sort_key(n: str) -> int:
+    def _sort_key(n: str) -> int:
         try:
-            return int(re.search(r"_(\d+)\[", n).group(1))  # type: ignore[union-attr]
+            return int(n.split("_")[1].split("[")[0])
         except Exception:
             return 9999
 
-    def _row_sort_key(row_label: str) -> int:
-        if not row_label:
-            return 999
-        if row_label.startswith("Row"):
-            s = row_label.replace("Row", "")
-            try:
-                return int(s.strip("[]") or "999")
-            except Exception:
-                pass
-        m = re.search(r"(\d+)", str(row_label))
-        return int(m.group(1)) if m else 999
-
     rows: List[Part3RowRefs] = []
-    for row_name in sorted(text_by_row.keys(), key=_row_sort_key):
-        texts = sorted(text_by_row.get(row_name, []), key=_field_sort_key)
-        boxes = sorted(box_by_row.get(row_name, []), key=_field_sort_key)
+    for row_name in sorted(text_by_row.keys(), key=lambda r: int(r.replace("Row", "").strip("[]") or "999")):
+        texts = sorted(text_by_row.get(row_name, []), key=_sort_key)
+        boxes = sorted(box_by_row.get(row_name, []), key=_sort_key)
         rows.append(Part3RowRefs(text_fields=texts, month_boxes=boxes))
     return rows
 
 
-# ───────────────────── Month coverage calculations ───────────────────
+# ----------------------------- Month coverage math -----------------------------
 def _months_from_periods(periods: List[Tuple[date, date]], year: int) -> Tuple[bool, List[bool]]:
-    """Given coverage periods -> (all12, [Jan..Dec] flags) for that year."""
+    """
+    Given coverage periods [(start,end), ...] return (all12, [Jan..Dec] booleans) for the given year.
+    """
     jan1, dec31 = date(year, 1, 1), date(year, 12, 31)
     covered = [False] * 12
     for (s, e) in periods:
@@ -182,31 +179,17 @@ def _months_from_periods(periods: List[Tuple[date, date]], year: int) -> Tuple[b
             ms, me = month_bounds(year, m)
             if not (e < ms or s > me):
                 covered[m - 1] = True
-    return all(covered), covered
+    all12 = all(covered)
+    return all12, covered
 
 
-# ─────────────────── Robust Part I/II field indexing ─────────────────
-# Examples that this matches:
-#   "f1_1[0]"                        (plain)
-#   "topmostSubform[0].f1_1[0]"      (prefixed)
-#   "Page1[0].f1_017[0]"             (zero-padded)
-_F1_RE = re.compile(r"f1[_\.]?(0*)(\d+)\[0\]$")
-
-def _index_f1_fields(reader: PdfReader) -> Dict[int, str]:
-    """
-    Build a map {number: full_field_name} for any field ending with f1_<num>[0],
-    regardless of prefixes/zero-padding.
-    """
-    out: Dict[int, str] = {}
-    fields = reader.get_fields() or {}
-    for full_name in fields.keys():
-        m = _F1_RE.search(full_name)
-        if m:
-            out[int(m.group(2))] = full_name
-    return out
+# ----------------------------- Part I & II mapping helpers -----------------------------
+def _f1_field_names(reader: PdfReader, start_num: int, count: int) -> List[str]:
+    """Utility: build f1_<n>[0] names like f1_18.. given a starting numeric id and count."""
+    return [f"f1_{i}[0]" for i in range(start_num, start_num + count)]
 
 
-# ─────────────────────────── Public API ───────────────────────────
+# ----------------------------- Public API -----------------------------
 def fill_pdf_for_employee(
     pdf_bytes: bytes,
     emp_row: pd.Series,
@@ -222,12 +205,11 @@ def fill_pdf_for_employee(
     reader = PdfReader(io.BytesIO(pdf_bytes))
     writer = PdfWriter()
 
-    # Copy pages and copy AcroForm so fields render
+    # Copy pages
     for p in reader.pages:
         writer.add_page(p)
-    _ensure_acroform(writer, reader)
 
-    # ------------- Part I (employee info) -------------
+    # ---------------- Part I (employee info) ----------------
     first = _coerce_str(emp_row.get("firstname"))
     mi = _coerce_str(emp_row.get("middleinitial"))
     last = _coerce_str(emp_row.get("lastname"))
@@ -238,28 +220,25 @@ def fill_pdf_for_employee(
     state = _coerce_str(emp_row.get("state"))
     zipcode = _coerce_str(emp_row.get("zipcode"))
 
-    f1_index = _index_f1_fields(reader)
-    def _name_for(num: int) -> Optional[str]:
-        return f1_index.get(num)
+    # IRS template typically uses f1_1..f1_8 for the employee block
+    part1_values = {
+        "f1_1[0]": last,        # Last name
+        "f1_2[0]": first,       # First name
+        "f1_3[0]": mi,          # MI
+        "f1_4[0]": ssn,         # SSN
+        "f1_5[0]": addr1,       # Address
+        "f1_6[0]": addr2,       # Address 2
+        "f1_7[0]": city,        # City
+        "f1_8[0]": f"{state} {zipcode}".strip(),
+    }
+    _update_text(writer.pages[0], part1_values)
 
-    part1_map: Dict[str, str] = {}
-    if _name_for(1):  part1_map[_name_for(1)] = last
-    if _name_for(2):  part1_map[_name_for(2)] = first
-    if _name_for(3):  part1_map[_name_for(3)] = mi
-    if _name_for(4):  part1_map[_name_for(4)] = ssn
-    if _name_for(5):  part1_map[_name_for(5)] = addr1
-    if _name_for(6):  part1_map[_name_for(6)] = addr2
-    if _name_for(7):  part1_map[_name_for(7)] = city
-    if _name_for(8):  part1_map[_name_for(8)] = f"{state} {zipcode}".strip()
-    if part1_map:
-        _update_text(writer.pages[0], part1_map)
-
-    # ------------- Part II (Line 14 + Line 16) -------------
-    # Line 14: All-12 + Jan..Dec -> 17, 18..29
-    l14_all12_name = _name_for(17)
-    l14_month_fields = [_name_for(n) for n in range(18, 30)]
-    # Line 16: Jan..Dec -> 44..55
-    l16_month_fields = [_name_for(n) for n in range(44, 56)]
+    # ---------------- Part II (Line 14 + Line 16) ----------------
+    # Line 14: All-12 + Jan..Dec: f1_17..f1_29 (13 fields)
+    # Line 16: Jan..Dec: f1_44..f1_55 (12 fields)
+    l14_all12_name = "f1_17[0]"
+    l14_month_fields = _f1_field_names(reader, 18, 12)  # f1_18..f1_29
+    l16_month_fields = _f1_field_names(reader, 44, 12)  # f1_44..f1_55
 
     m_to_l14: Dict[str, str] = {}
     m_to_l16: Dict[str, str] = {}
@@ -272,23 +251,19 @@ def fill_pdf_for_employee(
 
     # Line 14
     l14_vals = [m_to_l14.get(m, "") for m in MONTHS]
-    if l14_all12_name and l14_vals and all(v == l14_vals[0] and v for v in l14_vals):
+    if l14_vals and all(v == l14_vals[0] and v for v in l14_vals):
         _update_text(writer.pages[0], {l14_all12_name: l14_vals[0]})
     else:
-        updates = {fld: val for fld, val in zip(l14_month_fields, l14_vals) if fld}
-        if updates:
-            _update_text(writer.pages[0], updates)
+        _update_text(writer.pages[0], {fld: val for fld, val in zip(l14_month_fields, l14_vals)})
 
     # Line 16
     l16_vals = [m_to_l16.get(m, "") for m in MONTHS]
-    updates = {fld: val for fld, val in zip(l16_month_fields, l16_vals) if fld}
-    if updates:
-        _update_text(writer.pages[0], updates)
+    _update_text(writer.pages[0], {fld: val for fld, val in zip(l16_month_fields, l16_vals)})
 
-    # ------------- Part III (Covered Individuals) -------------
+    # ---------------- Part III (Covered Individuals) ----------------
     covered_rows: List[Tuple[str, str, str, str, Tuple[bool, List[bool]]]] = []
 
-    # Employee coverage from enrollment (skip WAIVE) else infer from 2C
+    # (A) Employee: from enrollment if provided, else derived from Line16 == '2C'
     emp_months_enrolled = [False] * 12
     if emp_enroll_emp is not None and not emp_enroll_emp.empty:
         periods: List[Tuple[date, date]] = []
@@ -310,7 +285,7 @@ def fill_pdf_for_employee(
             all12 = all(emp_months_enrolled)
             covered_rows.append((first, mi, last, ssn, (all12, emp_months_enrolled)))
 
-    # Dependents (skip WAIVE)
+    # (B) Dependents (skip WAIVE)
     if dep_enroll_emp is not None and not dep_enroll_emp.empty:
         for _, rr in dep_enroll_emp.iterrows():
             plan_code = _coerce_str(rr.get("plancode") or rr.get("PlanCode"))
@@ -328,20 +303,23 @@ def fill_pdf_for_employee(
             if any(months):
                 covered_rows.append((dep_first, dep_mi, dep_last, dep_ssn, (all12, months)))
 
-    # Fill discovered rows
+    # Discover Part III rows in the PDF and fill them
     p3_rows = _discover_part3_rows(reader)
+
     for idx, person in enumerate(covered_rows[: len(p3_rows)]):
         first_n, mi_n, last_n, ssn_n, (all12, mlist) = person
         rowref = p3_rows[idx]
 
-        # Heuristic text order: smallest ids → Last, First, MI, SSN, (DOB)
+        # Text assignment heuristic: smallest numeric ids align as L, F, MI, SSN, DOB
         texts_sorted = rowref.text_fields
         assign = {}
-        if len(texts_sorted) >= 4:
+        if len(texts_sorted) >= 5:
             assign[texts_sorted[0]] = last_n
             assign[texts_sorted[1]] = first_n
             assign[texts_sorted[2]] = mi_n
             assign[texts_sorted[3]] = ssn_n
+            # texts_sorted[4] presumed DOB -> left blank
+        # update on last page (AcroForm is global)
         _update_text(writer.pages[-1], assign)
 
         # Month boxes: [All12, Jan..Dec]
@@ -353,23 +331,16 @@ def fill_pdf_for_employee(
                     if on and m_idx + 1 < len(rowref.month_boxes):
                         _set_checkbox_on(writer.pages[-1], rowref.month_boxes[m_idx + 1])
 
-    # Ensure viewers re-generate appearances
-    try:
-        writer._root_object["/AcroForm"].update(
-            {NameObject("/NeedAppearances"): NameObject("/true")}
-        )
-    except Exception:
-        pass
+    _set_need_appearances(writer)
 
-    # Write outputs
     editable = io.BytesIO()
     writer.write(editable)
     editable.seek(0)
 
-    # NOTE: Aggressive "flatten" (removing AcroForm/Annots) can hide values on some viewers.
-    # For reliability, ship the same bytes as a 'flattened' copy. If you later need a true
-    # visual flatten (draw text to the page content), we can add a render-based overlay.
-    flattened = io.BytesIO(editable.getvalue())
+    flattened_writer = _flatten(writer)
+    flattened = io.BytesIO()
+    flattened_writer.write(flattened)
+    flattened.seek(0)
 
     first_last = f"{first}_{last}".strip().replace(" ", "_") or (_coerce_str(emp_row.get("employeeid")) or "employee")
     editable_name = f"1095c_filled_fields_{first_last}_{year_used}.pdf"
@@ -377,7 +348,7 @@ def fill_pdf_for_employee(
     return editable_name, editable, flattened_name, flattened
 
 
-# ────────────────── Excel writer (used by API layer) ─────────────────
+# ----------------------------- Excel writer -----------------------------
 def save_excel_outputs(
     interim: pd.DataFrame,
     final: pd.DataFrame,
@@ -392,31 +363,3 @@ def save_excel_outputs(
             penalty_dashboard.to_excel(xw, index=False, sheet_name=f"Penalty Dashboard {year}")
     buf.seek(0)
     return buf.getvalue()
-
-
-# ─────────────── Debug helper: list fields in a PDF ───────────────
-def list_pdf_fields(pdf_bytes: bytes) -> Dict[str, Dict[str, Any]]:
-    """
-    Return a dict of all AcroForm fields found in the PDF.
-    Key is the full field name; value includes a couple of useful attributes.
-    If this returns {}, your PDF likely has no AcroForm fields (or is XFA-only).
-    """
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        fields = reader.get_fields() or {}
-        out: Dict[str, Dict[str, Any]] = {}
-        for full_name, rec in fields.items():
-            try:
-                parent = rec.get("/Parent", {})
-                row = None
-                if isinstance(parent, dict):
-                    row = parent.get("/T")
-                out[full_name] = {
-                    "parent_T": str(row) if row is not None else None,
-                    "FT": str(rec.get("/FT")) if "/FT" in rec else None,   # field type
-                }
-            except Exception:
-                out[full_name] = {"parent_T": None, "FT": None}
-        return out
-    except Exception as e:
-        return {"__error__": {"message": str(e)}}
