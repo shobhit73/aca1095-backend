@@ -1,4 +1,4 @@
-# main_fastapi.py — ACA 1095-C backend (robust form parsing + correct build_interim kwargs)
+# main_fastapi.py — ACA 1095-C backend with emp_demo wired into build_interim
 from __future__ import annotations
 
 import io
@@ -10,14 +10,13 @@ from fastapi import FastAPI, File, Form, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-# Your project modules
+# Project modules
 from aca_builder import build_interim, build_final, build_penalty_dashboard
 from aca_pdf import fill_pdf_for_employee, save_excel_outputs, list_pdf_fields
 
+app = FastAPI(title="ACA 1095-C Backend", version="1.0.5")
 
-app = FastAPI(title="ACA 1095-C Backend", version="1.0.4")
-
-# ────────────────────────── CORS (tighten in prod) ──────────────────────────
+# ───────────────────────── CORS (tighten in prod) ─────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,15 +25,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ───────────────────────────── health ─────────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True}
 
-
-# ──────────────────────────── helpers ────────────────────────────
+# ─────────────────────────── helpers ───────────────────────────
 def _to_plain_dict(m: Mapping[str, Any]) -> dict[str, Any]:
-    """Flatten a starlette FormData/QueryParams to a plain dict (keep original keys)."""
     return {str(k): m[k] for k in m}
 
 def _try_int(x: Any) -> Optional[int]:
@@ -65,7 +61,6 @@ def _truthy(x: Any, default: bool = False) -> bool:
     return str(x).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 def _detect_year(form: Mapping[str, Any], explicit: Optional[int] = None) -> Optional[int]:
-    """Prefer explicit year, otherwise pick any key containing 'year'."""
     if explicit is not None:
         return explicit
     for k, v in form.items():
@@ -76,7 +71,6 @@ def _detect_year(form: Mapping[str, Any], explicit: Optional[int] = None) -> Opt
     return None
 
 def _detect_threshold(form: Mapping[str, Any], explicit: Optional[float] = None) -> Optional[float]:
-    """Prefer explicit threshold, otherwise search common keys / any '*threshold*' key."""
     if explicit is not None:
         return explicit
     for key in ("affordabilityThreshold", "affordability_threshold", "threshold", "aff_threshold"):
@@ -92,7 +86,6 @@ def _detect_threshold(form: Mapping[str, Any], explicit: Optional[float] = None)
     return None
 
 def _xlsx_from_upload(file: UploadFile) -> dict[str, pd.DataFrame]:
-    """Read an uploaded Excel into {sheet_name: DataFrame} with lower-cased columns."""
     with io.BytesIO(file.file.read()) as buf:
         buf.seek(0)
         xl = pd.ExcelFile(buf)
@@ -104,7 +97,6 @@ def _xlsx_from_upload(file: UploadFile) -> dict[str, pd.DataFrame]:
         return out
 
 def _get_sheet(sheets: dict[str, pd.DataFrame], *candidates: str) -> pd.DataFrame:
-    """Case/space-tolerant sheet fetch. Returns empty DataFrame if not found."""
     norm = {k.strip().lower(): v for k, v in sheets.items()}
     for cand in candidates:
         key = cand.strip().lower()
@@ -119,12 +111,16 @@ def _build_everything(
     include_penalty: bool,
 ):
     """
-    Extract inputs → build interim → build final → (optional) penalty dashboard.
-    IMPORTANT: We call build_interim with **keyword args** to avoid ordering mistakes.
+    Extract inputs and build interim/final/grids.
+    IMPORTANT: build_interim requires emp_demo — pass all params as **keyword args**.
     """
+    # Employee demographics / master (sheet commonly named 'EmployeeID' or 'Demographics')
+    emp_demo = _get_sheet(
+        sheets,
+        "employeeid", "employee id", "demographics", "emp demographics", "emp demo", "employee master"
+    )
 
-    # Core three inputs expected by your pipeline
-    emp_elig  = _get_sheet(
+    emp_elig = _get_sheet(
         sheets,
         "emp eligibility", "employee eligibility", "eligibility", "emp_eligibility"
     )
@@ -137,19 +133,18 @@ def _build_everything(
         "dep enrollment", "dependent enrollment", "dep_enrollment", "dependent enrolment"
     )
 
-    # If your build_interim also accepts an Emp Wait Period sheet (e.g., emp_wait=...),
-    # you can uncomment the next two lines and add the kwarg below.
+    # If your pipeline also supports the "Emp Wait Period" sheet, add it here and
+    # include the kwarg in build_interim. (Left out unless your function expects it.)
     # emp_wait = _get_sheet(sheets, "emp wait period", "wait period", "emp_wait_period")
-    # ... then pass emp_wait=emp_wait in the call.
 
-    # Keyword-based call (prevents the float→int error you saw when order was swapped)
     interim = build_interim(
+        emp_demo=emp_demo,
         emp_elig=emp_elig,
         emp_enroll=emp_enroll,
         dep_enroll=dep_enroll,
         affordability_threshold=float(threshold),
         year=int(year),
-        # emp_wait=emp_wait,  # ← only if your function signature includes it
+        # emp_wait=emp_wait,  # ← uncomment only if build_interim has this kwarg
     )
 
     final = build_final(interim, year=int(year))
@@ -163,11 +158,9 @@ def _build_everything(
 
     return interim, final, penalty
 
-
-# ───────────────────────── Debug endpoint ─────────────────────────
+# ─────────────────────── debug helper ───────────────────────
 @app.post("/debug/pdf_fields")
 async def debug_pdf_fields(pdf: UploadFile = File(...)):
-    """Upload a blank 1095-C PDF to list its AcroForm fields (helps mapping)."""
     try:
         pdf_bytes = await pdf.read()
         fields = list_pdf_fields(pdf_bytes)
@@ -175,25 +168,19 @@ async def debug_pdf_fields(pdf: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
 
-
-# ───────────────────────── Main endpoints ─────────────────────────
+# ─────────────────────── main endpoints ───────────────────────
 @app.post("/generate/single")
 async def generate_single(
     request: Request,
     excel: UploadFile = File(..., description="Input XLSX"),
     pdf: UploadFile | None = File(None, description="Blank 1095-C PDF"),
     employee_id: Optional[str] = Form(None, alias="employeeId"),
-
-    # common aliases from the UI
     filing_year: Optional[int] = Form(None, alias="filingYear"),
     year: Optional[int] = Form(None),
-
     affordability_threshold: Optional[float] = Form(None, alias="affordabilityThreshold"),
     threshold: Optional[float] = Form(None),
-
     include_penalty_dashboard: Optional[str] = Form(None, alias="includePenaltyDashboard"),
     includePenalty: Optional[str] = Form(None),
-
     mode: Optional[str] = Form(None),
 ):
     try:
@@ -235,7 +222,7 @@ async def generate_single(
                 headers={"Content-Disposition": f'attachment; filename="{filename}"'},
             )
 
-        # Generate ONE employee’s PDF
+        # Generate one employee’s PDF
         emp_id_str = str(employee_id).strip()
         final_emp = final[final["EmployeeID"].astype(str) == emp_id_str]
         if final_emp.empty:
@@ -245,16 +232,14 @@ async def generate_single(
             return JSONResponse({"error": "Blank 1095-C PDF is required when EmployeeID is provided"}, status_code=422)
         pdf_bytes = await pdf.read()
 
-        # Optional enrollments for Part III logic in PDF
+        # Optional enrollments for Part III logic
         emp_enroll = sheets.get("Emp Enrollment") or sheets.get("emp enrollment")
         dep_enroll = sheets.get("Dep Enrollment") or sheets.get("dep enrollment")
 
-        # Try demographics/EmployeeID sheet to fill Part I; fallback to Final row
+        # Prefer demo/master sheet row for Part I text (fallback to final row)
         demo = (
-            sheets.get("EmployeeID")
-            or sheets.get("employeeid")
-            or sheets.get("demographics")
-            or sheets.get("Demographics")
+            sheets.get("EmployeeID") or sheets.get("employeeid")
+            or sheets.get("Demographics") or sheets.get("demographics")
         )
         if demo is not None and not demo.empty:
             dem_row = demo[demo["employeeid"].astype(str) == emp_id_str]
@@ -262,7 +247,7 @@ async def generate_single(
         else:
             emp_row = final_emp.iloc[0]
 
-        editable_name, editable, flattened_name, flattened = fill_pdf_for_employee(
+        _, _, flattened_name, flattened = fill_pdf_for_employee(
             pdf_bytes=pdf_bytes,
             emp_row=emp_row,
             final_df_emp=final_emp,
@@ -276,16 +261,14 @@ async def generate_single(
             media_type="application/pdf",
             headers={"Content-Disposition": f'attachment; filename="{flattened_name}"'},
         )
-
     except Exception as e:
         return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
-
 
 @app.post("/generate/bulk")
 async def generate_bulk(
     request: Request,
     excel: UploadFile = File(...),
-    pdf: UploadFile = File(...),  # kept for future expansion
+    pdf: UploadFile = File(...),  # currently unused but kept for parity
     filing_year: Optional[int] = Form(None, alias="filingYear"),
     year: Optional[int] = Form(None),
     affordability_threshold: Optional[float] = Form(None, alias="affordabilityThreshold"),
@@ -293,7 +276,6 @@ async def generate_bulk(
     include_penalty_dashboard: Optional[str] = Form(None, alias="includePenaltyDashboard"),
     includePenalty: Optional[str] = Form(None),
 ):
-    """Processes Excel and returns the Interim/Final (and optional Penalty) workbook."""
     try:
         raw_form = _to_plain_dict(await request.form())
 
@@ -328,7 +310,6 @@ async def generate_bulk(
     except Exception as e:
         return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
 
-
 @app.post("/process/excel")
 async def process_excel(
     request: Request,
@@ -340,7 +321,6 @@ async def process_excel(
     include_penalty_dashboard: Optional[str] = Form(None, alias="includePenaltyDashboard"),
     includePenalty: Optional[str] = Form(None),
 ):
-    """Returns an Excel workbook with Interim + Final (+ Penalty if requested)."""
     try:
         raw_form = _to_plain_dict(await request.form())
 
