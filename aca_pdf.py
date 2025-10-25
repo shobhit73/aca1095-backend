@@ -45,6 +45,23 @@ def fill_pdf_for_employee(
     return editable_name, editable_buf, flat_name, flat_buf
 
 
+def _safe_df(df: pd.DataFrame | None, *, name: str) -> pd.DataFrame:
+    """
+    Ensure we always have something to write so openpyxl has
+    at least one visible sheet. If df is None or has 0 rows AND 0 columns,
+    produce a tiny placeholder DataFrame.
+    """
+    if isinstance(df, pd.DataFrame):
+        # If it has any columns, to_excel will create a sheet even with 0 rows.
+        if df.shape[1] > 0:
+            return df
+        # If it has 0 cols but some rows (unlikely), still write a placeholder.
+    # Placeholder sheet
+    return pd.DataFrame(
+        {"Info": [f"No data available for '{name}' at the time of export."]}
+    )
+
+
 def save_excel_outputs(
     interim: pd.DataFrame,
     final: pd.DataFrame,
@@ -52,21 +69,32 @@ def save_excel_outputs(
     *,
     penalty_dashboard: pd.DataFrame | None = None,
 ) -> bytes:
-    """Write Final/Interim/(optional) Penalty sheets safely (no ambiguous DataFrame checks)."""
+    """
+    Write Final/Interim/(optional) Penalty sheets safely.
+    Guarantees at least one visible sheet so openpyxl never raises:
+    'IndexError: At least one sheet must be visible'.
+    """
     from pandas import ExcelWriter
 
     output = io.BytesIO()
     with ExcelWriter(output, engine="openpyxl") as xw:
-        (final or pd.DataFrame()).to_excel(
+        # Always write Final and Interim (using safe placeholders when needed)
+        _safe_df(final, name="Final").to_excel(
             xw, index=False, sheet_name=f"Final {year}"
         )
-        (interim or pd.DataFrame()).to_excel(
+        _safe_df(interim, name="Interim").to_excel(
             xw, index=False, sheet_name=f"Interim {year}"
         )
-        # Critical guard to avoid "truth value of a DataFrame is ambiguous"
-        if penalty_dashboard is not None and not penalty_dashboard.empty:
+
+        # Only add Penalty when it exists and has columns/rows
+        if (
+            isinstance(penalty_dashboard, pd.DataFrame)
+            and penalty_dashboard.shape[1] > 0
+            and not penalty_dashboard.empty
+        ):
             penalty_dashboard.to_excel(
                 xw, index=False, sheet_name=f"Penalty Dashboard {year}"
             )
+
     output.seek(0)
     return output.getvalue()
