@@ -352,11 +352,25 @@ def build_interim(
 
 def build_final(interim: pd.DataFrame) -> pd.DataFrame:
     if interim is None or interim.empty:
-        return pd.DataFrame(columns=["EmployeeID","Month","Line14_Final","Line16_Final"])
+        return pd.DataFrame(columns=["EmployeeID", "Month", "Line14_Final", "Line16_Final"])
     df = interim.copy()
-    df = df.sort_values(["EmployeeID","MonthNum"])
+    df = df.sort_values(["EmployeeID", "MonthNum"])
     out = []
     for emp, g in df.groupby("EmployeeID", sort=False):
         l14_all12 = (g["line14_all12"].astype(str).str.strip().iloc[0] or "")
         if l14_all12:
-            out.append({"EmployeeID": emp, "Month":"All
+            out.append({
+                "EmployeeID": emp,
+                "Month": "All 12 months",
+                "Line14_Final": l14_all12,
+                "Line16_Final": ""
+            })
+        else:
+            for _, r in g.iterrows():
+                out.append({
+                    "EmployeeID": emp,
+                    "Month": r["Month"],
+                    "Line14_Final": r["line14_final"],
+                    "Line16_Final": r["line16_final"]
+                })
+    return pd.DataFrame.from_records(out)
