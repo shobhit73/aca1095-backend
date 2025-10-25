@@ -1,24 +1,32 @@
 # main_fastapi.py
 from __future__ import annotations
 
+import io, os, json
+from typing import Optional
+
+import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-import io, zipfile, json, os
-import pandas as pd
 
 from aca_processing import (
-    load_excel, prepare_inputs, choose_report_year, MONTHS, _coerce_str
+    load_excel,
+    prepare_inputs,
+    choose_report_year,
+    MONTHS,
+    _coerce_str,
 )
 from aca_builder import (
-    build_interim, build_final, build_penalty_dashboard
+    build_interim,
+    build_final,
+    build_penalty_dashboard,
 )
 from aca_pdf import (
-    fill_pdf_for_employee, save_excel_outputs
+    fill_pdf_for_employee,
+    save_excel_outputs,
 )
 
-# ------------------ App & CORS ------------------
-app = FastAPI(title="ACA 1095 Service", version="1.0.0")
+app = FastAPI(title="ACA 1095 Service", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,7 +36,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------ API Keys ------------------
 def _get_api_key(request: Request):
     keys = os.getenv("API_KEYS", "supersecret-key-123").split(",")
     keys = [k.strip() for k in keys if k.strip()]
@@ -45,27 +52,43 @@ def health():
 @app.post("/process/excel")
 async def process_excel(
     excel: UploadFile = File(...),
+    # UI options (optional; safe defaults)
+    filing_year: Optional[int] = Form(None),
+    affordability_threshold: Optional[float] = Form(None),
+    include_penalty_dashboard: str = Form("true"),
     api_key: str = Depends(_get_api_key),
 ):
     if not excel.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Upload a .xlsx file")
+
     excel_bytes = await excel.read()
     try:
         data = load_excel(excel_bytes)
         emp_demo, emp_elig, emp_enroll, dep_enroll = prepare_inputs(data)
 
-        year_used = choose_report_year(emp_elig)
+        # Choose year: explicit from UI, else infer
+        year_used = int(filing_year) if filing_year else choose_report_year(emp_elig)
 
         interim_df = build_interim(
-            emp_demo, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_elig, emp_enroll, dep_enroll,
+            year=year_used,
+            affordability_threshold=affordability_threshold,  # may be None
         )
-        final_df   = build_final(interim_df)
-        penalty_df = build_penalty_dashboard(interim_df)
+        final_df = build_final(interim_df)
 
-        # Write 3 sheets: Final, Interim, Penalty Dashboard
+        penalty_df = None
+        if include_penalty_dashboard.lower() in {"true", "1", "yes", "y"}:
+            penalty_df = build_penalty_dashboard(interim_df)
+        else:
+            penalty_df = pd.DataFrame()
+
         out_bytes = save_excel_outputs(
-            interim_df, final_df, year_used, penalty_dashboard=penalty_df
+            interim_df,
+            final_df,
+            year_used,
+            penalty_dashboard=penalty_df
         )
+
     except HTTPException:
         raise
     except Exception as e:
@@ -85,6 +108,8 @@ async def generate_single(
     excel: UploadFile = File(...),
     pdf:   UploadFile = File(...),
     employee_id: str | None = Form(None),
+    filing_year: Optional[int] = Form(None),
+    affordability_threshold: Optional[float] = Form(None),
     flattened_only: str = Form("true"),
     api_key: str = Depends(_get_api_key),
 ):
@@ -102,7 +127,6 @@ async def generate_single(
         if emp_demo.empty:
             raise HTTPException(status_code=422, detail="No employees in Emp Demographic")
 
-        # Default EmployeeID if not provided
         if not employee_id:
             employee_id = _coerce_str(emp_demo["employeeid"].iloc[0])
 
@@ -110,10 +134,12 @@ async def generate_single(
         if row.empty:
             raise HTTPException(status_code=404, detail=f"EmployeeID {employee_id} not found")
 
-        year_used = choose_report_year(emp_elig)
+        year_used = int(filing_year) if filing_year else choose_report_year(emp_elig)
 
         interim_df = build_interim(
-            emp_demo, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_elig, emp_enroll, dep_enroll,
+            year=year_used,
+            affordability_threshold=affordability_threshold,
         )
         final_df = build_final(interim_df)
 
@@ -134,6 +160,7 @@ async def generate_single(
             return StreamingResponse(io.BytesIO(flat_bytes.getvalue()), media_type="application/pdf", headers=headers)
 
         zip_buf = io.BytesIO()
+        import zipfile
         with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
             z.writestr(editable_name, editable_bytes.getvalue())
             z.writestr(flat_name, flat_bytes.getvalue())
@@ -151,7 +178,9 @@ async def generate_single(
 async def generate_bulk(
     excel: UploadFile = File(...),
     pdf:   UploadFile = File(...),
-    employee_ids: str | None = Form(None),  # JSON list of ids or None for all
+    employee_ids: str | None = Form(None),  # JSON array or None for all
+    filing_year: Optional[int] = Form(None),
+    affordability_threshold: Optional[float] = Form(None),
     api_key: str = Depends(_get_api_key),
 ):
     if not excel.filename.lower().endswith(".xlsx"):
@@ -168,19 +197,19 @@ async def generate_bulk(
         if emp_demo.empty:
             raise HTTPException(status_code=422, detail="No employees in Emp Demographic")
 
-        year_used = choose_report_year(emp_elig)
+        year_used = int(filing_year) if filing_year else choose_report_year(emp_elig)
         all_ids = list(map(str, emp_demo["employeeid"].astype(str).unique()))
-        if employee_ids:
-            ids = list(map(str, json.loads(employee_ids)))
-        else:
-            ids = all_ids
+        ids = list(map(str, json.loads(employee_ids))) if employee_ids else all_ids
 
         interim_df = build_interim(
-            emp_demo, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_elig, emp_enroll, dep_enroll,
+            year=year_used,
+            affordability_threshold=affordability_threshold,
         )
         final_df = build_final(interim_df)
 
         zip_buf = io.BytesIO()
+        import zipfile
         with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
             for eid in ids:
                 row = emp_demo[emp_demo["employeeid"].astype(str)==eid]
@@ -193,7 +222,9 @@ async def generate_bulk(
                         "Line14_Final": ["" for _ in MONTHS],
                         "Line16_Final": ["" for _ in MONTHS]
                     })
-                _, _, flat_name, flat_bytes = fill_pdf_for_employee(pdf_bytes, row.iloc[0], emp_final, year_used)
+                _, _, flat_name, flat_bytes = fill_pdf_for_employee(
+                    pdf_bytes, row.iloc[0], emp_final, year_used
+                )
                 z.writestr(flat_name, flat_bytes.getvalue())
         zip_buf.seek(0)
         headers = {"Content-Disposition": f'attachment; filename="1095c_bulk_{year_used}.zip"'}
