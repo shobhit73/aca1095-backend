@@ -1,9 +1,8 @@
 # main_fastapi.py
+# main_fastapi.py
 from __future__ import annotations
 
-import io
-import os
-import json
+import io, os, json
 from typing import Optional
 
 import pandas as pd
@@ -18,19 +17,11 @@ from aca_processing import (
     MONTHS,
     _coerce_str,
 )
-from aca_builder import (
-    build_interim,
-    build_final,
-    build_penalty_dashboard,
-)
-from aca_pdf import (
-    fill_pdf_for_employee,
-    save_excel_outputs,
-)
+from aca_builder import build_interim, build_final, build_penalty_dashboard
+from aca_pdf import fill_pdf_for_employee, save_excel_outputs
 
-app = FastAPI(title="ACA 1095 Service", version="1.2.0")
+app = FastAPI(title="ACA 1095 Service", version="1.3.0")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
@@ -39,7 +30,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Simple API key check
 def _get_api_key(request: Request):
     keys = os.getenv("API_KEYS", "supersecret-key-123").split(",")
     keys = [k.strip() for k in keys if k.strip()]
@@ -52,7 +42,6 @@ def _get_api_key(request: Request):
 def health():
     return {"ok": True}
 
-# ------------------ Excel → Final/Interim/Penalty (xlsx) ------------------
 @app.post("/process/excel")
 async def process_excel(
     excel: UploadFile = File(...),
@@ -67,38 +56,31 @@ async def process_excel(
     excel_bytes = await excel.read()
     try:
         data = load_excel(excel_bytes)
-        emp_demo, emp_elig, emp_enroll, dep_enroll = prepare_inputs(data)
+        # NOTE: prepare_inputs now returns FIVE frames (includes emp_wait)
+        emp_demo, emp_elig, emp_enroll, dep_enroll, emp_wait = prepare_inputs(data)
 
-        # Choose year: explicit from UI, else infer
         year_used = int(filing_year) if filing_year else choose_report_year(emp_elig)
 
         interim_df = build_interim(
             emp_demo, emp_elig, emp_enroll, dep_enroll,
             year=year_used,
-            affordability_threshold=affordability_threshold,  # may be None
+            emp_wait=emp_wait,                         # NEW
+            affordability_threshold=affordability_threshold,
         )
         final_df = build_final(interim_df)
 
-        # Build penalty dashboard only if asked; force None if empty to avoid
-        # any legacy truthiness checks downstream
         penalty_df = None
         if include_penalty_dashboard.lower() in {"true", "1", "yes", "y"}:
             tmp = build_penalty_dashboard(interim_df)
             penalty_df = None if (tmp is None or getattr(tmp, "empty", True)) else tmp
-        else:
-            penalty_df = None
 
         out_bytes = save_excel_outputs(
-            interim_df,
-            final_df,
-            year_used,
-            penalty_dashboard=penalty_df
+            interim_df, final_df, year_used, penalty_dashboard=penalty_df
         )
 
     except HTTPException:
         raise
     except Exception as e:
-        # Print full traceback to Render logs so we see exact line/file
         import traceback, sys
         print("=== /process/excel FAILED ===", file=sys.stderr, flush=True)
         print(traceback.format_exc(), file=sys.stderr, flush=True)
