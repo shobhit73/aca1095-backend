@@ -57,11 +57,12 @@ def load_excel(excel_bytes: bytes) -> Dict[str, pd.DataFrame]:
     data["emp_enroll"] = read_sheet("Emp Enrollment")
     data["dep_enroll"] = read_sheet("Dep Enrollment")
 
-    # NEW: Emp Wait Period (exact name)
+    # Emp Wait Period (exact name)
     data["emp_wait"]   = read_sheet("Emp Wait Period")  # expects employeeid, effectivedate, waitperiod
-    # simple alias if workbook used "waitperioddays"
-    if not data["emp_wait"].empty and "waitperioddays" in data["emp_wait"].columns and "waitperiod" not in data["emp_wait"].columns:
-        data["emp_wait"].rename(columns={"waitperioddays": "waitperiod"}, inplace=True)
+    # alias if workbook used "Wait Period Days"
+    w = data["emp_wait"]
+    if not w.empty and "waitperioddays" in w.columns and "waitperiod" not in w.columns:
+        w.rename(columns={"waitperioddays": "waitperiod"}, inplace=True)
 
     return data
 
@@ -121,38 +122,32 @@ def _collect_employee_ids(*frames: Iterable[pd.DataFrame]) -> List[str]:
 
 def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize employment status info from Emp Demographic.
+    Normalize employment status from Emp Demographic with robust FT/PT + ACTIVE/TERM detection.
     - Creates/aligns: statusstartdate, statusenddate
-    - Derives: _role_norm ("FULLTIME"/"PARTTIME"/"") and _estatus_norm ("ACTIVE"/"TERM"/"")
-    Works even when column names vary (ftpt, employmenttype, status, etc.).
+    - Derives: _role_norm in {"FULLTIME","PARTTIME",""} and _estatus_norm in {"ACTIVE","TERM",""}
+    - Scans MANY column names/values and also numeric heuristics (FTE, hours).
     """
     if emp_demo is None or emp_demo.empty:
         return pd.DataFrame(columns=["employeeid","statusstartdate","statusenddate","_role_norm","_estatus_norm"])
 
     df = emp_demo.copy()
 
-    # unify employeeid
+    # unify id
     if "employeeid" in df.columns:
         df["employeeid"] = df["employeeid"].astype(str)
 
-    # candidate date columns
-    start_cands = [
-        "statusstartdate","hiredate","startdate","effectivedate","originalhiredate","employmentstartdate"
-    ]
-    end_cands = [
-        "statusenddate","termdate","terminationdate","enddate","separationdate","employmentenddate"
-    ]
+    # ---- dates (tolerant) ----
+    start_cands = ["statusstartdate","hiredate","startdate","effectivedate","originalhiredate","employmentstartdate"]
+    end_cands   = ["statusenddate","termdate","terminationdate","enddate","separationdate","employmentenddate"]
 
-    def first_present(cols: list[str]) -> str | None:
+    def _first(cols):
         for c in cols:
-            if c in df.columns:
-                return c
+            if c in df.columns: return c
         return None
 
-    s_col = first_present(start_cands)
-    e_col = first_present(end_cands)
+    s_col = _first(start_cands)
+    e_col = _first(end_cands)
 
-    # ensure canonical columns exist
     if s_col and s_col != "statusstartdate":
         df.rename(columns={s_col: "statusstartdate"}, inplace=True)
     elif "statusstartdate" not in df.columns:
@@ -163,28 +158,10 @@ def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
     elif "statusenddate" not in df.columns:
         df["statusenddate"] = pd.NaT
 
-    # parse dates
     for c in ("statusstartdate","statusenddate"):
         df[c] = pd.to_datetime(df[c], errors="coerce")
 
-    # derive FT/PT from multiple likely columns
-    role_cands = [
-        "role","ftpt","ft_pt","employmenttype","employeetype","employeeclass",
-        "jobclass","employmentcategory","fulltimeparttime","fte_status","fte",
-        "positiontype","classification","class"
-    ]
-    present_role = [c for c in role_cands if c in df.columns]
-
-    def detect_role(row) -> str:
-        for c in present_role:
-            val = str(row.get(c, "")).upper()
-            if any(t in val for t in ("FULL-TIME", "FULLTIME", " FULL", " F/T", " F T", " FT")):
-                return "FULLTIME"
-            if any(t in val for t in ("PART-TIME", "PARTTIME", " PART", " P/T", " P T", " PT")):
-                return "PARTTIME"
-        return ""
-
-    # derive employment status (active/term) from likely columns
+    # ---- ACTIVE / TERM detection ----
     status_cands = ["employeestatus","status","employmentstatus","workstatus","jobstatus"]
     present_stat = [c for c in status_cands if c in df.columns]
 
@@ -195,6 +172,52 @@ def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
                 return "TERM"
             if any(t in val for t in ("ACTIVE", "EMPLOY", "HIRED", "CURRENT")):
                 return "ACTIVE"
+        return ""
+
+    # ---- FT/PT detection (names + values + numerics) ----
+    # columns whose name suggests role/hrs/fte
+    name_ftpt_keywords = ("FT", "FULL", "PART", "PT", "FTE", "HOUR", "STDHOUR", "STANDARDHOUR", "WEEKLYHOUR")
+    role_like_cols = [c for c in df.columns if any(k in c.upper() for k in name_ftpt_keywords)]
+
+    # plus a curated list
+    role_cands = set(role_like_cols) | set([
+        "role","ftpt","ft_pt","employmenttype","employeetype","employeeclass","jobclass",
+        "employmentcategory","fulltimeparttime","fte_status","fte","positiontype",
+        "classification","class","standardhours","hoursperweek","avgweeklyhours","weeklyhours"
+    ])
+    role_cands = [c for c in role_cands if c in df.columns]
+
+    FT_STR_TOKENS = ("FULL-TIME","FULLTIME"," FULL"," F/T"," F T"," FT","REGULAR FULL","SALARIED FULL","RFT")
+    PT_STR_TOKENS = ("PART-TIME","PARTTIME"," PART"," P/T"," P T"," PT","RPT")
+
+    def is_ft_numeric(val, colname: str) -> bool | None:
+        try:
+            v = float(val)
+        except Exception:
+            return None
+        cu = colname.upper()
+        if "FTE" in cu:
+            return True if v >= 0.75 else (False if v > 0 else None)
+        if any(k in cu for k in ("HOUR","STDHOUR","WEEKLY")):
+            return True if v >= 30 else (False if 0 < v < 30 else None)
+        return None
+
+    def detect_role(row) -> str:
+        # 1) string tokens
+        for c in role_cands:
+            val = str(row.get(c, "")).upper()
+            if any(t in val for t in FT_STR_TOKENS): return "FULLTIME"
+            if any(t in val for t in PT_STR_TOKENS): return "PARTTIME"
+        # 2) numeric heuristics (FTE / Hours)
+        for c in role_cands:
+            res = is_ft_numeric(row.get(c, None), c)
+            if res is True:  return "FULLTIME"
+            if res is False: return "PARTTIME"
+        # 3) last-resort: any column value exactly "FT"/"PT"
+        for c in df.columns:
+            val = str(row.get(c, "")).strip().upper()
+            if val == "FT": return "FULLTIME"
+            if val == "PT": return "PARTTIME"
         return ""
 
     df["_role_norm"] = df.apply(detect_role, axis=1)
@@ -223,7 +246,7 @@ def _all_month(df: pd.DataFrame, start_col: str, end_col: str, ms: date, me: dat
     return bool((mask & (s <= ms) & (e >= me)).any())
 
 
-# ---- NEW: compute waiting by window overlap from Emp Wait Period
+# ---- Wait Period overlap from Emp Wait Period
 def _waiting_in_month(wait_df_emp: pd.DataFrame, ms: date, me: date) -> bool:
     """
     True if ANY wait window overlaps the month [ms, me].
