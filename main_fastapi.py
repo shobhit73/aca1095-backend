@@ -1,34 +1,22 @@
-# main_fastapi.py  — fixed: no read_input_excel import
+# main_fastapi.py — form-key-agnostic year parsing
 from __future__ import annotations
 
 import io
 import traceback
-from typing import Optional
+from typing import Optional, Any, Mapping
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import pandas as pd
 
-# ✅ only import what exists
-from aca_processing import (
-    preprocess_inputs,   # applies aliases, normalization, waits, etc.
-)
-from aca_builder import (
-    build_interim,             # builds interim grid
-    build_final,               # builds final (lines 14/16) from interim
-    build_penalty_dashboard,   # optional
-)
-from aca_pdf import (
-    fill_pdf_for_employee,
-    save_excel_outputs,
-    list_pdf_fields,           # debug helper
-)
+from aca_builder import build_interim, build_final, build_penalty_dashboard
+from aca_pdf import fill_pdf_for_employee, save_excel_outputs, list_pdf_fields
 
-app = FastAPI(title="ACA 1095-C Backend", version="1.0.0")
+app = FastAPI(title="ACA 1095-C Backend", version="1.0.1")
 
-# CORS (adjust allow_origins for prod)
+# CORS (tighten allow_origins in prod)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,30 +30,67 @@ def health():
     return {"ok": True}
 
 # ───────────────────────── helpers ─────────────────────────
-def _get_bool(form, *names: str, default: bool = False) -> bool:
-    for n in names:
-        if n in form and form[n] is not None:
-            v = str(form[n]).strip().lower()
-            return v in {"1", "true", "t", "yes", "y", "on"}
-    return default
+def _to_lower_keys(m: Mapping[str, Any]) -> dict[str, Any]:
+    return {str(k): m[k] for k in m}
 
-def _get_int(form, *names: str, default: Optional[int] = None) -> Optional[int]:
-    for n in names:
-        if n in form and form[n] is not None:
-            try:
-                return int(str(form[n]).strip())
-            except Exception:
-                return default
-    return default
+def _try_int(x: Any) -> Optional[int]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    try:
+        return int(float(s))
+    except Exception:
+        return None
 
-def _get_float(form, *names: str, default: Optional[float] = None) -> Optional[float]:
-    for n in names:
-        if n in form and form[n] is not None:
-            try:
-                return float(str(form[n]).strip())
-            except Exception:
-                return default
-    return default
+def _try_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def _truthy(x: Any, default: bool = False) -> bool:
+    if x is None:
+        return default
+    return str(x).strip().lower() in {"1","true","t","yes","y","on"}
+
+def _detect_year(form: Mapping[str, Any], explicit: Optional[int] = None) -> Optional[int]:
+    """
+    Return the first reasonable int for filing year. If not supplied in the
+    explicitly parsed inputs, scan all form keys that contain 'year'.
+    """
+    if explicit is not None:
+        return explicit
+    # scan any key that contains 'year'
+    for k, v in form.items():
+        if "year" in str(k).lower():
+            y = _try_int(v)
+            if y:
+                return y
+    return None
+
+def _detect_threshold(form: Mapping[str, Any], explicit: Optional[float] = None) -> Optional[float]:
+    if explicit is not None:
+        return explicit
+    # common names
+    for key in ("affordabilityThreshold","affordability_threshold","threshold","aff_threshold"):
+        if key in form:
+            t = _try_float(form[key])
+            if t is not None:
+                return t
+    # last resort: any key containing 'threshold'
+    for k, v in form.items():
+        if "threshold" in str(k).lower():
+            t = _try_float(v)
+            if t is not None:
+                return t
+    return None
 
 def _xlsx_from_upload(file: UploadFile) -> dict[str, pd.DataFrame]:
     """Read an uploaded Excel file into {sheet_name: DataFrame} (lowercased column names)."""
@@ -87,9 +112,9 @@ def _build_everything(
 ):
     """
     Orchestrates processing -> interim -> final (+ optional penalty).
+    NOTE: If you have a preprocess/aliasing step, call it here before build_interim.
     """
-    inputs = preprocess_inputs(sheets)  # user-specific normalization (aliases, waits, etc.)
-    interim = build_interim(inputs, year=year, affordability_threshold=threshold)
+    interim = build_interim(sheets, year=year, affordability_threshold=threshold)
     final = build_final(interim, year=year)
     penalty = None
     if include_penalty:
@@ -112,8 +137,10 @@ async def debug_pdf_fields(pdf: UploadFile = File(...)):
 
 @app.post("/generate/single")
 async def generate_single(
+    request: Request,
     excel: UploadFile = File(..., description="Input XLSX"),
     pdf: UploadFile | None = File(None, description="Blank 1095-C PDF"),
+    # keep these so FastAPI happily parses known aliases, but we'll also scan raw form
     employee_id: Optional[str] = Form(None, alias="employeeId"),
     filing_year: Optional[int] = Form(None, alias="filingYear"),
     year: Optional[int] = Form(None),
@@ -124,28 +151,39 @@ async def generate_single(
     mode: Optional[str] = Form(None),
 ):
     try:
-        used_year = filing_year or year
-        if used_year is None:
-            return JSONResponse({"error": "Missing filing year"}, status_code=422)
-        used_threshold = (affordability_threshold if affordability_threshold is not None else threshold)
-        if used_threshold is None:
-            used_threshold = 50.0  # default for UAT
+        # Read full form to be key-agnostic
+        raw_form = _to_lower_keys(dict(await request.form()))
 
-        include_penalty = _get_bool(
-            {"includePenaltyDashboard": include_penalty_dashboard, "includePenalty": includePenalty},
-            "includePenaltyDashboard", "includePenalty",
-            default=False,
+        # Filing year: prefer explicit parsed, then detect anywhere
+        used_year = _detect_year(raw_form, filing_year or year)
+        if used_year is None:
+            # default for UAT; change if you want to force hard error
+            return JSONResponse({"error": "Missing filing year"}, status_code=422)
+
+        # Threshold: explicit → detect → default
+        used_threshold = affordability_threshold if affordability_threshold is not None else threshold
+        if used_threshold is None:
+            used_threshold = _detect_threshold(raw_form, None)
+        if used_threshold is None:
+            used_threshold = 50.0  # safe default for UAT
+
+        include_penalty = _truthy(
+            raw_form.get("includepenaltydashboard", include_penalty_dashboard)
+            or raw_form.get("includepenalty", includePenalty),
+            default=False
         )
 
+        # Read Excel
         sheets = _xlsx_from_upload(excel)
         if not sheets:
             return JSONResponse({"error": "Excel file has no readable sheets"}, status_code=422)
 
+        # Build
         interim, final, penalty = _build_everything(
             sheets=sheets, year=int(used_year), threshold=float(used_threshold), include_penalty=include_penalty
         )
 
-        # If no EmployeeID → return Excel bundle
+        # If no EmployeeID → return Excel bundle only
         if not employee_id:
             out_bytes = save_excel_outputs(interim=interim, final=final, year=int(used_year), penalty_dashboard=penalty)
             filename = f"ACA_outputs_{used_year}.xlsx"
@@ -168,6 +206,7 @@ async def generate_single(
         emp_enroll = sheets.get("Emp Enrollment") or sheets.get("emp enrollment")
         dep_enroll = sheets.get("Dep Enrollment") or sheets.get("dep enrollment")
 
+        # Demographic row for Part I (fallback to final row)
         demo = sheets.get("EmployeeID") or sheets.get("employeeid") or sheets.get("demographics") or sheets.get("Demographics")
         if demo is not None and not demo.empty:
             dem_row = demo[demo["employeeid"].astype(str) == emp_id_str]
@@ -194,6 +233,7 @@ async def generate_single(
 
 @app.post("/generate/bulk")
 async def generate_bulk(
+    request: Request,
     excel: UploadFile = File(...),
     pdf: UploadFile = File(...),
     filing_year: Optional[int] = Form(None, alias="filingYear"),
@@ -205,16 +245,21 @@ async def generate_bulk(
 ):
     """Simple bulk stub: returns the processed Excel bundle."""
     try:
-        used_year = filing_year or year
+        raw_form = _to_lower_keys(dict(await request.form()))
+        used_year = _detect_year(raw_form, filing_year or year)
         if used_year is None:
             return JSONResponse({"error": "Missing filing year"}, status_code=422)
-        used_threshold = (affordability_threshold if affordability_threshold is not None else threshold)
+
+        used_threshold = affordability_threshold if affordability_threshold is not None else threshold
+        if used_threshold is None:
+            used_threshold = _detect_threshold(raw_form, None)
         if used_threshold is None:
             used_threshold = 50.0
 
-        include_penalty = _get_bool(
-            {"includePenaltyDashboard": include_penalty_dashboard, "includePenalty": includePenalty},
-            "includePenaltyDashboard", "includePenalty", default=False
+        include_penalty = _truthy(
+            raw_form.get("includepenaltydashboard", include_penalty_dashboard)
+            or raw_form.get("includepenalty", includePenalty),
+            default=False
         )
 
         sheets = _xlsx_from_upload(excel)
@@ -233,6 +278,7 @@ async def generate_bulk(
 
 @app.post("/process/excel")
 async def process_excel(
+    request: Request,
     excel: UploadFile = File(...),
     filing_year: Optional[int] = Form(None, alias="filingYear"),
     year: Optional[int] = Form(None),
@@ -243,16 +289,21 @@ async def process_excel(
 ):
     """Returns an Excel workbook (Interim + Final [+ optional Penalty])."""
     try:
-        used_year = filing_year or year
+        raw_form = _to_lower_keys(dict(await request.form()))
+        used_year = _detect_year(raw_form, filing_year or year)
         if used_year is None:
             return JSONResponse({"error": "Missing filing year"}, status_code=422)
-        used_threshold = (affordability_threshold if affordability_threshold is not None else threshold)
+
+        used_threshold = affordability_threshold if affordability_threshold is not None else threshold
+        if used_threshold is None:
+            used_threshold = _detect_threshold(raw_form, None)
         if used_threshold is None:
             used_threshold = 50.0
 
-        include_penalty = _get_bool(
-            {"includePenaltyDashboard": include_penalty_dashboard, "includePenalty": includePenalty},
-            "includePenaltyDashboard", "includePenalty", default=False
+        include_penalty = _truthy(
+            raw_form.get("includepenaltydashboard", include_penalty_dashboard)
+            or raw_form.get("includepenalty", includePenalty),
+            default=False
         )
 
         sheets = _xlsx_from_upload(excel)
