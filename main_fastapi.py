@@ -14,45 +14,50 @@ from aca_builder import (
     build_interim, build_final, build_penalty_dashboard
 )
 from aca_pdf import (
-    save_excel_outputs, fill_pdf_for_employee
+    fill_pdf_for_employee, save_excel_outputs
 )
 
-app = FastAPI(title="ACA-1095 Builder API", version="1.0.0")
+# ------------------ App & CORS ------------------
+app = FastAPI(title="ACA 1095 Service", version="1.0.0")
 
-# CORS (tighten allow_origins for prod)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
     allow_credentials=True,
-    allow_methods=["POST","GET","OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-API_KEYS = set(filter(None, os.getenv("API_KEYS", "supersecret-key-123").split(",")))
-
-async def require_api_key(request: Request):
-    key = request.headers.get("x-api-key")
-    if key not in API_KEYS:
+# ------------------ API Keys ------------------
+def _get_api_key(request: Request):
+    keys = os.getenv("API_KEYS", "supersecret-key-123").split(",")
+    keys = [k.strip() for k in keys if k.strip()]
+    incoming = request.headers.get("x-api-key", "")
+    if incoming not in keys:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return incoming
 
 @app.get("/health")
-async def health():
+def health():
     return {"ok": True}
 
-# -------- Excel -> Interim/Final (+Penalty Dashboard) --------
-@app.post("/process/excel", dependencies=[Depends(require_api_key)])
-async def process_excel(excel: UploadFile = File(...)):
+# ------------------ Excel → Final/Interim/Penalty (xlsx) ------------------
+@app.post("/process/excel")
+async def process_excel(
+    excel: UploadFile = File(...),
+    api_key: str = Depends(_get_api_key),
+):
     if not excel.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Upload a .xlsx file")
     excel_bytes = await excel.read()
     try:
         data = load_excel(excel_bytes)
-        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, _pay_deductions = prepare_inputs(data)
+        emp_demo, emp_elig, emp_enroll, dep_enroll = prepare_inputs(data)
 
         year_used = choose_report_year(emp_elig)
 
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_elig, emp_enroll, dep_enroll, year=year_used
         )
         final_df   = build_final(interim_df)
         penalty_df = build_penalty_dashboard(interim_df)
@@ -74,26 +79,30 @@ async def process_excel(excel: UploadFile = File(...)):
         headers=headers
     )
 
-# -------- Single PDF fill --------
-@app.post("/generate/single", dependencies=[Depends(require_api_key)])
+# ------------------ Single 1095-C (PDF) ------------------
+@app.post("/generate/single")
 async def generate_single(
     excel: UploadFile = File(...),
-    pdf: UploadFile = File(...),
-    employee_id: str = Form(None),
-    flattened_only: str = Form("true")
+    pdf:   UploadFile = File(...),
+    employee_id: str | None = Form(None),
+    flattened_only: str = Form("true"),
+    api_key: str = Depends(_get_api_key),
 ):
-    if not excel.filename.lower().endswith(".xlsx") or not pdf.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Upload .xlsx and .pdf")
+    if not excel.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Upload a .xlsx file")
+    if not pdf.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Upload a 1095-C base PDF")
 
     excel_bytes = await excel.read()
-    pdf_bytes = await pdf.read()
+    pdf_bytes   = io.BytesIO(await pdf.read())
 
     try:
         data = load_excel(excel_bytes)
-        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, _pay_deductions = prepare_inputs(data)
+        emp_demo, emp_elig, emp_enroll, dep_enroll = prepare_inputs(data)
         if emp_demo.empty:
             raise HTTPException(status_code=422, detail="No employees in Emp Demographic")
 
+        # Default EmployeeID if not provided
         if not employee_id:
             employee_id = _coerce_str(emp_demo["employeeid"].iloc[0])
 
@@ -104,7 +113,7 @@ async def generate_single(
         year_used = choose_report_year(emp_elig)
 
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_elig, emp_enroll, dep_enroll, year=year_used
         )
         final_df = build_final(interim_df)
 
@@ -129,7 +138,7 @@ async def generate_single(
             z.writestr(editable_name, editable_bytes.getvalue())
             z.writestr(flat_name, flat_bytes.getvalue())
         zip_buf.seek(0)
-        headers = {"Content-Disposition": f'attachment; filename="1095c_{employee_id}_{year_used}.zip"'}
+        headers = {"Content-Disposition": f'attachment; filename="1095c_{employee_id}.zip"'}
         return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
 
     except HTTPException:
@@ -137,22 +146,25 @@ async def generate_single(
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"PDF generation failed: {e}")
 
-# -------- Bulk PDF fill --------
-@app.post("/generate/bulk", dependencies=[Depends(require_api_key)])
+# ------------------ Bulk 1095-Cs (ZIP of flattened PDFs) ------------------
+@app.post("/generate/bulk")
 async def generate_bulk(
     excel: UploadFile = File(...),
-    pdf: UploadFile = File(...),
-    employee_ids: str = Form(None)  # JSON array or None=ALL
+    pdf:   UploadFile = File(...),
+    employee_ids: str | None = Form(None),  # JSON list of ids or None for all
+    api_key: str = Depends(_get_api_key),
 ):
-    if not excel.filename.lower().endswith(".xlsx") or not pdf.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Upload .xlsx and .pdf")
+    if not excel.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Upload a .xlsx file")
+    if not pdf.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Upload a 1095-C base PDF")
 
     excel_bytes = await excel.read()
-    pdf_bytes = await pdf.read()
+    pdf_bytes   = io.BytesIO(await pdf.read())
 
     try:
         data = load_excel(excel_bytes)
-        emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, _pay_deductions = prepare_inputs(data)
+        emp_demo, emp_elig, emp_enroll, dep_enroll = prepare_inputs(data)
         if emp_demo.empty:
             raise HTTPException(status_code=422, detail="No employees in Emp Demographic")
 
@@ -164,7 +176,7 @@ async def generate_bulk(
             ids = all_ids
 
         interim_df = build_interim(
-            emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year=year_used
+            emp_demo, emp_elig, emp_enroll, dep_enroll, year=year_used
         )
         final_df = build_final(interim_df)
 
