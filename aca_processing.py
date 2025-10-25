@@ -15,13 +15,47 @@ MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec
 FULL_MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"]
 MONTHNUM_TO_FULL = {i+1: m for i,m in enumerate(FULL_MONTHS)}
 
-# Accept common misspellings / variants
+# ---------- Column normalization ----------
 CANON_ALIASES = {
-    "mimimumvaluecoverage": "minimumvaluecoverage",
-    "minimimvaluecoverage": "minimumvaluecoverage",
-    "zip": "zipcode", "zip code": "zipcode",
-    "ssn (digits only)": "ssn",
+    # common misspellings / variants → canonical
+    "employee id": "employeeid",
+    "empid": "employeeid",
+    "emp id": "employeeid",
+    "first name": "firstname",
+    "last name": "lastname",
+    "address 1": "addressline1",
+    "address1": "addressline1",
+    "address 2": "addressline2",
+    "address2": "addressline2",
+    "zip": "zipcode",
+    "zip code": "zipcode",
+    "employment status": "employmentstatus",
+    "status start date": "statusstartdate",
+    "status end date": "statusenddate",
+
+    "eligibleplan": "plancode",
+    "eligibletier": "eligibilitytier",
+    "tier": "enrollmenttier",
+
+    "is eligible for coverage": "iseligibleforcoverage",
+    "eligibility start date": "eligibilitystartdate",
+    "eligibility end date": "eligibilityenddate",
+
+    "is enrolled": "isenrolled",
+    "enrollment start date": "enrollmentstartdate",
+    "enrollment end date": "enrollmentenddate",
+
+    "eligible start date": "eligiblestartdate",
+    "eligible end date": "eligibleenddate",
 }
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    # strip/trim headers; lower
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return df
 
 # Expected sheets/columns (contract kept here so it remains stable)
 EXPECTED_SHEETS = {
@@ -29,7 +63,6 @@ EXPECTED_SHEETS = {
         "employeeid","firstname","lastname","ssn","addressline1","addressline2",
         "city","state","zipcode","role","employmentstatus","statusstartdate","statusenddate"
     ],
-    "emp status": ["employeeid","employmentstatus","role","statusstartdate","statusenddate"],  # optional
     # Plan/tier/cost included to compute MV (PlanA) + EMP affordability from Eligibility
     "emp eligibility": [
         "employeeid","iseligibleforcoverage","eligibilitystartdate","eligibilityenddate",
@@ -43,33 +76,20 @@ EXPECTED_SHEETS = {
         "employeeid","dependentrelationship","eligible","enrolled",
         "eligiblestartdate","eligibleenddate","enrollmentstartdate","enrollmentenddate",
         "plancode"
-    ],
-    # retained for compatibility (not used for affordability in current logic)
-    "pay deductions": ["employeeid","amount","startdate","enddate"]
+    ]
 }
 
 # ---------- Small helpers ----------
 def _int_year(y, fallback=None):
     try:
         f = float(y)
-        if np.isnan(f):  # type: ignore[arg-type]
-            raise ValueError("NaN year")
-        return int(f)
+        if np.isfinite(f):
+            if f.is_integer():
+                return int(f)
+            return int(round(f))
     except Exception:
-        return fallback if fallback is not None else datetime.now().year
-
-def _safe_int(x, default=None):
-    try:
-        f = float(x)
-        if np.isnan(f):  # type: ignore[arg-type]
-            return default
-        return int(f)
-    except Exception:
-        return default
-
-def _coerce_str(x) -> str:
-    if pd.isna(x): return ""
-    return str(x).strip()
+        pass
+    return int(fallback) if fallback is not None else None
 
 def _norm_token(x) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(x).upper())
@@ -100,53 +120,58 @@ def _last_day_of_month(y: int, m: int) -> date:
     return date(y,12,31) if m==12 else (date(y, m+1, 1) - timedelta(days=1))
 
 def parse_date_safe(d, default_end: bool=False):
-    """Parse many date formats; return Python date or None. If default_end, open-ended → month/year end."""
-    if pd.isna(d): return None
-    if isinstance(d, (datetime, np.datetime64)):
-        dt = pd.to_datetime(d, errors="coerce");  return None if pd.isna(dt) else dt.date()
+    if pd.isna(d) or d is None:
+        return None
+    if isinstance(d, (pd.Timestamp, datetime, date)):
+        return d
     s = str(d).strip()
-    if not s: return None
-    try:
-        if len(s)==4 and s.isdigit():
-            y = int(s); return date(y,12,31) if default_end else date(y,1,1)
-        if len(s)==7 and s[4]=="-":
-            y,m = map(int, s.split("-"));  return _last_day_of_month(y,m) if default_end else date(y,m,1)
-    except:
-        pass
-    dt = pd.to_datetime(s, errors="coerce", dayfirst=False)
-    if pd.isna(dt):
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d","%m/%d/%Y","%d/%m/%Y","%d-%b-%Y","%b %d, %Y"):
         try:
-            y,m = map(int, s.split("-")[:2])
-            return _last_day_of_month(y,m) if default_end else date(y,m,1)
-        except:
-            return None
-    return dt.date()
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    # try excel serial
+    try:
+        n = float(s)
+        base = datetime(1899,12,30)
+        return base + timedelta(days=n)
+    except Exception:
+        return None
 
-def month_bounds(year:int, month:int):
-    y = _int_year(year, datetime.now().year)
-    m = _safe_int(month, 1)
-    return date(y, m, 1), _last_day_of_month(y, m)
+def month_bounds(year:int, month:int) -> tuple[date, date]:
+    ms = date(int(year), int(month), 1)
+    me = _last_day_of_month(ms.year, ms.month)
+    return (ms, me)
 
-def _any_overlap(df, start_col, end_col, m_start, m_end, mask=None) -> bool:
-    if df.empty: return False
-    _m = mask if mask is not None else pd.Series(True, index=df.index)
-    s = df.loc[_m, start_col].fillna(pd.Timestamp.min).dt.date
-    e = df.loc[_m, end_col].fillna(pd.Timestamp.max).dt.date
-    return bool(((e >= m_start) & (s <= m_end)).any())
+def _any_overlap(df: pd.DataFrame, start_col: str, end_col: str, ms: date, me: date, *, mask=None) -> bool:
+    if df is None or df.empty: return False
+    if start_col not in df.columns or end_col not in df.columns: return False
+    s = df[start_col]; e = df[end_col]
+    if mask is None:
+        mask = pd.Series(True, index=df.index)
+    s = pd.to_datetime(s, errors="coerce").dt.date
+    e = pd.to_datetime(e, errors="coerce").dt.date
+    e = e.fillna(date(9999,12,31))
+    s = s.fillna(date(1900,1,1))
+    hits = (e >= ms) & (s <= me) & mask
+    return bool(hits.any())
 
-def _all_month(df, start_col, end_col, m_start, m_end, mask=None) -> bool:
-    if df.empty: return False
-    _m = mask if mask is not None else pd.Series(True, index=df.index)
-    s = df.loc[_m, start_col].fillna(pd.Timestamp.min).dt.date
-    e = df.loc[_m, end_col].fillna(pd.Timestamp.max).dt.date
-    return bool(((s <= m_start) & (e >= m_end)).any())
+def _all_month(df: pd.DataFrame, start_col: str, end_col: str, ms: date, me: date, *, mask=None) -> bool:
+    if df is None or df.empty: return False
+    if start_col not in df.columns or end_col not in df.columns: return False
+    if mask is None:
+        mask = pd.Series(True, index=df.index)
+    s = pd.to_datetime(df[start_col], errors="coerce").dt.date.fillna(date(1900,1,1))
+    e = pd.to_datetime(df[end_col], errors="coerce").dt.date.fillna(date(9999,12,31))
+    m = mask & (s <= ms) & (e >= me)
+    return bool(m.any())
 
-# ---------- Excel I/O & cleaning ----------
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = (df.columns.str.strip().str.replace(r"\s+", " ", regex=True).str.lower())
-    return df
+def _coerce_str(x) -> str:
+    return "" if x is None or (isinstance(x,float) and np.isnan(x)) else str(x).strip()
 
+# ---------- Loading ----------
 def load_excel(file_bytes: bytes) -> dict:
     xls = pd.ExcelFile(io.BytesIO(file_bytes))
     out = {}
@@ -184,13 +209,15 @@ def _boolify(df, cols):
     if df.empty: return df
     df = df.copy()
     for c in cols:
-        if c in df.columns: df[c] = df[c].apply(to_bool)
+        if c in df.columns:
+            df[c] = df[c].apply(to_bool)
     return df
 
-def prepare_inputs(data: dict):
+def prepare_inputs(data: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Returns cleaned dataframes for:
-      Emp Demographic, Emp Status, Emp Eligibility, Emp Enrollment, Dep Enrollment, Pay Deductions
+    Standardize inputs and return:
+      emp_demo, emp_elig, emp_enroll, dep_enroll
+    (Emp Status and Pay Deductions are removed entirely.)
     """
     cleaned = {}
     for sheet, cols in EXPECTED_SHEETS.items():
@@ -204,16 +231,8 @@ def prepare_inputs(data: dict):
                 df = df.rename(columns={misspell: canon})
         df = _ensure_employeeid_str(df)
 
-        if sheet == "emp status":
-            if "employmentstatus" in df.columns:
-                df["employmentstatus"] = df["employmentstatus"].astype(str).str.strip()
-            if "role" in df.columns:
-                df["role"] = df["role"].astype(str).str.strip()
-            if "employmentstatus" in df.columns:
-                df["_estatus_norm"] = df["employmentstatus"].map(_norm_token)
-            if "role" in df.columns:
-                df["_role_norm"] = df["role"].map(_norm_token)
-            df = _parse_date_cols(df, ["statusstartdate","statusenddate"], default_end_cols=["statusenddate"])
+        if False:  # emp status removed
+            pass
 
         elif sheet == "emp eligibility":
             # normalize IDs
@@ -221,15 +240,14 @@ def prepare_inputs(data: dict):
                 df["employeeid"] = df["employeeid"].astype(str).str.strip()
 
             # Handle common header variants
-            if "eligibleplan" in df.columns and "plancode" not in df.columns:
-                df["plancode"] = df["eligibleplan"].astype(str).str.strip()
-            if "eligibletier" in df.columns and "eligibilitytier" not in df.columns:
-                df["eligibilitytier"] = df["eligibletier"].astype(str).str.strip()
-
-            for c in ("plancode","eligibilitytier"):
+            if "eligibilitytier" in df.columns:
+                df["eligibilitytier"] = df["eligibilitytier"].astype(str).str.strip()
+            for c in ("plancode","planname"):
                 if c in df.columns:
                     df[c] = df[c].astype(str).str.strip()
 
+            # boolean and numeric cost
+            df = _boolify(df, ["iseligibleforcoverage"])
             if "plancost" in df.columns:
                 df["plancost"] = pd.to_numeric(df["plancost"], errors="coerce")
 
@@ -260,13 +278,10 @@ def prepare_inputs(data: dict):
             if "plancode" in df.columns:
                 df["plancode"] = df["plancode"].astype(str).str.strip()
 
-        elif sheet == "pay deductions":
-            df = _parse_date_cols(df, ["startdate","enddate"], default_end_cols=["enddate"])
-
         cleaned[sheet] = df
 
-    return (cleaned["emp demographic"], cleaned["emp status"], cleaned["emp eligibility"],
-            cleaned["emp enrollment"], cleaned["dep enrollment"], cleaned["pay deductions"])
+    return (cleaned["emp demographic"], cleaned["emp eligibility"],
+            cleaned["emp enrollment"], cleaned["dep enrollment"])
 
 # ---------- Year & grid ----------
 def choose_report_year(emp_elig: pd.DataFrame, fallback_to_current=True) -> int:
@@ -280,20 +295,13 @@ def choose_report_year(emp_elig: pd.DataFrame, fallback_to_current=True) -> int:
     for _, r in emp_elig.iterrows():
         s = pd.to_datetime(r.get("eligibilitystartdate"), errors="coerce")
         e = pd.to_datetime(r.get("eligibilityenddate"), errors="coerce")
-
-        if pd.isna(s) and pd.isna(e):
-            continue
-
-        if pd.isna(s) and not pd.isna(e):
-            sy = ey = int(e.year)
-        elif not pd.isna(s) and pd.isna(e):
-            sy = ey = int(s.year)
-        else:
-            sy, ey = int(s.year), int(e.year)
-
-        lo, hi = min(sy, ey), max(sy, ey)
-        for y in range(lo, hi + 1):
-            counts[y] = counts.get(y, 0) + 1
+        for x in (s, e):
+            try:
+                if pd.notna(x):
+                    y = int(x.year)
+                    counts[y] = counts.get(y, 0) + 1
+            except Exception:
+                pass
 
     if counts:
         return max(sorted(counts), key=lambda y: (counts[y], y))
