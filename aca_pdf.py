@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 from typing import Tuple
+
 import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
 
@@ -17,7 +18,6 @@ def fill_pdf_for_employee(
     Minimal placeholder filler:
     - Returns a copy of the base PDF as "editable"
     - Returns a flattened copy (no form fields) as "flat"
-    This avoids PDF-related crashes while we stabilize the backend.
     """
     base_pdf_bytes_io.seek(0)
     reader = PdfReader(base_pdf_bytes_io)
@@ -52,15 +52,21 @@ def save_excel_outputs(
     *,
     penalty_dashboard: pd.DataFrame | None = None,
 ) -> bytes:
-    """Write Final/Interim/(optional) Penalty sheets safely."""
+    """Write Final/Interim/(optional) Penalty sheets safely (no ambiguous DataFrame checks)."""
     from pandas import ExcelWriter
-    import io
 
     output = io.BytesIO()
     with ExcelWriter(output, engine="openpyxl") as xw:
-        (final or pd.DataFrame()).to_excel(xw, index=False, sheet_name=f"Final {year}")
-        (interim or pd.DataFrame()).to_excel(xw, index=False, sheet_name=f"Interim {year}")
+        (final or pd.DataFrame()).to_excel(
+            xw, index=False, sheet_name=f"Final {year}"
+        )
+        (interim or pd.DataFrame()).to_excel(
+            xw, index=False, sheet_name=f"Interim {year}"
+        )
+        # Critical guard to avoid "truth value of a DataFrame is ambiguous"
         if penalty_dashboard is not None and not penalty_dashboard.empty:
-            penalty_dashboard.to_excel(xw, index=False, sheet_name=f"Penalty Dashboard {year}")
+            penalty_dashboard.to_excel(
+                xw, index=False, sheet_name=f"Penalty Dashboard {year}"
+            )
     output.seek(0)
     return output.getvalue()
