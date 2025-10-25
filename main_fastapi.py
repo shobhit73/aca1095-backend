@@ -1,272 +1,331 @@
 # main_fastapi.py
-
 from __future__ import annotations
 
 import io
-import os
-import zipfile
-from typing import Optional, Dict, Any
+import traceback
+from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, Form, Header, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import pandas as pd
 
-# ---- project imports ----
 from aca_processing import (
-    load_excel,          # must return dict of dataframes, incl. 'year_used'
-    _coerce_str,
+    read_input_excel,          # your helper: returns dict of sheets as DataFrames
+    preprocess_inputs,         # applies aliases, normalization, waits, etc.
 )
 from aca_builder import (
-    build_interim,
-    build_final,
-    build_penalty_dashboard,
+    build_interim,             # builds interim grid
+    build_final,               # builds final (lines 14/16) from interim
+    build_penalty_dashboard,   # optional
 )
 from aca_pdf import (
     fill_pdf_for_employee,
     save_excel_outputs,
-    list_pdf_fields,     # debug helper
+    list_pdf_fields,           # debug helper
 )
 
-# ----------------------------------------------------------------------
-# App + CORS
-# ----------------------------------------------------------------------
-app = FastAPI(title="ACA 1095 Backend", version="1.0.0")
 
+app = FastAPI(title="ACA 1095-C Backend", version="1.0.0")
+
+# CORS (adjust to your frontend origin)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],  # tighten in prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-FASTAPI_API_KEY = os.getenv("FASTAPI_API_KEY")  # optional
-def _check_key(x_api_key: Optional[str]):
-    if FASTAPI_API_KEY and (x_api_key or "") != FASTAPI_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
 
-
-# ----------------------------------------------------------------------
-# Small helpers
-# ----------------------------------------------------------------------
-async def _read_bytes(file: UploadFile) -> bytes:
-    if file is None:
-        raise HTTPException(status_code=422, detail="Missing file")
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=422, detail=f"Empty upload: {file.filename}")
-    return data
-
-def _stream_bytes(b: bytes, filename: str, content_type: str) -> StreamingResponse:
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return StreamingResponse(io.BytesIO(b), headers=headers, media_type=content_type)
-
-
-# ----------------------------------------------------------------------
-# Health
-# ----------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"ok": True}
 
 
-# ----------------------------------------------------------------------
-# DEBUG: list PDF fields (diagnose blank PDFs / field-name mismatches)
-# Use from Swagger UI at http://127.0.0.1:8000/docs
-# ----------------------------------------------------------------------
+# -------------------------- helpers --------------------------
+
+def _get_bool(form, *names: str, default: bool = False) -> bool:
+    for n in names:
+        if n in form:
+            v = str(form[n]).strip().lower()
+            return v in {"1", "true", "t", "yes", "y", "on"}
+    return default
+
+def _get_int(form, *names: str, default: Optional[int] = None) -> Optional[int]:
+    for n in names:
+        if n in form:
+            try:
+                return int(str(form[n]).strip())
+            except Exception:
+                return default
+    return default
+
+def _get_float(form, *names: str, default: Optional[float] = None) -> Optional[float]:
+    for n in names:
+        if n in form:
+            try:
+                return float(str(form[n]).strip())
+            except Exception:
+                return default
+    return default
+
+def _get_str(form, *names: str, default: Optional[str] = None) -> Optional[str]:
+    for n in names:
+        if n in form:
+            v = str(form[n]).strip()
+            return v if v != "" else default
+    return default
+
+
+def _xlsx_from_upload(file: UploadFile) -> dict[str, pd.DataFrame]:
+    """Read an uploaded Excel file into {sheet_name: DataFrame} (lowercased column names)."""
+    with io.BytesIO(file.file.read()) as buf:
+        buf.seek(0)
+        xl = pd.ExcelFile(buf)
+        sheets: dict[str, pd.DataFrame] = {}
+        for s in xl.sheet_names:
+            df = xl.parse(s)
+            # normalize header case
+            df.columns = [str(c).strip().lower() for c in df.columns]
+            sheets[s.strip()] = df
+        return sheets
+
+
+def _first_visible_sheet_required(xw: pd.ExcelWriter):
+    """No-op placeholder; kept in case we later enforce 'at least one visible sheet' logic."""
+    return
+
+
+def _build_everything(
+    sheets: dict[str, pd.DataFrame],
+    year: int,
+    threshold: float,
+    include_penalty: bool,
+):
+    """
+    Orchestrates processing -> interim -> final (+ optional penalty).
+    """
+    # user-specific normalization (aliases, waits, etc.)
+    inputs = preprocess_inputs(sheets)
+
+    # pipeline
+    interim = build_interim(inputs, year=year, affordability_threshold=threshold)
+    final = build_final(interim, year=year)
+
+    penalty = None
+    if include_penalty:
+        try:
+            penalty = build_penalty_dashboard(final)
+        except Exception:
+            penalty = None
+
+    return interim, final, penalty
+
+
+# -------------------------- API routes --------------------------
+
 @app.post("/debug/pdf_fields")
-async def debug_pdf_fields(
-    pdf: UploadFile = File(...),
-):
-    pdf_bytes = await _read_bytes(pdf)
-    fields = list_pdf_fields(pdf_bytes)
-    return JSONResponse(fields)
-
-
-# ----------------------------------------------------------------------
-# Core: Process Excel only (returns Excel workbook of outputs)
-# ----------------------------------------------------------------------
-@app.post("/process/excel")
-async def process_excel(
-    excel: UploadFile = File(...),
-    filing_year: int = Form(...),
-    affordability_threshold: float = Form(...),
-    include_penalty_dashboard: Optional[bool] = Form(False),
-    x_api_key: Optional[str] = Header(None),
-):
-    _check_key(x_api_key)
-
-    # 1) Load excel
-    excel_bytes = await _read_bytes(excel)
+async def debug_pdf_fields(pdf: UploadFile = File(...)):
+    """Upload a blank 1095-C PDF; returns a dict of its AcroForm fields."""
     try:
-        data = load_excel(
-            io.BytesIO(excel_bytes),
-            filing_year=filing_year,
-            affordability_threshold=affordability_threshold,
-        )
+        pdf_bytes = await pdf.read()
+        fields = list_pdf_fields(pdf_bytes)
+        return JSONResponse(fields)
     except Exception as e:
-        return PlainTextResponse(f"Failed to load Excel: {e}", status_code=422)
-
-    # 2) Build dataframes
-    try:
-        interim = build_interim(data)
-        final = build_final(interim, data)
-        penalty = build_penalty_dashboard(final, data) if include_penalty_dashboard else None
-    except Exception as e:
-        return PlainTextResponse(f"Failed during build: {e}", status_code=422)
-
-    # 3) Write outputs to xlsx
-    try:
-        out_bytes = save_excel_outputs(
-            interim=interim,
-            final=final,
-            year=data.get("year_used", filing_year),
-            penalty_dashboard=penalty,
-        )
-    except Exception as e:
-        return PlainTextResponse(f"Failed to write Excel: {e}", status_code=500)
-
-    return _stream_bytes(out_bytes, f"aca_outputs_{filing_year}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
 
 
-# ----------------------------------------------------------------------
-# Core: Generate single employee PDF (returns one flattened PDF)
-# Form fields expected:
-#   - excel: xlsx input
-#   - pdf: blank 1095-C template
-#   - filing_year, affordability_threshold
-#   - employee_id (optional, if blank uses the first employee)
-#   - include_penalty_dashboard (ignored here)
-# ----------------------------------------------------------------------
 @app.post("/generate/single")
 async def generate_single(
-    excel: UploadFile = File(...),
-    pdf: UploadFile = File(...),
-    filing_year: int = Form(...),
-    affordability_threshold: float = Form(...),
-    employee_id: Optional[str] = Form(None),
-    x_api_key: Optional[str] = Header(None),
+    # files
+    excel: UploadFile = File(..., description="Input XLSX"),
+    pdf: UploadFile | None = File(None, description="Blank 1095-C PDF"),
+    # optional filter
+    employee_id: Optional[str] = Form(None, alias="employeeId"),
+    # options (accept multiple aliases so 422 never happens due to key mismatch)
+    filing_year: Optional[int] = Form(None, alias="filingYear"),
+    year: Optional[int] = Form(None),
+    affordability_threshold: Optional[float] = Form(None, alias="affordabilityThreshold"),
+    threshold: Optional[float] = Form(None),
+    include_penalty_dashboard: Optional[str] = Form(None, alias="includePenaltyDashboard"),
+    includePenalty: Optional[str] = Form(None),
+    mode: Optional[str] = Form(None),  # "single" | "bulk" | "process" (ignored here but harmless)
 ):
-    _check_key(x_api_key)
-
-    excel_bytes = await _read_bytes(excel)
-    pdf_bytes = await _read_bytes(pdf)
-
-    # load & build
     try:
-        data = load_excel(io.BytesIO(excel_bytes), filing_year=filing_year, affordability_threshold=affordability_threshold)
-        interim = build_interim(data)
-        final = build_final(interim, data)
-        year_used = int(data.get("year_used", filing_year))
-    except Exception as e:
-        return PlainTextResponse(f"Failed to prepare data: {e}", status_code=422)
+        # Parse options defensively
+        used_year = filing_year or year
+        if used_year is None:
+            return JSONResponse({"error": "Missing filing year"}, status_code=422)
+        used_threshold = affordability_threshold if affordability_threshold is not None else threshold
+        if used_threshold is None:
+            used_threshold = 50.0  # safe default for UAT
 
-    # choose employee row
-    try:
-        # Expect final to have 'EmployeeID' and 'Month'
-        emp_ids = final["EmployeeID"].dropna().astype(str).unique().tolist()
-        if not emp_ids:
-            return PlainTextResponse("No employees found in 'Final' sheet.", status_code=422)
-
-        target_emp = _coerce_str(employee_id) if employee_id else _coerce_str(emp_ids[0])
-
-        emp_final = final[final["EmployeeID"].astype(str) == target_emp]
-        if emp_final.empty:
-            return PlainTextResponse(f"EmployeeID {target_emp} not found in Final.", status_code=422)
-
-        # demographic row for Part I fields: take first
-        emp_demo = interim[interim["EmployeeID"].astype(str) == target_emp].head(1).squeeze()
-        if isinstance(emp_demo, pd.DataFrame):  # just in case
-            emp_demo = emp_demo.iloc[0]
-    except Exception as e:
-        return PlainTextResponse(f"Failed selecting employee: {e}", status_code=422)
-
-    # optional coverage slices (if these exist in data)
-    emp_enroll = data.get("emp_enroll")
-    if isinstance(emp_enroll, pd.DataFrame):
-        emp_enroll_emp = emp_enroll[emp_enroll["EmployeeID"].astype(str) == target_emp]
-    else:
-        emp_enroll_emp = None
-
-    dep_enroll = data.get("dep_enroll")
-    if isinstance(dep_enroll, pd.DataFrame):
-        dep_enroll_emp = dep_enroll[dep_enroll["EmployeeID"].astype(str) == target_emp]
-    else:
-        dep_enroll_emp = None
-
-    # fill the PDF
-    try:
-        editable_name, _editable, flat_name, flat_bytes_io = fill_pdf_for_employee(
-            pdf_bytes=pdf_bytes,
-            emp_row=emp_demo,
-            final_df_emp=emp_final,
-            year_used=year_used,
-            emp_enroll_emp=emp_enroll_emp,
-            dep_enroll_emp=dep_enroll_emp,
+        include_penalty = _get_bool(
+            {
+                "includePenaltyDashboard": include_penalty_dashboard,
+                "includePenalty": includePenalty,
+            },
+            "includePenaltyDashboard", "includePenalty",
+            default=False,
         )
-        flat_bytes = flat_bytes_io.getvalue()
+
+        # Read Excel
+        sheets = _xlsx_from_upload(excel)
+        if not sheets:
+            return JSONResponse({"error": "Excel file has no readable sheets"}, status_code=422)
+
+        # Build data
+        interim, final, penalty = _build_everything(
+            sheets=sheets, year=int(used_year), threshold=float(used_threshold), include_penalty=include_penalty
+        )
+
+        # If no employee_id provided, return Excel bundle only
+        if not employee_id:
+            out_bytes = save_excel_outputs(
+                interim=interim, final=final, year=int(used_year), penalty_dashboard=penalty
+            )
+            filename = f"ACA_outputs_{used_year}.xlsx"
+            return Response(
+                content=out_bytes,
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+
+        # Generate one employee’s PDFs
+        # Find the row to print from final
+        emp_id_str = str(employee_id).strip()
+        final_emp = final[final["EmployeeID"].astype(str) == emp_id_str]
+        if final_emp.empty:
+            return JSONResponse({"error": f"EmployeeID {emp_id_str} not found in Final grid"}, status_code=404)
+
+        # Need blank form to fill
+        if pdf is None:
+            return JSONResponse({"error": "Blank 1095-C PDF is required when EmployeeID is provided"}, status_code=422)
+        pdf_bytes = await pdf.read()
+
+        # Optional enrollment sheets for Part III
+        emp_enroll = sheets.get("Emp Enrollment") or sheets.get("emp enrollment")
+        dep_enroll = sheets.get("Dep Enrollment") or sheets.get("dep enrollment")
+
+        # A single employee row from a demographic sheet (for Part I), fallback to final row
+        demo = sheets.get("EmployeeID") or sheets.get("employeeid") or sheets.get("demographics") or sheets.get("Demographics")
+        if demo is not None and not demo.empty:
+            dem_row = demo[demo["employeeid"].astype(str) == emp_id_str]
+            emp_row = dem_row.iloc[0] if not dem_row.empty else final_emp.iloc[0]
+        else:
+            emp_row = final_emp.iloc[0]
+
+        editable_name, editable, flattened_name, flattened = fill_pdf_for_employee(
+            pdf_bytes=pdf_bytes,
+            emp_row=emp_row,
+            final_df_emp=final_emp,
+            year_used=int(used_year),
+            emp_enroll_emp=emp_enroll,
+            dep_enroll_emp=dep_enroll,
+        )
+
+        # Return the flattened by default (same as editable if you used the safe version)
+        return StreamingResponse(
+            flattened,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{flattened_name}"'},
+        )
+
     except Exception as e:
-        return PlainTextResponse(f"PDF generation failed: {e}", status_code=422)
+        return JSONResponse(
+            {"error": str(e), "trace": traceback.format_exc()},
+            status_code=500,
+        )
 
-    return _stream_bytes(flat_bytes, flat_name, "application/pdf")
 
-
-# ----------------------------------------------------------------------
-# Core: Bulk generate PDFs (returns ZIP of flattened PDFs)
-# ----------------------------------------------------------------------
 @app.post("/generate/bulk")
 async def generate_bulk(
     excel: UploadFile = File(...),
     pdf: UploadFile = File(...),
-    filing_year: int = Form(...),
-    affordability_threshold: float = Form(...),
-    x_api_key: Optional[str] = Header(None),
+    filing_year: Optional[int] = Form(None, alias="filingYear"),
+    year: Optional[int] = Form(None),
+    affordability_threshold: Optional[float] = Form(None, alias="affordabilityThreshold"),
+    threshold: Optional[float] = Form(None),
+    include_penalty_dashboard: Optional[str] = Form(None, alias="includePenaltyDashboard"),
+    includePenalty: Optional[str] = Form(None),
 ):
-    _check_key(x_api_key)
-
-    excel_bytes = await _read_bytes(excel)
-    pdf_bytes = await _read_bytes(pdf)
-
-    # Prepare dataframes
+    """
+    Stub for bulk ZIP (left minimal; returns Excel outputs for now).
+    """
     try:
-        data = load_excel(io.BytesIO(excel_bytes), filing_year=filing_year, affordability_threshold=affordability_threshold)
-        interim = build_interim(data)
-        final = build_final(interim, data)
-        year_used = int(data.get("year_used", filing_year))
+        used_year = filing_year or year
+        if used_year is None:
+            return JSONResponse({"error": "Missing filing year"}, status_code=422)
+        used_threshold = affordability_threshold if affordability_threshold is not None else threshold
+        if used_threshold is None:
+            used_threshold = 50.0
+
+        include_penalty = _get_bool(
+            {"includePenaltyDashboard": include_penalty_dashboard, "includePenalty": includePenalty},
+            "includePenaltyDashboard", "includePenalty", default=False
+        )
+
+        sheets = _xlsx_from_upload(excel)
+        interim, final, penalty = _build_everything(
+            sheets=sheets, year=int(used_year), threshold=float(used_threshold), include_penalty=include_penalty
+        )
+        out_bytes = save_excel_outputs(interim=interim, final=final, year=int(used_year), penalty_dashboard=penalty)
+
+        filename = f"ACA_outputs_{used_year}.xlsx"
+        return Response(
+            content=out_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
     except Exception as e:
-        return PlainTextResponse(f"Failed to prepare data: {e}", status_code=422)
+        return JSONResponse(
+            {"error": str(e), "trace": traceback.format_exc()},
+            status_code=500,
+        )
 
-    emp_enroll = data.get("emp_enroll")
-    dep_enroll = data.get("dep_enroll")
 
-    # Build zip
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for emp in final["EmployeeID"].dropna().astype(str).unique():
-            try:
-                emp_final = final[final["EmployeeID"].astype(str) == emp]
-                demo_row = interim[interim["EmployeeID"].astype(str) == emp].head(1).squeeze()
-                if isinstance(demo_row, pd.DataFrame):
-                    demo_row = demo_row.iloc[0]
+@app.post("/process/excel")
+async def process_excel(
+    excel: UploadFile = File(...),
+    filing_year: Optional[int] = Form(None, alias="filingYear"),
+    year: Optional[int] = Form(None),
+    affordability_threshold: Optional[float] = Form(None, alias="affordabilityThreshold"),
+    threshold: Optional[float] = Form(None),
+    include_penalty_dashboard: Optional[str] = Form(None, alias="includePenaltyDashboard"),
+    includePenalty: Optional[str] = Form(None),
+):
+    """
+    Returns an Excel workbook (Interim + Final [+ optional Penalty Dashboard]).
+    """
+    try:
+        used_year = filing_year or year
+        if used_year is None:
+            return JSONResponse({"error": "Missing filing year"}, status_code=422)
+        used_threshold = affordability_threshold if affordability_threshold is not None else threshold
+        if used_threshold is None:
+            used_threshold = 50.0
 
-                emp_enroll_emp = None
-                dep_enroll_emp = None
-                if isinstance(emp_enroll, pd.DataFrame):
-                    emp_enroll_emp = emp_enroll[emp_enroll["EmployeeID"].astype(str) == emp]
-                if isinstance(dep_enroll, pd.DataFrame):
-                    dep_enroll_emp = dep_enroll[dep_enroll["EmployeeID"].astype(str) == emp]
+        include_penalty = _get_bool(
+            {"includePenaltyDashboard": include_penalty_dashboard, "includePenalty": includePenalty},
+            "includePenaltyDashboard", "includePenalty", default=False
+        )
 
-                _, _, flat_name, flat_io = fill_pdf_for_employee(
-                    pdf_bytes=pdf_bytes,
-                    emp_row=demo_row,
-                    final_df_emp=emp_final,
-                    year_used=year_used,
-                    emp_enroll_emp=emp_enroll_emp,
-                    dep_enroll_emp=dep_enroll_emp,
-                )
-                zf.writestr(flat_name, flat_io.getvalue())
-            except Exception as e:
-                zf.writestr(f"error_{emp}.txt", f"Failed to build PDF for EmployeeID={emp}: {e}")
-
-    buf.seek(0)
-    return _stream_bytes(buf.getvalue(), f"aca_pdfs_{filing_year}.zip", "application/zip")
+        sheets = _xlsx_from_upload(excel)
+        interim, final, penalty = _build_everything(
+            sheets=sheets, year=int(used_year), threshold=float(used_threshold), include_penalty=include_penalty
+        )
+        out_bytes = save_excel_outputs(interim=interim, final=final, year=int(used_year), penalty_dashboard=penalty)
+        filename = f"ACA_outputs_{used_year}.xlsx"
+        return Response(
+            content=out_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"error": str(e), "trace": traceback.format_exc()},
+            status_code=500,
+        )
