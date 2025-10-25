@@ -6,6 +6,7 @@ import io
 from dataclasses import dataclass
 from datetime import date
 from typing import Dict, List, Optional, Tuple
+import re
 
 import numpy as np
 import pandas as pd
@@ -132,11 +133,12 @@ class Part3RowRefs:
 def _discover_part3_rows(reader: PdfReader) -> List[Part3RowRefs]:
     """
     Inspect the PDF's AcroForm and return row references for Part III (Covered Individuals).
-    Relies on /Parent '/T' like 'Row1', 'Row2', ... (present in the IRS form).
+    Works with both IRS 'Row1/Row2/...' and vendor PDFs that label rows differently.
     """
     fields = _all_fields(reader)
     text_by_row: Dict[str, List[str]] = {}
     box_by_row: Dict[str, List[str]] = {}
+
     for name, rec in fields.items():
         if name.startswith("f3_"):  # text inputs
             parent = rec.get("/Parent", {})
@@ -149,16 +151,35 @@ def _discover_part3_rows(reader: PdfReader) -> List[Part3RowRefs]:
             row = str(row) if row else "Row?"
             box_by_row.setdefault(row, []).append(name)
 
-    def _sort_key(n: str) -> int:
+    def _field_sort_key(n: str) -> int:
+        # Sort f3_1[0], f3_12[0] numerically
         try:
             return int(n.split("_")[1].split("[")[0])
         except Exception:
             return 9999
 
+    def _row_sort_key(row_label: str) -> int:
+        """
+        Robust row sorter:
+        - If label looks like 'Row12' → 12
+        - Else extract any digits '...5...' → 5
+        - Else 999 (push to the end)
+        """
+        if not row_label:
+            return 999
+        if row_label.startswith("Row"):
+            s = row_label.replace("Row", "")
+            try:
+                return int(s.strip("[]") or "999")
+            except Exception:
+                pass
+        m = re.search(r"(\d+)", str(row_label))
+        return int(m.group(1)) if m else 999
+
     rows: List[Part3RowRefs] = []
-    for row_name in sorted(text_by_row.keys(), key=lambda r: int(r.replace("Row", "").strip("[]") or "999")):
-        texts = sorted(text_by_row.get(row_name, []), key=_sort_key)
-        boxes = sorted(box_by_row.get(row_name, []), key=_sort_key)
+    for row_name in sorted(text_by_row.keys(), key=_row_sort_key):
+        texts = sorted(text_by_row.get(row_name, []), key=_field_sort_key)
+        boxes = sorted(box_by_row.get(row_name, []), key=_field_sort_key)
         rows.append(Part3RowRefs(text_fields=texts, month_boxes=boxes))
     return rows
 
@@ -263,7 +284,7 @@ def fill_pdf_for_employee(
     # ---------------- Part III (Covered Individuals) ----------------
     covered_rows: List[Tuple[str, str, str, str, Tuple[bool, List[bool]]]] = []
 
-    # (A) Employee: from enrollment if provided, else derived from Line16 == '2C'
+    # (A) Employee coverage periods (skip WAIVE)
     emp_months_enrolled = [False] * 12
     if emp_enroll_emp is not None and not emp_enroll_emp.empty:
         periods: List[Tuple[date, date]] = []
@@ -303,7 +324,7 @@ def fill_pdf_for_employee(
             if any(months):
                 covered_rows.append((dep_first, dep_mi, dep_last, dep_ssn, (all12, months)))
 
-    # Discover Part III rows in the PDF and fill them
+    # Discover Part III rows and fill
     p3_rows = _discover_part3_rows(reader)
 
     for idx, person in enumerate(covered_rows[: len(p3_rows)]):
@@ -319,7 +340,6 @@ def fill_pdf_for_employee(
             assign[texts_sorted[2]] = mi_n
             assign[texts_sorted[3]] = ssn_n
             # texts_sorted[4] presumed DOB -> left blank
-        # update on last page (AcroForm is global)
         _update_text(writer.pages[-1], assign)
 
         # Month boxes: [All12, Jan..Dec]
