@@ -1,4 +1,4 @@
-# main_fastapi.py — ACA 1095-C backend with emp_demo wired into build_interim
+# main_fastapi.py — ACA 1095-C backend with emp_demo and positional build_final(year)
 from __future__ import annotations
 
 import io
@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from aca_builder import build_interim, build_final, build_penalty_dashboard
 from aca_pdf import fill_pdf_for_employee, save_excel_outputs, list_pdf_fields
 
-app = FastAPI(title="ACA 1095-C Backend", version="1.0.5")
+app = FastAPI(title="ACA 1095-C Backend", version="1.0.6")
 
 # ───────────────────────── CORS (tighten in prod) ─────────────────────────
 app.add_middleware(
@@ -114,7 +114,7 @@ def _build_everything(
     Extract inputs and build interim/final/grids.
     IMPORTANT: build_interim requires emp_demo — pass all params as **keyword args**.
     """
-    # Employee demographics / master (sheet commonly named 'EmployeeID' or 'Demographics')
+    # Employee demographics / master (common names)
     emp_demo = _get_sheet(
         sheets,
         "employeeid", "employee id", "demographics", "emp demographics", "emp demo", "employee master"
@@ -133,8 +133,7 @@ def _build_everything(
         "dep enrollment", "dependent enrollment", "dep_enrollment", "dependent enrolment"
     )
 
-    # If your pipeline also supports the "Emp Wait Period" sheet, add it here and
-    # include the kwarg in build_interim. (Left out unless your function expects it.)
+    # If supported by your builder, you can also pass Emp Wait Period:
     # emp_wait = _get_sheet(sheets, "emp wait period", "wait period", "emp_wait_period")
 
     interim = build_interim(
@@ -147,7 +146,8 @@ def _build_everything(
         # emp_wait=emp_wait,  # ← uncomment only if build_interim has this kwarg
     )
 
-    final = build_final(interim, year=int(year))
+    # ↓↓↓ FIX HERE: use positional year (no keyword 'year')
+    final = build_final(interim, int(year))
 
     penalty = None
     if include_penalty:
