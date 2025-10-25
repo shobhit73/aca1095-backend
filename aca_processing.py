@@ -200,7 +200,7 @@ def _all_month(df: pd.DataFrame, start_col: str, end_col: str, ms: date, me: dat
     e = pd.to_datetime(df[end_col], errors="coerce").dt.date.fillna(date(9999, 12, 31))
 
     covers = mask & (s <= ms) & (e >= me)
-    return bool(covers.any()))
+    return bool(covers.any())
 
 def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
     need = {"employeeid","role","employmentstatus","statusstartdate","statusenddate"}
