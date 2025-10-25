@@ -1,4 +1,5 @@
-# main_fastapi.py — ACA 1095-C backend with emp_demo and positional build_final(year)
+# main_fastapi.py — ACA 1095-C backend (build_final expects only the interim)
+
 from __future__ import annotations
 
 import io
@@ -10,13 +11,11 @@ from fastapi import FastAPI, File, Form, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-# Project modules
 from aca_builder import build_interim, build_final, build_penalty_dashboard
 from aca_pdf import fill_pdf_for_employee, save_excel_outputs, list_pdf_fields
 
-app = FastAPI(title="ACA 1095-C Backend", version="1.0.6")
+app = FastAPI(title="ACA 1095-C Backend", version="1.0.7")
 
-# ───────────────────────── CORS (tighten in prod) ─────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,7 +28,7 @@ app.add_middleware(
 def health():
     return {"ok": True}
 
-# ─────────────────────────── helpers ───────────────────────────
+# ----------------- small helpers -----------------
 def _to_plain_dict(m: Mapping[str, Any]) -> dict[str, Any]:
     return {str(k): m[k] for k in m}
 
@@ -110,32 +109,16 @@ def _build_everything(
     threshold: float,
     include_penalty: bool,
 ):
-    """
-    Extract inputs and build interim/final/grids.
-    IMPORTANT: build_interim requires emp_demo — pass all params as **keyword args**.
-    """
-    # Employee demographics / master (common names)
+    # Inputs
     emp_demo = _get_sheet(
         sheets,
         "employeeid", "employee id", "demographics", "emp demographics", "emp demo", "employee master"
     )
+    emp_elig = _get_sheet(sheets, "emp eligibility", "employee eligibility", "eligibility", "emp_eligibility")
+    emp_enroll = _get_sheet(sheets, "emp enrollment", "employee enrollment", "emp_enrollment")
+    dep_enroll = _get_sheet(sheets, "dep enrollment", "dependent enrollment", "dep_enrollment")
 
-    emp_elig = _get_sheet(
-        sheets,
-        "emp eligibility", "employee eligibility", "eligibility", "emp_eligibility"
-    )
-    emp_enroll = _get_sheet(
-        sheets,
-        "emp enrollment", "employee enrollment", "emp_enrollment", "employee enrolment"
-    )
-    dep_enroll = _get_sheet(
-        sheets,
-        "dep enrollment", "dependent enrollment", "dep_enrollment", "dependent enrolment"
-    )
-
-    # If supported by your builder, you can also pass Emp Wait Period:
-    # emp_wait = _get_sheet(sheets, "emp wait period", "wait period", "emp_wait_period")
-
+    # Build interim (keyword args)
     interim = build_interim(
         emp_demo=emp_demo,
         emp_elig=emp_elig,
@@ -143,11 +126,10 @@ def _build_everything(
         dep_enroll=dep_enroll,
         affordability_threshold=float(threshold),
         year=int(year),
-        # emp_wait=emp_wait,  # ← uncomment only if build_interim has this kwarg
     )
 
-    # ↓↓↓ FIX HERE: use positional year (no keyword 'year')
-    final = build_final(interim, int(year))
+    # Build final — IMPORTANT: only pass the interim
+    final = build_final(interim)
 
     penalty = None
     if include_penalty:
@@ -158,7 +140,7 @@ def _build_everything(
 
     return interim, final, penalty
 
-# ─────────────────────── debug helper ───────────────────────
+# --------------- debug fields ---------------
 @app.post("/debug/pdf_fields")
 async def debug_pdf_fields(pdf: UploadFile = File(...)):
     try:
@@ -168,12 +150,12 @@ async def debug_pdf_fields(pdf: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
 
-# ─────────────────────── main endpoints ───────────────────────
+# --------------- endpoints ---------------
 @app.post("/generate/single")
 async def generate_single(
     request: Request,
-    excel: UploadFile = File(..., description="Input XLSX"),
-    pdf: UploadFile | None = File(None, description="Blank 1095-C PDF"),
+    excel: UploadFile = File(...),
+    pdf: UploadFile | None = File(None),
     employee_id: Optional[str] = Form(None, alias="employeeId"),
     filing_year: Optional[int] = Form(None, alias="filingYear"),
     year: Optional[int] = Form(None),
@@ -185,7 +167,6 @@ async def generate_single(
 ):
     try:
         raw_form = _to_plain_dict(await request.form())
-
         used_year = _detect_year(raw_form, filing_year or year)
         if used_year is None:
             return JSONResponse({"error": "Missing filing year"}, status_code=422)
@@ -194,7 +175,7 @@ async def generate_single(
         if used_threshold is None:
             used_threshold = _detect_threshold(raw_form)
         if used_threshold is None:
-            used_threshold = 50.0  # UAT default
+            used_threshold = 50.0
 
         include_penalty = _truthy(
             raw_form.get("includePenaltyDashboard", include_penalty_dashboard)
@@ -210,11 +191,8 @@ async def generate_single(
             sheets=sheets, year=int(used_year), threshold=float(used_threshold), include_penalty=include_penalty
         )
 
-        # If EmployeeID is not provided → return processed Excel bundle
         if not employee_id:
-            out_bytes = save_excel_outputs(
-                interim=interim, final=final, year=int(used_year), penalty_dashboard=penalty
-            )
+            out_bytes = save_excel_outputs(interim=interim, final=final, year=int(used_year), penalty_dashboard=penalty)
             filename = f"ACA_outputs_{used_year}.xlsx"
             return Response(
                 content=out_bytes,
@@ -222,7 +200,6 @@ async def generate_single(
                 headers={"Content-Disposition": f'attachment; filename="{filename}"'},
             )
 
-        # Generate one employee’s PDF
         emp_id_str = str(employee_id).strip()
         final_emp = final[final["EmployeeID"].astype(str) == emp_id_str]
         if final_emp.empty:
@@ -232,11 +209,9 @@ async def generate_single(
             return JSONResponse({"error": "Blank 1095-C PDF is required when EmployeeID is provided"}, status_code=422)
         pdf_bytes = await pdf.read()
 
-        # Optional enrollments for Part III logic
         emp_enroll = sheets.get("Emp Enrollment") or sheets.get("emp enrollment")
         dep_enroll = sheets.get("Dep Enrollment") or sheets.get("dep enrollment")
 
-        # Prefer demo/master sheet row for Part I text (fallback to final row)
         demo = (
             sheets.get("EmployeeID") or sheets.get("employeeid")
             or sheets.get("Demographics") or sheets.get("demographics")
@@ -268,7 +243,7 @@ async def generate_single(
 async def generate_bulk(
     request: Request,
     excel: UploadFile = File(...),
-    pdf: UploadFile = File(...),  # currently unused but kept for parity
+    pdf: UploadFile = File(...),
     filing_year: Optional[int] = Form(None, alias="filingYear"),
     year: Optional[int] = Form(None),
     affordability_threshold: Optional[float] = Form(None, alias="affordabilityThreshold"),
@@ -278,7 +253,6 @@ async def generate_bulk(
 ):
     try:
         raw_form = _to_plain_dict(await request.form())
-
         used_year = _detect_year(raw_form, filing_year or year)
         if used_year is None:
             return JSONResponse({"error": "Missing filing year"}, status_code=422)
@@ -323,7 +297,6 @@ async def process_excel(
 ):
     try:
         raw_form = _to_plain_dict(await request.form())
-
         used_year = _detect_year(raw_form, filing_year or year)
         if used_year is None:
             return JSONResponse({"error": "Missing filing year"}, status_code=422)
