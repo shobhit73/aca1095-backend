@@ -1,7 +1,9 @@
 # main_fastapi.py
 from __future__ import annotations
 
-import io, os, json
+import io
+import os
+import json
 from typing import Optional
 
 import pandas as pd
@@ -26,8 +28,9 @@ from aca_pdf import (
     save_excel_outputs,
 )
 
-app = FastAPI(title="ACA 1095 Service", version="1.1.0")
+app = FastAPI(title="ACA 1095 Service", version="1.2.0")
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
@@ -36,6 +39,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Simple API key check
 def _get_api_key(request: Request):
     keys = os.getenv("API_KEYS", "supersecret-key-123").split(",")
     keys = [k.strip() for k in keys if k.strip()]
@@ -52,7 +56,6 @@ def health():
 @app.post("/process/excel")
 async def process_excel(
     excel: UploadFile = File(...),
-    # UI options (optional; safe defaults)
     filing_year: Optional[int] = Form(None),
     affordability_threshold: Optional[float] = Form(None),
     include_penalty_dashboard: str = Form("true"),
@@ -76,11 +79,14 @@ async def process_excel(
         )
         final_df = build_final(interim_df)
 
+        # Build penalty dashboard only if asked; force None if empty to avoid
+        # any legacy truthiness checks downstream
         penalty_df = None
         if include_penalty_dashboard.lower() in {"true", "1", "yes", "y"}:
-            penalty_df = build_penalty_dashboard(interim_df)
+            tmp = build_penalty_dashboard(interim_df)
+            penalty_df = None if (tmp is None or getattr(tmp, "empty", True)) else tmp
         else:
-            penalty_df = pd.DataFrame()
+            penalty_df = None
 
         out_bytes = save_excel_outputs(
             interim_df,
@@ -92,10 +98,14 @@ async def process_excel(
     except HTTPException:
         raise
     except Exception as e:
+        # Print full traceback to Render logs so we see exact line/file
+        import traceback, sys
+        print("=== /process/excel FAILED ===", file=sys.stderr, flush=True)
+        print(traceback.format_exc(), file=sys.stderr, flush=True)
         raise HTTPException(status_code=422, detail=f"Failed to process Excel: {e}")
 
     fname = f"final_interim_penalty_{year_used}.xlsx"
-    headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
+    headers = {"Content-Disposition": f'attachment; filename=\"{fname}\"'}
     return StreamingResponse(
         io.BytesIO(out_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -156,21 +166,25 @@ async def generate_single(
         )
 
         if flattened_only.lower() in {"true","1","yes","y"}:
-            headers = {"Content-Disposition": f'attachment; filename="{flat_name}"'}
+            headers = {"Content-Disposition": f'attachment; filename=\"{flat_name}\"'}
             return StreamingResponse(io.BytesIO(flat_bytes.getvalue()), media_type="application/pdf", headers=headers)
 
+        # If not flattened-only: return both in a ZIP
         zip_buf = io.BytesIO()
         import zipfile
         with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
             z.writestr(editable_name, editable_bytes.getvalue())
             z.writestr(flat_name, flat_bytes.getvalue())
         zip_buf.seek(0)
-        headers = {"Content-Disposition": f'attachment; filename="1095c_{employee_id}.zip"'}
+        headers = {"Content-Disposition": f'attachment; filename=\"1095c_{employee_id}.zip\"'}
         return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
 
     except HTTPException:
         raise
     except Exception as e:
+        import traceback, sys
+        print("=== /generate/single FAILED ===", file=sys.stderr, flush=True)
+        print(traceback.format_exc(), file=sys.stderr, flush=True)
         raise HTTPException(status_code=422, detail=f"PDF generation failed: {e}")
 
 # ------------------ Bulk 1095-Cs (ZIP of flattened PDFs) ------------------
@@ -227,10 +241,13 @@ async def generate_bulk(
                 )
                 z.writestr(flat_name, flat_bytes.getvalue())
         zip_buf.seek(0)
-        headers = {"Content-Disposition": f'attachment; filename="1095c_bulk_{year_used}.zip"'}
+        headers = {"Content-Disposition": f'attachment; filename=\"1095c_bulk_{year_used}.zip\"'}
         return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
 
     except HTTPException:
         raise
     except Exception as e:
+        import traceback, sys
+        print("=== /generate/bulk FAILED ===", file=sys.stderr, flush=True)
+        print(traceback.format_exc(), file=sys.stderr, flush=True)
         raise HTTPException(status_code=422, detail=f"Bulk generation failed: {e}")
