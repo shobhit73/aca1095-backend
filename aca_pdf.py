@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 from dataclasses import dataclass
 from datetime import date
 from typing import Dict, List, Optional, Tuple
@@ -10,14 +11,17 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
-from PyPDF2.generic import NameObject
+from PyPDF2.generic import (
+    NameObject,
+    BooleanObject,
+    TextStringObject,
+    DictionaryObject,
+)
 
 from aca_processing import MONTHS, _coerce_str, month_bounds
 
 
 # ----------------------------- small helpers -----------------------------
-
-import re
 
 def _to_int_safe(val, default=9999):
     """Extract first integer from any string like 'f1_10', 'Row[12]', 'f1_[10]'.
@@ -29,6 +33,7 @@ def _to_int_safe(val, default=9999):
         return int(m.group(0)) if m else default
     except Exception:
         return default
+
 
 def _safe_int(x, default=None):
     try:
@@ -60,7 +65,6 @@ def _all_fields(reader: PdfReader) -> Dict[str, dict]:
         raw = reader.get_fields()
         if isinstance(raw, dict):
             for k, v in raw.items():
-                # Normalize to dict (sometimes indirect objects live here)
                 try:
                     fields[str(k)] = dict(v)
                 except Exception:
@@ -82,7 +86,6 @@ def _find_on_value(annot_obj) -> NameObject:
         ap = annot_obj.get("/AP")
         if ap and "/N" in ap:
             n = ap["/N"]
-            # n could be a dict of appearances. Choose the first non-Off key.
             keys = list(n.keys()) if isinstance(n, dict) else []
             for k in keys:
                 if str(k) not in ("/Off", "Off", "None"):
@@ -95,7 +98,7 @@ def _find_on_value(annot_obj) -> NameObject:
 def _update_text(writer: PdfWriter, page, name_to_value: Dict[str, str]):
     """
     Update text fields on a given page using PdfWriter.update_page_form_field_values.
-    Also sets the /V directly on the widget if necessary.
+    Also sets the /V directly on the widget (as TextStringObject) if necessary.
     """
     try:
         writer.update_page_form_field_values(page, name_to_value)
@@ -112,7 +115,8 @@ def _update_text(writer: PdfWriter, page, name_to_value: Dict[str, str]):
                     obj = annot
                 nm = obj.get("/T")
                 if nm in name_to_value:
-                    obj.update({NameObject("/V"): name_to_value[nm]})
+                    val = TextStringObject(str(name_to_value[nm]))
+                    obj.update({NameObject("/V"): val})
     except Exception:
         pass
 
@@ -137,17 +141,16 @@ def _set_checkbox_on(writer: PdfWriter, page, field_name: str):
 
 
 def _set_need_appearances(writer: PdfWriter):
+    """Ensure NeedAppearances is a proper PDF boolean."""
     try:
         root = writer._root_object  # type: ignore[attr-defined]
         if "/AcroForm" in root:
             acro = root["/AcroForm"]
-            acro.update({NameObject("/NeedAppearances"): NameObject("/true")})
+            acro.update({NameObject("/NeedAppearances"): BooleanObject(True)})
         else:
-            # Create minimal AcroForm if missing
-            from PyPDF2.generic import DictionaryObject
             root.update({
                 NameObject("/AcroForm"): DictionaryObject({
-                    NameObject("/NeedAppearances"): NameObject("/true")
+                    NameObject("/NeedAppearances"): BooleanObject(True)
                 })
             })
     except Exception:
@@ -162,7 +165,6 @@ def _flatten(writer: PdfWriter) -> bytes:
         root = writer._root_object  # type: ignore[attr-defined]
         if "/AcroForm" in root:
             del root["/AcroForm"]
-        # Also strip page-level annotations
         for i in range(len(writer.pages)):
             page = writer.pages[i]
             if "/Annots" in page:
@@ -234,11 +236,8 @@ def _months_from_periods(periods: List[Tuple[date, date]], year: int) -> Tuple[b
     """
     covered = [False] * 12
     for s, e in periods:
-        # clip to year
-        ys, ye = s.year, e.year
         for m in range(1, 13):
             ms, me = month_bounds(year, m)
-            # overlap if max(start) <= min(end)
             ss = max(s, ms)
             ee = min(e, me)
             if ss <= ee:
@@ -265,12 +264,6 @@ def fill_pdf_for_employee(
     """
     Fill 1095-C PDF (Parts I, II, and PART III)
 
-    Arguments:
-      pdf_bytes    : the blank 1095-C PDF (bytes)
-      emp_row      : Series for the target employee (demographic columns)
-      final_df_emp : 12-row DataFrame for that employee (Month, Line14_Final, Line16_Final)
-      year_used    : filing year (int)
-
     Returns: (editable_name, editable_bytes, flattened_name, flattened_bytes)
     """
     reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -292,9 +285,8 @@ def fill_pdf_for_employee(
     zipcode = _coerce_str(emp_row.get("zipcode"))
 
     page0 = writer.pages[0]
-    # typical IRS 1095-C has Part I/II as f1_* text fields
-    # employee name block (f1_18..f1_25) and monthly codes lines (14 & 16)
-    # Adjust these starts only if your template is different.
+
+    # These ranges match the form revision you're targeting
     EMPLOYEE_FIELDS = _f1_field_names(reader, 18, 8)  # First, MI, Last, SSN, Addr1, Addr2, City, State
     ZIP_FIELD = "f1_26[0]"
 
@@ -313,25 +305,19 @@ def fill_pdf_for_employee(
     _update_text(writer, page0, tx)
 
     # ---------------- Part II (Line 14, Line 16) ----------------
-    # If all months share the same code, set All-12 field; else set individual months
-    # These ranges match the IRS 1095-C form revision your project targets.
     LINE14_FIELDS = _f1_field_names(reader, 44, 13)  # [All12, Jan..Dec]
     LINE16_FIELDS = _f1_field_names(reader, 57, 13)  # [All12, Jan..Dec]
 
-    # Prepare monthly values
     m2 = final_df_emp.copy()
     m2["Month"] = m2["Month"].astype(str).str.strip()
-    # Normalize month order to MONTHS
     month_to_code14: Dict[str, str] = {row["Month"]: _coerce_str(row.get("Line14_Final")) for _, row in m2.iterrows()}
     month_to_code16: Dict[str, str] = {row["Month"]: _coerce_str(row.get("Line16_Final")) for _, row in m2.iterrows()}
 
-    # Determine if all 12 months share the same value
     vals14 = [month_to_code14.get(m, "") for m in MONTHS]
     vals16 = [month_to_code16.get(m, "") for m in MONTHS]
     all14_same = len(set(vals14)) == 1 and (vals14[0] or "") != ""
     all16_same = len(set(vals16)) == 1 and (vals16[0] or "") != ""
 
-    # write Line 14
     if LINE14_FIELDS:
         if all14_same:
             _update_text(writer, page0, {LINE14_FIELDS[0]: vals14[0]})
@@ -339,7 +325,6 @@ def fill_pdf_for_employee(
             for i, m in enumerate(MONTHS, start=1):
                 _update_text(writer, page0, {LINE14_FIELDS[i]: month_to_code14.get(m, "")})
 
-    # write Line 16
     if LINE16_FIELDS:
         if all16_same:
             _update_text(writer, page0, {LINE16_FIELDS[0]: vals16[0]})
@@ -348,12 +333,8 @@ def fill_pdf_for_employee(
                 _update_text(writer, page0, {LINE16_FIELDS[i]: month_to_code16.get(m, "")})
 
     # ---------------- Part III (Covered Individuals) ----------------
-    # If you have enrollment periods, you can drive the month checkboxes per person.
     rows = _discover_part3_rows(reader)
-    # A simple single-person fill (employee only) using 'all 12' if Line14 implies MEC for all months.
-    # Extend as needed to add dependents (rows[1:], etc.).
     if rows:
-        # Expect: 5 text fields (Last, First, MI, SSN, DOB) then 13 month boxes
         r0 = rows[0]
         if len(r0.text_fields) >= 5:
             last_first_mi_ssn_dob = {
@@ -361,18 +342,15 @@ def fill_pdf_for_employee(
                 r0.text_fields[1]: first,
                 r0.text_fields[2]: mi,
                 r0.text_fields[3]: ssn,
-                r0.text_fields[4]: "",  # DOB left blank unless provided in sheet
+                r0.text_fields[4]: "",  # DOB if available
             }
             _update_text(writer, page0, last_first_mi_ssn_dob)
 
-        # MEC months (checkboxes). Here we set All-12 if Line14 is uniform & not blank.
         if r0.month_boxes:
             mec_all12 = all14_same and (vals14[0] or "") != ""
             if mec_all12:
                 _set_checkbox_on(writer, page0, r0.month_boxes[0])  # 'All 12'
             else:
-                # If you have actual coverage periods, replace with real logic from enrollments
-                # Example placeholder: mark months that have a non-blank Line14 code
                 for i, m in enumerate(MONTHS, start=1):
                     if month_to_code14.get(m, ""):
                         _set_checkbox_on(writer, page0, r0.month_boxes[i])
@@ -407,7 +385,6 @@ def save_excel_outputs(
     penalty_dashboard: Optional[pd.DataFrame] = None,
 ) -> bytes:
     buf = io.BytesIO()
-    # Use openpyxl to avoid "no visible sheet" edge case; ensure at least 1 visible sheet.
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         wrote_any = False
         if final is not None and not final.empty:
