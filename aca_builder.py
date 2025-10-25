@@ -25,6 +25,13 @@ PENALTY_A_MONTHLY = 241.67
 PENALTY_B_MONTHLY = 362.50
 
 
+def _df_or_empty(df: pd.DataFrame | None) -> pd.DataFrame:
+    """Return df if it is a non-empty DataFrame; else an empty DataFrame."""
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        return df
+    return pd.DataFrame()
+
+
 def _apply_aliases(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -241,10 +248,12 @@ def build_interim(
     affordability_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
     """Main rules engine (no Emp Status / Pay Deductions dependency)."""
-    emp_demo = _apply_aliases(emp_demo or pd.DataFrame())
-    emp_elig = _apply_aliases(emp_elig or pd.DataFrame())
-    emp_enroll = _apply_aliases(emp_enroll or pd.DataFrame())
-    dep_enroll = _apply_aliases(dep_enroll or pd.DataFrame())
+
+    # *** FIX: never use DataFrame in boolean context ***
+    emp_demo = _apply_aliases(_df_or_empty(emp_demo))
+    emp_elig = _apply_aliases(_df_or_empty(emp_elig))
+    emp_enroll = _apply_aliases(_df_or_empty(emp_enroll))
+    dep_enroll = _apply_aliases(_df_or_empty(dep_enroll))
 
     for df, sc, ec in (
         (emp_elig, "eligibilitystartdate", "eligibilityenddate"),
