@@ -17,7 +17,29 @@ from PyPDF2.generic import (
     IndirectObject,
 )
 
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+
 from aca_processing import MONTHS, _coerce_str
+
+
+# =========================
+#  CONFIG: Part II overlay
+# =========================
+# Coordinates are PDF points (1/72"). Origin is bottom-left of the page.
+# These defaults are for the 2024 IRS 1095-C (Cat. No. 60705M) at 100% scale.
+# If codes land slightly off, tweak only these constants.
+
+# Table origin at the *baseline* of the “All 12 Months” cell in Line 14 row.
+TABLE_X0 = 110.0   # left edge of the All-12 column block (approx)
+TABLE_Y_L14 = 405.0  # baseline for Line 14 text
+TABLE_Y_L16 = 353.0  # baseline for Line 16 text
+
+DX_ALL12_TO_JAN = 42.0   # distance from All-12 column to Jan column center
+DX_MONTH = 40.0          # horizontal step between month columns
+# Text drawing alignment
+FONT_NAME = "Helvetica"
+FONT_SIZE = 9.5
 
 
 # ----------------- small helpers -----------------
@@ -40,7 +62,7 @@ def _normalize_ssn(s: str) -> str:
 
 
 def _resolve(obj):
-    """Return the underlying object for IndirectObject, else obj itself."""
+    """Return underlying object for IndirectObject, else obj itself."""
     try:
         if isinstance(obj, IndirectObject):
             return obj.get_object()
@@ -150,6 +172,91 @@ def _discover_part3(reader: PdfReader) -> List[Part3Row]:
     return rows
 
 
+# ---------- Part II overlay drawing ----------
+
+def _make_partii_overlay_page(width: float, height: float,
+                              codes14: Dict[str, str],
+                              codes16: Dict[str, str]) -> bytes:
+    """
+    Create a transparent PDF page that prints Line 14 / Line 16 codes
+    at the configured coordinates.
+    """
+    buf = io.BytesIO()
+    can = canvas.Canvas(buf, pagesize=(width, height))
+    can.setFont(FONT_NAME, FONT_SIZE)
+
+    # Helper to draw centered text
+    def draw_centered(x, y, txt):
+        if not (txt or "").strip():
+            return
+        can.drawCentredString(x, y, str(txt).strip())
+
+    # ---- Line 14 ----
+    all14 = ""
+    if len(set(v for v in codes14.values() if v)) == 1:
+        # same non-empty code across months
+        v = next((vv for vv in codes14.values() if vv), "")
+        if v:
+            all14 = v
+
+    # All-12 column center
+    x_all = TABLE_X0
+    if all14:
+        draw_centered(x_all, TABLE_Y_L14, all14)
+    else:
+        # months 1..12 (Jan..Dec)
+        for i, m in enumerate(MONTHS, start=1):
+            v = codes14.get(m, "")
+            if not v:
+                continue
+            x = TABLE_X0 + DX_ALL12_TO_JAN + (i - 1) * DX_MONTH
+            draw_centered(x, TABLE_Y_L14, v)
+
+    # ---- Line 16 ----
+    all16 = ""
+    if len(set(v for v in codes16.values() if v)) == 1:
+        vv = next((vv for vv in codes16.values() if vv), "")
+        if vv:
+            all16 = vv
+
+    if all16:
+        draw_centered(x_all, TABLE_Y_L16, all16)
+    else:
+        for i, m in enumerate(MONTHS, start=1):
+            v = codes16.get(m, "")
+            if not v:
+                continue
+            x = TABLE_X0 + DX_ALL12_TO_JAN + (i - 1) * DX_MONTH
+            draw_centered(x, TABLE_Y_L16, v)
+
+    can.save()
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def overlay_line14_line16(reader: PdfReader,
+                          codes14: Dict[str, str],
+                          codes16: Dict[str, str]):
+    """
+    Merge an overlay with Line 14/16 codes onto page 1 (index 0).
+    """
+    # Page 1 size
+    p0 = _resolve(reader.pages[0])
+    media = _resolve(p0.get("/MediaBox"))
+    if media and len(media) == 4:
+        width = float(media[2])
+        height = float(media[3])
+    else:
+        width, height = letter  # fallback
+
+    overlay_bytes = _make_partii_overlay_page(width, height, codes14, codes16)
+    overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
+    overlay_page = overlay_reader.pages[0]
+
+    # Merge overlay onto page 1
+    p0.merge_page(overlay_page)  # PyPDF2 will overlay content streams in-place
+
+
 # ---------- public API (unchanged signature) ----------
 
 def fill_pdf_for_employee(
@@ -161,7 +268,7 @@ def fill_pdf_for_employee(
     dep_enroll_emp: Optional[pd.DataFrame] = None,
 ):
     """
-    Fill your 1095-C form (Parts I, III; Part II grid on this template is printed).
+    Fill your 1095-C form (Parts I, II overlay for 14/16, PART III).
     Returns: (editable_name, editable_bytes, flattened_name, flattened_bytes)
     """
     reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -188,10 +295,15 @@ def fill_pdf_for_employee(
     _set_text_by_name(reader, "f1_5[0]", state)     # state
     _set_text_by_name(reader, "f1_6[0]", zipc)      # ZIP
 
-    # -------- Part II (grid is printed in this IRS template) --------
-    month_to_l14 = {r["Month"]: _coerce_str(r.get("Line14_Final")) for _, r in final_df_emp.iterrows()}
-    vals14 = [month_to_l14.get(m, "") for m in MONTHS]
-    all12 = len(set(vals14)) == 1 and (vals14[0] or "") != ""
+    # -------- Part II (Line 14 & 16) overlay from final_df_emp --------
+    # Expect columns like 'Month', 'Line14_Final', 'Line16_Final'
+    codes14 = {row["Month"]: _coerce_str(row.get("Line14_Final")) for _, row in final_df_emp.iterrows()}
+    codes16 = {row["Month"]: _coerce_str(row.get("Line16_Final")) for _, row in final_df_emp.iterrows()}
+    # Normalize missing months
+    for m in MONTHS:
+        codes14.setdefault(m, "")
+        codes16.setdefault(m, "")
+    overlay_line14_line16(reader, codes14, codes16)
 
     # -------- Part III --------
     rows = _discover_part3(reader)
@@ -202,12 +314,15 @@ def fill_pdf_for_employee(
             _set_text_by_name(reader, r0.text_fields[1], first)
             _set_text_by_name(reader, r0.text_fields[2], mi)
             _set_text_by_name(reader, r0.text_fields[3], ssn)
+
+        # Check All-12 or monthly boxes using presence of Line14 code as proxy for MEC
+        same14 = len(set(v for v in codes14.values() if v)) == 1 and next((v for v in codes14.values() if v), "") != ""
         if r0.month_boxes:
-            if all12:
-                _set_checkbox_on(reader, r0.month_boxes[0])  # All 12
+            if same14:
+                _set_checkbox_on(reader, r0.month_boxes[0])  # All 12 months
             else:
                 for i, m in enumerate(MONTHS, start=1):
-                    if month_to_l14.get(m, ""):
+                    if codes14.get(m, ""):
                         _set_checkbox_on(reader, r0.month_boxes[i])
 
     # ---------- outputs ----------
