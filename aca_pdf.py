@@ -30,25 +30,22 @@ logger = logging.getLogger("pdf")
 #  CONFIG: Part II overlay
 # =========================
 # Coordinates are PDF points (1/72"). Origin is bottom-left of the page.
-# Defaults target the 2024 IRS 1095-C (Cat. No. 60705M).
+# Tuned for 2024 IRS 1095-C (Cat. No. 60705M); adjust if needed.
 
-# === Part II overlay positions (tuned) ===
-TABLE_X0 = 110.0
+TABLE_X0 = 110.0        # near left edge of the All-12 column block
+TABLE_Y_L14 = 388.0     # baseline for Line 14 (tuned down from 405)
+TABLE_Y_L16 = 336.0     # baseline for Line 16 (tuned down from 353)
 
-# Drop both lines ~17–20 pts so text lands inside the cells (not the header row)
-TABLE_Y_L14 = 388.0   # was 405.0
-TABLE_Y_L16 = 336.0   # was 353.0
-
-DX_ALL12_TO_JAN = 42.0
-DX_MONTH = 40.0
+DX_ALL12_TO_JAN = 42.0  # distance from All-12 to Jan center
+DX_MONTH = 40.0         # step between months
 
 FONT_NAME = "Helvetica"
 FONT_SIZE = 9.5
 
-X_NUDGE = 1.5
-Y_NUDGE_L14 = -2.0     # small fine-tune (keep small magnitude)
+# Fine-tune nudges if placement is slightly off
+X_NUDGE = 1.5           # +right / -left
+Y_NUDGE_L14 = -2.0      # +up / -down
 Y_NUDGE_L16 = -2.0
-
 
 # Show crosshairs at anchor points for one test run if needed
 DEBUG_OVERLAY = False
@@ -112,6 +109,28 @@ def _norm_month(m: str) -> str:
         "All 12 Months": "All", "All": "All",
     }
     return map3.get(m, m)
+
+
+def _field_keys(fields_dict):
+    """Return a list of (original_key, normalized_key) for fuzzy matching."""
+    out = []
+    for k in (fields_dict or {}).keys():
+        nk = re.sub(r"\s+", "", str(k).lower())
+        out.append((k, nk))
+    return out
+
+
+def _find_field_with_tokens(fields_dict, *tokens):
+    """
+    Find the first field whose name contains ALL tokens (case/space-insensitive).
+    tokens: strings like "first", "name", "employee" etc.
+    Returns original field key or None.
+    """
+    tokens = [re.sub(r"\s+", "", t.lower()) for t in tokens if t]
+    for orig, nk in _field_keys(fields_dict):
+        if all(t in nk for t in tokens):
+            return orig
+    return None
 
 
 # ---------- low-level PDF ops (works for XFA/AcroForm) ----------
@@ -226,7 +245,7 @@ def _make_partii_overlay_page(width: float, height: float,
     if all16:
         draw_centered(x_all, y16, all16)
     else:
-        for i, m in enumerate(MONTHS, start=1):
+        for i, m in enumerate(MONHS := MONTHS, start=1):
             v = codes16.get(m, "")
             if not v:
                 continue
@@ -324,7 +343,7 @@ def fill_pdf_for_employee(
     logger.info("PDF: final_df_emp columns: %s", list(final_df_emp.columns))
     logger.info("PDF: final_df_emp row count for employee: %s", len(final_df_emp))
 
-    # -------- Part I: employee info --------
+    # -------- Part I: employee info (split fields if available) --------
     first = _coerce_str(emp_row.get("firstname"))
     mi    = _coerce_str(emp_row.get("middleinitial"))
     last  = _coerce_str(emp_row.get("lastname"))
@@ -338,20 +357,58 @@ def fill_pdf_for_employee(
     state = _coerce_str(emp_row.get("state"))
     zipc  = _coerce_str(emp_row.get("zipcode"))
 
-    # Try split fields if present, else the combined field
     fields_map = reader.get_fields() or {}
-    if "f1_first[0]" in fields_map and "f1_last[0]" in fields_map:
-        _set_text_by_name(reader, "f1_first[0]", first)
-        _set_text_by_name(reader, "f1_middle[0]", mi)
-        _set_text_by_name(reader, "f1_last[0]", last)
-    else:
-        _set_text_by_name(reader, "f1_1[0]", full)      # combined name
 
-    _set_text_by_name(reader, "f1_2[0]", ssn)          # SSN
-    _set_text_by_name(reader, "f1_3[0]", addr)         # address
-    _set_text_by_name(reader, "f1_4[0]", city)         # city
-    _set_text_by_name(reader, "f1_5[0]", state)        # state
-    _set_text_by_name(reader, "f1_6[0]", zipc)         # ZIP
+    # Try to discover explicit split name fields by fuzzy tokens.
+    f_first  = (
+        _find_field_with_tokens(fields_map, "first", "name")
+        or _find_field_with_tokens(fields_map, "firstname")
+        or "f1_first[0]"
+    )
+    f_middle = (
+        _find_field_with_tokens(fields_map, "middle", "initial")
+        or _find_field_with_tokens(fields_map, "middlename")
+        or "f1_middle[0]"
+    )
+    f_last   = (
+        _find_field_with_tokens(fields_map, "last", "name")
+        or _find_field_with_tokens(fields_map, "lastname")
+        or "f1_last[0]"
+    )
+
+    split_exists = all(k in fields_map for k in (f_first, f_middle, f_last))
+    if split_exists:
+        _set_text_by_name(reader, f_first, first)
+        _set_text_by_name(reader, f_middle, mi)
+        _set_text_by_name(reader, f_last, last)
+        if "f1_1[0]" in fields_map:
+            _set_text_by_name(reader, "f1_1[0]", "")  # clear combined to avoid double-print
+    else:
+        _set_text_by_name(reader, "f1_1[0]", full)   # combined fallback
+
+    # SSN / address / city / state / zip (fuzzy fallback to template-specific names)
+    f_ssn  = "f1_2[0]"
+    f_addr = "f1_3[0]"
+    f_city = "f1_4[0]"
+    f_state = "f1_5[0]"
+    f_zip = "f1_6[0]"
+
+    if f_ssn not in fields_map:
+        f_ssn = _find_field_with_tokens(fields_map, "social", "security") or _find_field_with_tokens(fields_map, "ssn") or f_ssn
+    if f_addr not in fields_map:
+        f_addr = _find_field_with_tokens(fields_map, "address") or f_addr
+    if f_city not in fields_map:
+        f_city = _find_field_with_tokens(fields_map, "city") or f_city
+    if f_state not in fields_map:
+        f_state = _find_field_with_tokens(fields_map, "state") or f_state
+    if f_zip not in fields_map:
+        f_zip = _find_field_with_tokens(fields_map, "zip") or _find_field_with_tokens(fields_map, "postal") or f_zip
+
+    _set_text_by_name(reader, f_ssn, ssn)
+    _set_text_by_name(reader, f_addr, addr)
+    _set_text_by_name(reader, f_city, city)
+    _set_text_by_name(reader, f_state, state)
+    _set_text_by_name(reader, f_zip, zipc)
 
     # -------- Part II (Line 14 & 16) overlay from final_df_emp --------
     col_month = _pick_col(final_df_emp, ["Month", "Months", "Coverage Month", "Period"])
