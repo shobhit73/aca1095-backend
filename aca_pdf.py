@@ -30,24 +30,24 @@ from aca_processing import MONTHS, _coerce_str
 # These defaults target the 2024 IRS 1095-C (Cat. No. 60705M).
 # If codes land slightly off, tweak only these values.
 
-# Table origin at the *baseline* of the “All 12 Months” column in Line 14 row.
-TABLE_X0 = 110.0        # left edge of the All-12 column block (approx)
-TABLE_Y_L14 = 405.0     # baseline for Line 14 text
-TABLE_Y_L16 = 353.0     # baseline for Line 16 text
+# Table origin near the All-12 column for Line 14
+TABLE_X0 = 110.0        # left edge of the All-12 block (approx)
+TABLE_Y_L14 = 405.0     # baseline for Line 14
+TABLE_Y_L16 = 353.0     # baseline for Line 16
 
-DX_ALL12_TO_JAN = 42.0  # distance from All-12 to Jan column center
-DX_MONTH = 40.0         # horizontal step between month columns
+DX_ALL12_TO_JAN = 42.0  # distance from All-12 to Jan center
+DX_MONTH = 40.0         # step between months
 
-# Font for overlay
+# Font for overlay text
 FONT_NAME = "Helvetica"
 FONT_SIZE = 9.5
 
-# Fine-tune nudges (quick calibration without moving the base coords)
+# Fine-tune nudges (quick calibration without moving base coords)
 X_NUDGE = 1.5         # +right / -left
 Y_NUDGE_L14 = -7.0    # +up / -down
 Y_NUDGE_L16 = -7.0
 
-# Debug crosshairs at each draw point (turn on only while calibrating)
+# Turn on to draw tiny crosshairs where text anchors (for calibration)
 DEBUG_OVERLAY = False
 
 
@@ -78,6 +78,37 @@ def _resolve(obj):
     except Exception:
         pass
     return obj
+
+
+def _pick_col(df: pd.DataFrame, options: List[str]) -> Optional[str]:
+    """Find the first matching column in df for any of the options (case/space-insensitive)."""
+    norm = {re.sub(r"\W+", "", c).lower(): c for c in df.columns}
+    for opt in options:
+        key = re.sub(r"\W+", "", opt).lower()
+        if key in norm:
+            return norm[key]
+    return None
+
+
+def _norm_month(m: str) -> str:
+    """Normalize month labels to MONTHS keys (Jan..Dec). Accepts 'All 12 Months' too."""
+    m = (m or "").strip().title()
+    map3 = {
+        "January": "Jan", "Jan": "Jan", "Jan.": "Jan",
+        "February": "Feb", "Feb": "Feb", "Feb.": "Feb",
+        "March": "Mar", "Mar": "Mar", "Mar.": "Mar",
+        "April": "Apr", "Apr": "Apr", "Apr.": "Apr",
+        "May": "May",
+        "June": "Jun", "Jun": "Jun", "Jun.": "Jun",
+        "July": "Jul", "Jul": "Jul", "Jul.": "Jul",
+        "August": "Aug", "Aug": "Aug", "Aug.": "Aug",
+        "September": "Sept", "Sep": "Sept", "Sept": "Sept", "Sept.": "Sept",
+        "October": "Oct", "Oct": "Oct", "Oct.": "Oct",
+        "November": "Nov", "Nov": "Nov", "Nov.": "Nov",
+        "December": "Dec", "Dec": "Dec", "Dec.": "Dec",
+        "All 12 Months": "All", "All": "All",
+    }
+    return map3.get(m, m)
 
 
 # ---------- low-level PDF ops (works for XFA/AcroForm) ----------
@@ -124,6 +155,8 @@ def _build_writer_with_acroform(reader: PdfReader) -> PdfWriter:
     remove XFA, set NeedAppearances=True.
     """
     writer = PdfWriter()
+
+    # Add pages first; we'll merge overlay on page 0 later during add/write
     for p in reader.pages:
         writer.add_page(p)
 
@@ -145,6 +178,8 @@ def _build_writer_with_acroform(reader: PdfReader) -> PdfWriter:
     writer._root_object.update({NameObject("/AcroForm"): acro_ref})
     return writer
 
+
+# ---------- Part II overlay creation ----------
 
 def _make_partii_overlay_page(width: float, height: float,
                               codes14: Dict[str, str],
@@ -168,10 +203,9 @@ def _make_partii_overlay_page(width: float, height: float,
 
     # ---- Line 14 ----
     all14 = ""
-    if len(set(v for v in codes14.values() if v)) == 1:
-        v = next((vv for vv in codes14.values() if vv), "")
-        if v:
-            all14 = v
+    non_empty_14 = [v for v in codes14.values() if v]
+    if len(set(non_empty_14)) == 1 and non_empty_14:
+        all14 = non_empty_14[0]
 
     x_all = TABLE_X0 + X_NUDGE
     y14 = TABLE_Y_L14 + Y_NUDGE_L14
@@ -187,10 +221,9 @@ def _make_partii_overlay_page(width: float, height: float,
 
     # ---- Line 16 ----
     all16 = ""
-    if len(set(v for v in codes16.values() if v)) == 1:
-        vv = next((vv for vv in codes16.values() if vv), "")
-        if vv:
-            all16 = vv
+    non_empty_16 = [v for v in codes16.values() if v]
+    if len(set(non_empty_16)) == 1 and non_empty_16:
+        all16 = non_empty_16[0]
 
     y16 = TABLE_Y_L16 + Y_NUDGE_L16
     if all16:
@@ -208,9 +241,9 @@ def _make_partii_overlay_page(width: float, height: float,
     return buf.getvalue()
 
 
-def overlay_line14_line16(reader: PdfReader,
-                          codes14: Dict[str, str],
-                          codes16: Dict[str, str]):
+def _build_overlay_page_for_reader(reader: PdfReader,
+                                   codes14: Dict[str, str],
+                                   codes16: Dict[str, str]):
     """
     Build an overlay page with Line 14/16 codes sized to page 1.
     Returns a PageObject (from a tiny 1-page PDF) that the writer will merge.
@@ -235,14 +268,14 @@ def _write_reader(reader: PdfReader, overlay_page=None) -> bytes:
     """
     writer = _build_writer_with_acroform(reader)
 
+    # Re-add pages, merging overlay onto first page now to avoid corrupting reader state
+    writer._pages = []  # reset pages list populated in _build_writer_with_acroform
     for i, p in enumerate(reader.pages):
         page = _resolve(p)
         if i == 0 and overlay_page is not None:
-            # Merge the overlay in writer-phase to avoid corrupting the reader object graph
             try:
                 page.merge_page(overlay_page)
             except Exception:
-                # Some PyPDF2 builds are happier with a no-op transform merge
                 page.merge_transformed_page(overlay_page, [1, 0, 0, 1, 0, 0])
         writer.add_page(page)
 
@@ -296,7 +329,7 @@ def fill_pdf_for_employee(
     """
     reader = PdfReader(io.BytesIO(pdf_bytes))
 
-    # -------- Part I: employee info (EmployeeName[0] has f1_1..f1_8) --------
+    # -------- Part I: employee info --------
     first = _coerce_str(emp_row.get("firstname"))
     mi    = _coerce_str(emp_row.get("middleinitial"))
     last  = _coerce_str(emp_row.get("lastname"))
@@ -310,25 +343,61 @@ def fill_pdf_for_employee(
     state = _coerce_str(emp_row.get("state"))
     zipc  = _coerce_str(emp_row.get("zipcode"))
 
-    # your form uses these names under EmployeeName[0]
-    _set_text_by_name(reader, "f1_1[0]", full)      # name
-    _set_text_by_name(reader, "f1_2[0]", ssn)       # SSN
-    _set_text_by_name(reader, "f1_3[0]", addr)      # address
-    _set_text_by_name(reader, "f1_4[0]", city)      # city
-    _set_text_by_name(reader, "f1_5[0]", state)     # state
-    _set_text_by_name(reader, "f1_6[0]", zipc)      # ZIP
+    # Try split fields if present, else the combined field
+    fields_map = reader.get_fields() or {}
+    if "f1_first[0]" in fields_map and "f1_last[0]" in fields_map:
+        _set_text_by_name(reader, "f1_first[0]", first)
+        _set_text_by_name(reader, "f1_middle[0]", mi)
+        _set_text_by_name(reader, "f1_last[0]", last)
+    else:
+        _set_text_by_name(reader, "f1_1[0]", full)      # combined name
+
+    _set_text_by_name(reader, "f1_2[0]", ssn)          # SSN
+    _set_text_by_name(reader, "f1_3[0]", addr)         # address
+    _set_text_by_name(reader, "f1_4[0]", city)         # city
+    _set_text_by_name(reader, "f1_5[0]", state)        # state
+    _set_text_by_name(reader, "f1_6[0]", zipc)         # ZIP
 
     # -------- Part II (Line 14 & 16) overlay from final_df_emp --------
-    # Expect columns like 'Month', 'Line14_Final', 'Line16_Final'
-    codes14 = {row["Month"]: _coerce_str(row.get("Line14_Final")) for _, row in final_df_emp.iterrows()}
-    codes16 = {row["Month"]: _coerce_str(row.get("Line16_Final")) for _, row in final_df_emp.iterrows()}
-    for m in MONTHS:  # normalize missing months
+    # Accept many header aliases
+    col_month = _pick_col(final_df_emp, ["Month", "Months", "Coverage Month", "Period"])
+    col_l14   = _pick_col(final_df_emp, ["Line14_Final", "Line 14", "Line 14 Code", "Line14", "L14"])
+    col_l16   = _pick_col(final_df_emp, ["Line16_Final", "Line 16", "Line 16 Code", "Line16", "L16"])
+
+    if not col_month:
+        raise ValueError("final_df_emp is missing a Month/Months column for Line 14/16 overlay")
+
+    # Build per-month dicts (normalize to Jan..Dec keys)
+    codes14: Dict[str, str] = {}
+    codes16: Dict[str, str] = {}
+
+    for _, r in final_df_emp.iterrows():
+        m = _norm_month(_coerce_str(r.get(col_month)))
+        if m == "All":
+            if col_l14:
+                val = _coerce_str(r.get(col_l14))
+                for mm in MONTHS:
+                    codes14[mm] = val
+            if col_l16:
+                val = _coerce_str(r.get(col_l16))
+                for mm in MONTHS:
+                    codes16[mm] = val
+            continue
+
+        if m in MONTHS:
+            if col_l14:
+                codes14[m] = _coerce_str(r.get(col_l14))
+            if col_l16:
+                codes16[m] = _coerce_str(r.get(col_l16))
+
+    # Ensure every month exists (blank if missing)
+    for m in MONTHS:
         codes14.setdefault(m, "")
         codes16.setdefault(m, "")
 
-    overlay_page = overlay_line14_line16(reader, codes14, codes16)
+    overlay_page = _build_overlay_page_for_reader(reader, codes14, codes16)
 
-    # -------- Part III --------
+    # -------- Part III (employee row only) --------
     rows = _discover_part3(reader)
     if rows:
         r0 = rows[0]  # first row = employee
@@ -338,11 +407,12 @@ def fill_pdf_for_employee(
             _set_text_by_name(reader, r0.text_fields[2], mi)
             _set_text_by_name(reader, r0.text_fields[3], ssn)
 
-        # Check All-12 or monthly boxes using presence of Line14 code as proxy for MEC
-        same14 = len(set(v for v in codes14.values() if v)) == 1 and next((v for v in codes14.values() if v), "") != ""
+        # All-12 vs monthly checkboxes based on presence of Line 14 codes
+        non_empty_14 = [v for v in codes14.values() if v]
+        same14 = len(set(non_empty_14)) == 1 and non_empty_14
         if r0.month_boxes:
             if same14:
-                _set_checkbox_on(reader, r0.month_boxes[0])  # All 12 months
+                _set_checkbox_on(reader, r0.month_boxes[0])  # All 12
             else:
                 for i, m in enumerate(MONTHS, start=1):
                     if codes14.get(m, ""):
@@ -361,7 +431,7 @@ def fill_pdf_for_employee(
     )
 
 
-# ---------------- Excel output (unchanged) ----------------
+# ---------------- Excel output ----------------
 
 def save_excel_outputs(
     interim: pd.DataFrame,
