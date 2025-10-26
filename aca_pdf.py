@@ -5,11 +5,17 @@ from __future__ import annotations
 import io
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
-from PyPDF2.generic import NameObject, BooleanObject, TextStringObject, DictionaryObject
+from PyPDF2.generic import (
+    NameObject,
+    BooleanObject,
+    TextStringObject,
+    DictionaryObject,
+    IndirectObject,
+)
 
 from aca_processing import MONTHS, _coerce_str
 
@@ -33,66 +39,83 @@ def _normalize_ssn(s: str) -> str:
     return s
 
 
-# ---------- low-level PDF ops (works for XFA forms) ----------
+def _resolve(obj):
+    """Return the underlying object for IndirectObject, else obj itself."""
+    try:
+        if isinstance(obj, IndirectObject):
+            return obj.get_object()
+    except Exception:
+        pass
+    return obj
+
+
+# ---------- low-level PDF ops (works for XFA/AcroForm) ----------
 
 def _iter_annots(reader: PdfReader):
-    """Yield (page, annot_obj) pairs for all widget annotations."""
+    """Yield (page, annot_obj_resolved) pairs for all widget annotations."""
     for page in reader.pages:
+        page = _resolve(page)
         if "/Annots" not in page:
             continue
         for a in page["/Annots"]:
-            try:
-                yield page, a.get_object()
-            except Exception:
-                yield page, a
+            yield page, _resolve(a)
 
 
-def _set_text(reader: PdfReader, field_name: str, value: str):
-    """Set /V for a text field by its /T (name) across the whole doc."""
+def _set_text_by_name(reader: PdfReader, field_name: str, value: str):
+    """Set /V for a text field by its /T across the whole doc."""
     val = TextStringObject(value if value is not None else "")
     for _, annot in _iter_annots(reader):
-        if annot.get("/T") == field_name:
+        if _resolve(annot.get("/T")) == field_name:
             annot.update({NameObject("/V"): val})
 
 
-def _set_checkbox(reader: PdfReader, field_name: str):
+def _set_checkbox_on(reader: PdfReader, field_name: str):
     """Turn a checkbox 'on' (set /V and /AS to its 'On' appearance)."""
     for _, annot in _iter_annots(reader):
-        if annot.get("/T") != field_name:
+        if _resolve(annot.get("/T")) != field_name:
             continue
-        on = None
-        ap = annot.get("/AP")
-        if ap and "/N" in ap and isinstance(ap["/N"], dict):
-            for k in ap["/N"].keys():
-                if str(k) not in ("Off", "/Off"):
-                    on = NameObject(k)
-                    break
-        if on is None:
-            on = NameObject("/Yes")
-        annot.update({NameObject("/V"): on})
-        annot.update({NameObject("/AS"): on})
+        ap = _resolve(annot.get("/AP"))
+        on_name = NameObject("/Yes")
+        if ap and "/N" in ap:
+            n = _resolve(ap["/N"])
+            if isinstance(n, dict):
+                for k in n.keys():
+                    if str(k) not in ("Off", "/Off"):
+                        on_name = NameObject(k)
+                        break
+        annot.update({NameObject("/V"): on_name})
+        annot.update({NameObject("/AS"): on_name})
 
 
-def _remove_xfa_and_set_need_appearances(reader: PdfReader):
-    """Remove XFA so viewers render AcroForm, and set NeedAppearances=True."""
-    root = reader.trailer["/Root"]
-    acro = root.get("/AcroForm")
-    if acro is None:
-        acro = DictionaryObject()
-        root.update({NameObject("/AcroForm"): acro})
-    if "/XFA" in acro:
-        del acro["/XFA"]
-    acro.update({NameObject("/NeedAppearances"): BooleanObject(True)})
-
-
-def _write_reader(reader: PdfReader) -> bytes:
-    """Write the (possibly modified) reader to bytes, keeping the AcroForm."""
-    _remove_xfa_and_set_need_appearances(reader)
+def _build_writer_with_acroform(reader: PdfReader) -> PdfWriter:
+    """Create a writer, copy pages, import the reader's AcroForm (resolved),
+    remove XFA, set NeedAppearances=True."""
     writer = PdfWriter()
     for p in reader.pages:
         writer.add_page(p)
-    # carry over the (now XFA-free) AcroForm
-    writer._root_object.update({NameObject("/AcroForm"): reader.trailer["/Root"]["/AcroForm"]})
+
+    root = _resolve(reader.trailer.get("/Root"))
+    acro = _resolve(root.get("/AcroForm")) if root else None
+    if not isinstance(acro, dict):
+        acro = DictionaryObject()
+
+    # remove XFA if present and set NeedAppearances
+    if "/XFA" in acro:
+        try:
+            del acro["/XFA"]
+        except Exception:
+            pass
+    acro.update({NameObject("/NeedAppearances"): BooleanObject(True)})
+
+    # import AcroForm dict into writer
+    acro_ref = writer._add_object(acro)  # type: ignore[attr-defined]
+    writer._root_object.update({NameObject("/AcroForm"): acro_ref})
+    return writer
+
+
+def _write_reader(reader: PdfReader) -> bytes:
+    """Write the modified reader into a new PDF, keeping AcroForm."""
+    writer = _build_writer_with_acroform(reader)
     out = io.BytesIO()
     writer.write(out)
     out.seek(0)
@@ -108,12 +131,12 @@ class Part3Row:
 
 
 def _discover_part3(reader: PdfReader) -> List[Part3Row]:
-    """Your form groups Part III by Row1[0]..RowN[0], with f3_* (text) and c3_* (checkboxes)."""
+    """Group Part III by parent Row1[0]..RowN[0], using f3_* (text) and c3_* (checkbox)."""
     fields = reader.get_fields() or {}
     by_parent: Dict[str, List[str]] = {}
     for name, meta in fields.items():
-        parent = meta.get("/Parent")
-        pT = parent.get("/T") if parent else None
+        parent = _resolve(meta.get("/Parent"))
+        pT = _resolve(parent.get("/T")) if isinstance(parent, dict) else None
         if pT:
             by_parent.setdefault(pT, []).append(name)
 
@@ -127,7 +150,7 @@ def _discover_part3(reader: PdfReader) -> List[Part3Row]:
     return rows
 
 
-# ---------- public API ----------
+# ---------- public API (unchanged signature) ----------
 
 def fill_pdf_for_employee(
     pdf_bytes: bytes,
@@ -157,53 +180,39 @@ def fill_pdf_for_employee(
     state = _coerce_str(emp_row.get("state"))
     zipc  = _coerce_str(emp_row.get("zipcode"))
 
-    # these field names exist in your file under EmployeeName[0]
-    _set_text(reader, "f1_1[0]", full)      # name
-    _set_text(reader, "f1_2[0]", ssn)       # SSN
-    _set_text(reader, "f1_3[0]", addr)      # address
-    _set_text(reader, "f1_4[0]", city)      # city
-    _set_text(reader, "f1_5[0]", state)     # state
-    _set_text(reader, "f1_6[0]", zipc)      # ZIP
+    # your form uses these names under EmployeeName[0]
+    _set_text_by_name(reader, "f1_1[0]", full)      # name
+    _set_text_by_name(reader, "f1_2[0]", ssn)       # SSN
+    _set_text_by_name(reader, "f1_3[0]", addr)      # address
+    _set_text_by_name(reader, "f1_4[0]", city)      # city
+    _set_text_by_name(reader, "f1_5[0]", state)     # state
+    _set_text_by_name(reader, "f1_6[0]", zipc)      # ZIP
 
-    # -------- Part II (grid is printed lines in this IRS template) --------
-    # We can't write the 14/16 codes unless the template exposes fields for them.
-    # If you supply exact field names for L14/L16 cells, I'll wire them in.
-
-    # For Part III coverage, we'll mark "All 12" if Line 14 is same across months and non-empty;
-    # otherwise check months that have a Line14 code.
+    # -------- Part II (grid is printed in this IRS template) --------
     month_to_l14 = {r["Month"]: _coerce_str(r.get("Line14_Final")) for _, r in final_df_emp.iterrows()}
     vals14 = [month_to_l14.get(m, "") for m in MONTHS]
     all12 = len(set(vals14)) == 1 and (vals14[0] or "") != ""
 
+    # -------- Part III --------
     rows = _discover_part3(reader)
     if rows:
         r0 = rows[0]  # first row = employee
-        # your Row1 text fields include five f3_* (Last, First, MI, SSN, DOB). Fill what we have.
         if len(r0.text_fields) >= 4:
-            # best-effort mapping by slot order
-            _set_text(reader, r0.text_fields[0], last)
-            _set_text(reader, r0.text_fields[1], first)
-            _set_text(reader, r0.text_fields[2], mi)
-            _set_text(reader, r0.text_fields[3], ssn)
-            # DOB not available in your dataset now; leave blank if a 5th slot exists.
-
+            _set_text_by_name(reader, r0.text_fields[0], last)
+            _set_text_by_name(reader, r0.text_fields[1], first)
+            _set_text_by_name(reader, r0.text_fields[2], mi)
+            _set_text_by_name(reader, r0.text_fields[3], ssn)
         if r0.month_boxes:
             if all12:
-                # first checkbox in the row is the "All 12 months" box in this template
-                _set_checkbox(reader, r0.month_boxes[0])
+                _set_checkbox_on(reader, r0.month_boxes[0])  # All 12
             else:
-                # check Jan..Dec selectively (boxes 1..12 after "All 12")
                 for i, m in enumerate(MONTHS, start=1):
                     if month_to_l14.get(m, ""):
-                        _set_checkbox(reader, r0.month_boxes[i])
+                        _set_checkbox_on(reader, r0.month_boxes[i])
 
-    # ---------- produce outputs ----------
-    # "Editable": keep the form as-is (values already set on widgets)
+    # ---------- outputs ----------
     editable_bytes = _write_reader(reader)
-
-    # "Flattened": for now, same as editable (non-destructive; values visible).
-    # If you *must* burn in text (true raster flatten), we can add a renderer step later.
-    flattened_bytes = editable_bytes
+    flattened_bytes = editable_bytes  # non-destructive; values visible
 
     empid = _coerce_str(emp_row.get("employeeid"))
     return (
