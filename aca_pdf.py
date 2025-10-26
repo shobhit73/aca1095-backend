@@ -23,6 +23,8 @@ from reportlab.lib.pagesizes import letter
 
 from aca_processing import MONTHS, _coerce_str
 
+# ---------------- logging ----------------
+logger = logging.getLogger("pdf")
 
 # =========================
 #  CONFIG: Part II overlay
@@ -47,8 +49,6 @@ Y_NUDGE_L16 = -7.0
 
 # Show crosshairs at anchor points for one test run if needed
 DEBUG_OVERLAY = False
-
-logger = logging.getLogger("pdf")
 
 
 # ----------------- small helpers -----------------
@@ -151,14 +151,11 @@ def _set_checkbox_on(reader: PdfReader, field_name: str):
 
 def _build_writer_with_acroform(reader: PdfReader) -> PdfWriter:
     """
-    Create a writer, copy pages, import the reader's AcroForm (resolved),
+    Create a writer, import the reader's AcroForm (resolved),
     remove XFA, set NeedAppearances=True.
+    NOTE: We do NOT add any pages here. Pages are added in _write_reader().
     """
     writer = PdfWriter()
-
-    # Add pages first; we'll re-add again during write to merge overlay safely
-    for p in reader.pages:
-        writer.add_page(p)
 
     root = _resolve(reader.trailer.get("/Root"))
     acro = _resolve(root.get("/AcroForm")) if root else None
@@ -173,9 +170,9 @@ def _build_writer_with_acroform(reader: PdfReader) -> PdfWriter:
             pass
     acro.update({NameObject("/NeedAppearances"): BooleanObject(True)})
 
-    # import AcroForm dict into writer
-    acro_ref = writer._add_object(acro)  # type: ignore[attr-defined]
+    acro_ref = writer._add_object(acro)  # keep AcroForm on the writer
     writer._root_object.update({NameObject("/AcroForm"): acro_ref})
+
     return writer
 
 
@@ -262,8 +259,7 @@ def _write_reader(reader: PdfReader, overlay_page=None) -> bytes:
     """
     writer = _build_writer_with_acroform(reader)
 
-    # Re-add pages, merging overlay onto first page now to avoid corrupting reader state
-    writer._pages = []  # reset internal list populated earlier
+    # Add pages now (DO NOT touch writer._pages directly)
     for i, p in enumerate(reader.pages):
         page = _resolve(p)
         if i == 0 and overlay_page is not None:
@@ -431,7 +427,7 @@ def fill_pdf_for_employee(
 
     # ---------- outputs ----------
     editable_bytes = _write_reader(reader, overlay_page=overlay_page)
-    flattened_bytes = editable_bytes  # non-destructive; values visible
+    flattened_bytes = editable_bytes  # values remain visible/editable
 
     empid = _coerce_str(emp_row.get("employeeid"))
     return (
