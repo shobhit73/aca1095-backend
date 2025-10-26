@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import re
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -27,28 +28,27 @@ from aca_processing import MONTHS, _coerce_str
 #  CONFIG: Part II overlay
 # =========================
 # Coordinates are PDF points (1/72"). Origin is bottom-left of the page.
-# These defaults target the 2024 IRS 1095-C (Cat. No. 60705M).
-# If codes land slightly off, tweak only these values.
+# Defaults target the 2024 IRS 1095-C (Cat. No. 60705M).
 
-# Table origin near the All-12 column for Line 14
-TABLE_X0 = 110.0        # left edge of the All-12 block (approx)
+TABLE_X0 = 110.0        # near left edge of the All-12 column block
 TABLE_Y_L14 = 405.0     # baseline for Line 14
 TABLE_Y_L16 = 353.0     # baseline for Line 16
 
 DX_ALL12_TO_JAN = 42.0  # distance from All-12 to Jan center
 DX_MONTH = 40.0         # step between months
 
-# Font for overlay text
 FONT_NAME = "Helvetica"
 FONT_SIZE = 9.5
 
-# Fine-tune nudges (quick calibration without moving base coords)
-X_NUDGE = 1.5         # +right / -left
-Y_NUDGE_L14 = -7.0    # +up / -down
+# Fine-tune nudges if placement is slightly off
+X_NUDGE = 1.5           # +right / -left
+Y_NUDGE_L14 = -7.0      # +up / -down
 Y_NUDGE_L16 = -7.0
 
-# Turn on to draw tiny crosshairs where text anchors (for calibration)
+# Show crosshairs at anchor points for one test run if needed
 DEBUG_OVERLAY = False
+
+logger = logging.getLogger("pdf")
 
 
 # ----------------- small helpers -----------------
@@ -156,7 +156,7 @@ def _build_writer_with_acroform(reader: PdfReader) -> PdfWriter:
     """
     writer = PdfWriter()
 
-    # Add pages first; we'll merge overlay on page 0 later during add/write
+    # Add pages first; we'll re-add again during write to merge overlay safely
     for p in reader.pages:
         writer.add_page(p)
 
@@ -184,10 +184,7 @@ def _build_writer_with_acroform(reader: PdfReader) -> PdfWriter:
 def _make_partii_overlay_page(width: float, height: float,
                               codes14: Dict[str, str],
                               codes16: Dict[str, str]) -> bytes:
-    """
-    Create a transparent PDF page that prints Line 14 / Line 16 codes
-    at the configured coordinates (with nudges).
-    """
+    """Create a transparent PDF page that prints Line 14 / Line 16 codes."""
     buf = io.BytesIO()
     can = canvas.Canvas(buf, pagesize=(width, height))
     can.setFont(FONT_NAME, FONT_SIZE)
@@ -244,10 +241,7 @@ def _make_partii_overlay_page(width: float, height: float,
 def _build_overlay_page_for_reader(reader: PdfReader,
                                    codes14: Dict[str, str],
                                    codes16: Dict[str, str]):
-    """
-    Build an overlay page with Line 14/16 codes sized to page 1.
-    Returns a PageObject (from a tiny 1-page PDF) that the writer will merge.
-    """
+    """Return a 1-page PageObject overlay sized to the first page."""
     p0 = _resolve(reader.pages[0])
     media = _resolve(p0.get("/MediaBox"))
     if media and len(media) == 4:
@@ -258,18 +252,18 @@ def _build_overlay_page_for_reader(reader: PdfReader,
 
     overlay_bytes = _make_partii_overlay_page(width, height, codes14, codes16)
     overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
-    return overlay_reader.pages[0]  # PageObject
+    return overlay_reader.pages[0]
 
 
 def _write_reader(reader: PdfReader, overlay_page=None) -> bytes:
     """
     Write the modified reader into a new PDF, keeping AcroForm.
-    If overlay_page is provided (PageObject), merge it onto page 0 at write-time.
+    If overlay_page is provided, merge it onto page 0 at write-time.
     """
     writer = _build_writer_with_acroform(reader)
 
     # Re-add pages, merging overlay onto first page now to avoid corrupting reader state
-    writer._pages = []  # reset pages list populated in _build_writer_with_acroform
+    writer._pages = []  # reset internal list populated earlier
     for i, p in enumerate(reader.pages):
         page = _resolve(p)
         if i == 0 and overlay_page is not None:
@@ -328,6 +322,8 @@ def fill_pdf_for_employee(
     Returns: (editable_name, editable_bytes, flattened_name, flattened_bytes)
     """
     reader = PdfReader(io.BytesIO(pdf_bytes))
+    logger.info("PDF: final_df_emp columns: %s", list(final_df_emp.columns))
+    logger.info("PDF: final_df_emp row count for employee: %s", len(final_df_emp))
 
     # -------- Part I: employee info --------
     first = _coerce_str(emp_row.get("firstname"))
@@ -359,10 +355,17 @@ def fill_pdf_for_employee(
     _set_text_by_name(reader, "f1_6[0]", zipc)         # ZIP
 
     # -------- Part II (Line 14 & 16) overlay from final_df_emp --------
-    # Accept many header aliases
     col_month = _pick_col(final_df_emp, ["Month", "Months", "Coverage Month", "Period"])
     col_l14   = _pick_col(final_df_emp, ["Line14_Final", "Line 14", "Line 14 Code", "Line14", "L14"])
     col_l16   = _pick_col(final_df_emp, ["Line16_Final", "Line 16", "Line 16 Code", "Line16", "L16"])
+
+    logger.info("PDF: resolved columns -> Month=%r, L14=%r, L16=%r", col_month, col_l14, col_l16)
+    if col_month:
+        try:
+            logger.info("PDF: unique month values: %s",
+                        sorted(final_df_emp[col_month].dropna().astype(str).unique().tolist())[:30])
+        except Exception:
+            pass
 
     if not col_month:
         raise ValueError("final_df_emp is missing a Month/Months column for Line 14/16 overlay")
@@ -394,6 +397,14 @@ def fill_pdf_for_employee(
     for m in MONTHS:
         codes14.setdefault(m, "")
         codes16.setdefault(m, "")
+
+    logger.info("PDF: codes14: %s", {m: codes14.get(m, "") for m in MONTHS})
+    logger.info("PDF: codes16: %s", {m: codes16.get(m, "") for m in MONTHS})
+    if not any(codes14.values()) and not any(codes16.values()):
+        raise ValueError(
+            "No Line 14/16 codes available for this employee. "
+            "Check final_df_emp filtering and column names."
+        )
 
     overlay_page = _build_overlay_page_for_reader(reader, codes14, codes16)
 
