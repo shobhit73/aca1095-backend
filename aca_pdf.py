@@ -119,8 +119,10 @@ def _set_checkbox_on(reader: PdfReader, field_name: str):
 
 
 def _build_writer_with_acroform(reader: PdfReader) -> PdfWriter:
-    """Create a writer, copy pages, import the reader's AcroForm (resolved),
-    remove XFA, set NeedAppearances=True."""
+    """
+    Create a writer, copy pages, import the reader's AcroForm (resolved),
+    remove XFA, set NeedAppearances=True.
+    """
     writer = PdfWriter()
     for p in reader.pages:
         writer.add_page(p)
@@ -143,45 +145,6 @@ def _build_writer_with_acroform(reader: PdfReader) -> PdfWriter:
     writer._root_object.update({NameObject("/AcroForm"): acro_ref})
     return writer
 
-
-def _write_reader(reader: PdfReader) -> bytes:
-    """Write the modified reader into a new PDF, keeping AcroForm."""
-    writer = _build_writer_with_acroform(reader)
-    out = io.BytesIO()
-    writer.write(out)
-    out.seek(0)
-    return out.getvalue()
-
-
-# ---------- discovery for your template ----------
-
-@dataclass
-class Part3Row:
-    text_fields: List[str]   # Last, First, MI, SSN, DOB (5 items)
-    month_boxes: List[str]   # 13 checkboxes: All12, Jan..Dec
-
-
-def _discover_part3(reader: PdfReader) -> List[Part3Row]:
-    """Group Part III by parent Row1[0]..RowN[0], using f3_* (text) and c3_* (checkbox)."""
-    fields = reader.get_fields() or {}
-    by_parent: Dict[str, List[str]] = {}
-    for name, meta in fields.items():
-        parent = _resolve(meta.get("/Parent"))
-        pT = _resolve(parent.get("/T")) if isinstance(parent, dict) else None
-        if pT:
-            by_parent.setdefault(pT, []).append(name)
-
-    rows: List[Part3Row] = []
-    for parent in sorted([p for p in by_parent if p.startswith("Row")], key=_to_int):
-        names = by_parent[parent]
-        texts = sorted([n for n in names if n.startswith("f3_")], key=_to_int)
-        boxes = sorted([n for n in names if n.startswith("c3_")], key=_to_int)
-        if texts or boxes:
-            rows.append(Part3Row(text_fields=texts, month_boxes=boxes))
-    return rows
-
-
-# ---------- Part II overlay drawing ----------
 
 def _make_partii_overlay_page(width: float, height: float,
                               codes14: Dict[str, str],
@@ -249,7 +212,8 @@ def overlay_line14_line16(reader: PdfReader,
                           codes14: Dict[str, str],
                           codes16: Dict[str, str]):
     """
-    Merge an overlay with Line 14/16 codes onto page 1 (index 0).
+    Build an overlay page with Line 14/16 codes sized to page 1.
+    Returns a PageObject (from a tiny 1-page PDF) that the writer will merge.
     """
     p0 = _resolve(reader.pages[0])
     media = _resolve(p0.get("/MediaBox"))
@@ -261,13 +225,62 @@ def overlay_line14_line16(reader: PdfReader,
 
     overlay_bytes = _make_partii_overlay_page(width, height, codes14, codes16)
     overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
-    overlay_page = overlay_reader.pages[0]
-
-    # Merge overlay onto page 1
-    p0.merge_page(overlay_page)
+    return overlay_reader.pages[0]  # PageObject
 
 
-# ---------- public API (unchanged signature) ----------
+def _write_reader(reader: PdfReader, overlay_page=None) -> bytes:
+    """
+    Write the modified reader into a new PDF, keeping AcroForm.
+    If overlay_page is provided (PageObject), merge it onto page 0 at write-time.
+    """
+    writer = _build_writer_with_acroform(reader)
+
+    for i, p in enumerate(reader.pages):
+        page = _resolve(p)
+        if i == 0 and overlay_page is not None:
+            # Merge the overlay in writer-phase to avoid corrupting the reader object graph
+            try:
+                page.merge_page(overlay_page)
+            except Exception:
+                # Some PyPDF2 builds are happier with a no-op transform merge
+                page.merge_transformed_page(overlay_page, [1, 0, 0, 1, 0, 0])
+        writer.add_page(page)
+
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+    return out.getvalue()
+
+
+# ---------- discovery for your template (Part III) ----------
+
+@dataclass
+class Part3Row:
+    text_fields: List[str]   # Last, First, MI, SSN, DOB (5 items)
+    month_boxes: List[str]   # 13 checkboxes: All12, Jan..Dec
+
+
+def _discover_part3(reader: PdfReader) -> List[Part3Row]:
+    """Group Part III by parent Row1[0]..RowN[0], using f3_* (text) and c3_* (checkbox)."""
+    fields = reader.get_fields() or {}
+    by_parent: Dict[str, List[str]] = {}
+    for name, meta in fields.items():
+        parent = _resolve(meta.get("/Parent"))
+        pT = _resolve(parent.get("/T")) if isinstance(parent, dict) else None
+        if pT:
+            by_parent.setdefault(pT, []).append(name)
+
+    rows: List[Part3Row] = []
+    for parent in sorted([p for p in by_parent if p.startswith("Row")], key=_to_int):
+        names = by_parent[parent]
+        texts = sorted([n for n in names if n.startswith("f3_")], key=_to_int)
+        boxes = sorted([n for n in names if n.startswith("c3_")], key=_to_int)
+        if texts or boxes:
+            rows.append(Part3Row(text_fields=texts, month_boxes=boxes))
+    return rows
+
+
+# ---------- public API ----------
 
 def fill_pdf_for_employee(
     pdf_bytes: bytes,
@@ -312,7 +325,8 @@ def fill_pdf_for_employee(
     for m in MONTHS:  # normalize missing months
         codes14.setdefault(m, "")
         codes16.setdefault(m, "")
-    overlay_line14_line16(reader, codes14, codes16)
+
+    overlay_page = overlay_line14_line16(reader, codes14, codes16)
 
     # -------- Part III --------
     rows = _discover_part3(reader)
@@ -335,7 +349,7 @@ def fill_pdf_for_employee(
                         _set_checkbox_on(reader, r0.month_boxes[i])
 
     # ---------- outputs ----------
-    editable_bytes = _write_reader(reader)
+    editable_bytes = _write_reader(reader, overlay_page=overlay_page)
     flattened_bytes = editable_bytes  # non-destructive; values visible
 
     empid = _coerce_str(emp_row.get("employeeid"))
