@@ -32,20 +32,23 @@ logger = logging.getLogger("pdf")
 # Coordinates are PDF points (1/72"). Origin is bottom-left of the page.
 # Defaults target the 2024 IRS 1095-C (Cat. No. 60705M).
 
-TABLE_X0 = 110.0        # near left edge of the All-12 column block
-TABLE_Y_L14 = 405.0     # baseline for Line 14
-TABLE_Y_L16 = 353.0     # baseline for Line 16
+# === Part II overlay positions (tuned) ===
+TABLE_X0 = 110.0
 
-DX_ALL12_TO_JAN = 42.0  # distance from All-12 to Jan center
-DX_MONTH = 40.0         # step between months
+# Drop both lines ~17–20 pts so text lands inside the cells (not the header row)
+TABLE_Y_L14 = 388.0   # was 405.0
+TABLE_Y_L16 = 336.0   # was 353.0
+
+DX_ALL12_TO_JAN = 42.0
+DX_MONTH = 40.0
 
 FONT_NAME = "Helvetica"
 FONT_SIZE = 9.5
 
-# Fine-tune nudges if placement is slightly off
-X_NUDGE = 1.5           # +right / -left
-Y_NUDGE_L14 = -7.0      # +up / -down
-Y_NUDGE_L16 = -7.0
+X_NUDGE = 1.5
+Y_NUDGE_L14 = -2.0     # small fine-tune (keep small magnitude)
+Y_NUDGE_L16 = -2.0
+
 
 # Show crosshairs at anchor points for one test run if needed
 DEBUG_OVERLAY = False
