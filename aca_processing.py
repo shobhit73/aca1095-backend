@@ -361,3 +361,6 @@ def load_excel(xlsx_bytes: bytes):
 # Additional handy aliases some projects used
 load_sheets = read_excel_sheets
 get_sheets = read_excel_sheets
+
+# Keep older main_fastapi working without edits:
+prepare_inputs = prepare_employee_context
