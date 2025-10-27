@@ -9,9 +9,8 @@ import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
 from PyPDF2.generic import NameObject, BooleanObject
 
-
 # ===========================
-# Shared helpers / constants
+# Constants / field mappings
 # ===========================
 
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
@@ -32,7 +31,7 @@ LINE14_FIELDS = {
     "Dec": "f1_29[0]",
 }
 
-# Line 16 text fields (per month) — you said Sep–Dec blank
+# Line 16 text fields (per month) — (Sep–Dec can stay blank if you wish)
 LINE16_FIELDS = {
     "Jan": "f1_44[0]",
     "Feb": "f1_45[0]",
@@ -42,6 +41,10 @@ LINE16_FIELDS = {
     "Jun": "f1_49[0]",
     "Jul": "f1_50[0]",
     "Aug": "f1_51[0]",
+    # "Sep": ...,
+    # "Oct": ...,
+    # "Nov": ...,
+    # "Dec": ...,
 }
 
 # Part I: name/SSN fields
@@ -51,14 +54,15 @@ FIELD_LAST   = "f1_3[0]"
 FIELD_SSN    = "f1_4[0]"
 
 # Part I: address fields (Line 3–6)
-FIELD_STREET = "f1_5[0]"  # Street address (including apartment no.)
-FIELD_CITY   = "f1_6[0]"  # City or town
-FIELD_STATE  = "f1_7[0]"  # State or province
-FIELD_COUNTRY_ZIP = "f1_8[0]"  # Country and ZIP or foreign postal code
+FIELD_STREET      = "f1_5[0]"  # Street address (incl. apt)
+FIELD_CITY        = "f1_6[0]"  # City or town
+FIELD_STATE       = "f1_7[0]"  # State or province
+FIELD_COUNTRY_ZIP = "f1_8[0]"  # Country and ZIP (or foreign postal)
 
 # ------------------------------
 # Part III (Covered Individuals)
 # ------------------------------
+# NOTE: These IDs are from your mapping dump. Adjust here if your template differs.
 PART3_MAP: Dict[int, Dict[str, Any]] = {
     1: {'name': 'f3_76[0]',  'ssn': 'f3_77[0]', 'dob': 'f3_77[0]', 'all12': 'c3_55[0]',
         'months': {'Jan': 'c3_56[0]','Feb': 'c3_57[0]','Mar': 'c3_58[0]','Apr': 'c3_59[0]',
@@ -98,9 +102,8 @@ PART3_MAP: Dict[int, Dict[str, Any]] = {
                    'Sep': 'c3_148[0]','Oct': 'c3_149[0]','Nov': 'c3_150[0]','Dec': 'c3_151[0]'}},
 }
 
-
 # ======================
-# Field filling helpers
+# Utility helpers
 # ======================
 
 def _norm(s: str) -> str:
@@ -157,7 +160,6 @@ def _extract_address(row: pd.Series) -> Dict[str,str]:
     zipc   = str(row.get(_pick(row.index, ["ZIP","Zip","Postal","PostalCode","ZIP Code"])) or "").strip()
     cntry  = str(row.get(_pick(row.index, ["Country","Nation"])) or "").strip()
 
-    # The form has "Country and ZIP (or foreign postal)" as one field.
     cz = " ".join([x for x in [cntry, zipc] if x]).strip()
     return {
         "street": street_out,
@@ -203,7 +205,7 @@ def _extract_part3_rows_from_excel(
     emp_fullname: str
 ) -> List[Dict[str, Any]]:
     """
-    Row 1 = employee; 2..9 = dependents.
+    Row 1 = employee; rows 2..9 = dependents.
     """
     def _month_flags(row: pd.Series) -> Dict[str, bool]:
         out = {m: False for m in MONTHS}
@@ -287,7 +289,6 @@ def _extract_part3_rows_from_excel(
 
     return rows[:9]
 
-
 def _part3_rows_to_field_values(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     fields: Dict[str, Any] = {}
     for idx, data in enumerate(rows, start=1):
@@ -306,6 +307,7 @@ def _part3_rows_to_field_values(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             fields[m["dob"]] = dob
 
         months = data.get("months") or {}
+        # Prefer "All 12" if every month checked and the template has that field
         if months and all(months.get(mn, False) for mn in MONTHS) and m.get("all12"):
             fields[m["all12"]] = "/Yes"
         for mn, fname in m["months"].items():
@@ -313,12 +315,12 @@ def _part3_rows_to_field_values(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 fields[fname] = "/Yes"
     return fields
 
-
 def _fill_acroform(pdf_bytes: bytes, field_values: Dict[str, Any]) -> bytes:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     writer = PdfWriter()
     writer.clone_document_from_reader(reader)
 
+    # Ensure appearances are regenerated so text actually shows
     if "/AcroForm" in writer._root_object:
         acro = writer._root_object["/AcroForm"]
         acro.update({NameObject("/NeedAppearances"): BooleanObject(True)})
@@ -330,7 +332,6 @@ def _fill_acroform(pdf_bytes: bytes, field_values: Dict[str, Any]) -> bytes:
     writer.write(buf)
     buf.seek(0)
     return buf.getvalue()
-
 
 # ===========================
 # Public: main fill function
@@ -367,7 +368,7 @@ def fill_pdf_for_employee(
         FIELD_COUNTRY_ZIP: addr["country_zip"],
     }
 
-    # Line 14 + Line 16
+    # Line 14 + 16 monthly codes
     l14, l16 = _extract_line_codes(final_df_emp)
     for m in MONTHS:
         f = LINE14_FIELDS.get(m)
@@ -378,14 +379,14 @@ def fill_pdf_for_employee(
         if f:
             field_values[f] = l16.get(m, "")
 
-    # Part III
+    # Part III covered individuals
     emp_id_col = _pick(emp_row.index, ["EmployeeID","EmpID","Employee Id"]) or ""
     employee_id = str(emp_row.get(emp_id_col) or "").strip()
     part3_rows = _extract_part3_rows_from_excel(sheets, employee_id, full_name)
     if part3_rows:
         field_values.update(_part3_rows_to_field_values(part3_rows))
 
-    # Write
+    # Write filled AcroForm (editable)
     out_bytes = _fill_acroform(pdf_bytes, field_values)
     editable_name = f"1095c_{employee_id}.pdf" if employee_id else "1095c.pdf"
     flat_name = editable_name  # same bytes; NeedAppearances set
@@ -396,3 +397,41 @@ def fill_pdf_for_employee(
         flat_name,
         io.BytesIO(out_bytes),
     )
+
+# ==========================================================
+# Backward-compatible Excel helper expected by main_fastapi
+# ==========================================================
+import io as _io
+import pandas as _pd
+
+def save_excel_outputs(outputs) -> bytes:
+    """
+    Backward-compatible shim.
+
+    Accepts either:
+      - a dict[str, pandas.DataFrame] of sheets to write, OR
+      - a BytesIO / bytes that already contains an .xlsx payload.
+
+    Returns: raw bytes of the Excel workbook.
+    """
+    # If someone already passed a BytesIO/bytes, just return the bytes
+    if isinstance(outputs, (bytes, _io.BytesIO)):
+        return outputs if isinstance(outputs, bytes) else outputs.getvalue()
+
+    buf = _io.BytesIO()
+    with _pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        wrote_any = False
+        if isinstance(outputs, dict):
+            for name, df in outputs.items():
+                if df is None:
+                    continue
+                sheet = str(name or "Sheet1")[:31]
+                if isinstance(df, _pd.DataFrame) and not df.empty:
+                    df.to_excel(xw, sheet_name=sheet, index=False)
+                else:
+                    _pd.DataFrame({"Info": ["(empty)"]}).to_excel(xw, sheet_name=sheet, index=False)
+                wrote_any = True
+        if not wrote_any:
+            _pd.DataFrame({"Info": ["No data"]}).to_excel(xw, sheet_name="Output", index=False)
+    buf.seek(0)
+    return buf.getvalue()
