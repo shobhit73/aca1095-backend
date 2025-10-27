@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import logging
 import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -21,7 +22,7 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Constants / helpers
 # -----------------------------------------------------------------------------
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
@@ -36,6 +37,30 @@ def _pick_col(df_or_index, candidates: List[str]) -> Optional[str]:
         if k in norm:
             return norm[k]
     return None
+
+# -----------------------------------------------------------------------------
+# Year helpers (back-compat for main_fastapi)
+# -----------------------------------------------------------------------------
+def choose_report_year(requested: Optional[int], fallback: Optional[int] = None) -> int:
+    """
+    Back-compat: normalize the filing/report year.
+    - If 'requested' is a truthy int, return it.
+    - Else if 'fallback' provided, return fallback.
+    - Else return current calendar year.
+    """
+    try:
+        if requested is not None:
+            y = int(requested)
+            if y > 1900:
+                return y
+    except Exception:
+        pass
+    if fallback:
+        return int(fallback)
+    return int(datetime.utcnow().year)
+
+# Preserve older alias some code used
+get_report_year = choose_report_year
 
 # -----------------------------------------------------------------------------
 # Excel I/O
@@ -61,6 +86,9 @@ def read_excel_sheets(xlsx_bytes: bytes) -> Dict[str, pd.DataFrame]:
 # Backward-compatible aliases
 extract_sheets = read_excel_sheets
 read_excel_to_sheets = read_excel_sheets
+load_excel = read_excel_sheets  # legacy alias
+load_sheets = read_excel_sheets
+get_sheets = read_excel_sheets
 
 # -----------------------------------------------------------------------------
 # Employee row (Demographics)
@@ -354,13 +382,5 @@ def prepare_employee_context(
 # -----------------------------------------------------------------------------
 # Backward-compat shims (to avoid breaking older imports)
 # -----------------------------------------------------------------------------
-def load_excel(xlsx_bytes: bytes):
-    """Legacy alias used by older code."""
-    return read_excel_sheets(xlsx_bytes)
-
-# Additional handy aliases some projects used
-load_sheets = read_excel_sheets
-get_sheets = read_excel_sheets
-
-# Keep older main_fastapi working without edits:
-prepare_inputs = prepare_employee_context
+# Old projects might import these names:
+prepare_inputs = prepare_employee_context  # legacy alias
