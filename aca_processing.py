@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 # -----------------------------------------------------------------------------
-# Logging (safe defaults; caller can override level/handler)
+# Logging
 # -----------------------------------------------------------------------------
 logger = logging.getLogger("aca.processing")
 if not logger.handlers:
@@ -20,9 +20,8 @@ if not logger.handlers:
     logger.addHandler(_h)
 logger.setLevel(logging.INFO)
 
-
 # -----------------------------------------------------------------------------
-# Normalization helpers
+# Helpers
 # -----------------------------------------------------------------------------
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
@@ -38,7 +37,6 @@ def _pick_col(df_or_index, candidates: List[str]) -> Optional[str]:
             return norm[k]
     return None
 
-
 # -----------------------------------------------------------------------------
 # Excel I/O
 # -----------------------------------------------------------------------------
@@ -53,27 +51,23 @@ def read_excel_sheets(xlsx_bytes: bytes) -> Dict[str, pd.DataFrame]:
     for name, df in xl.items():
         if df is None:
             continue
-        # strip columns and coerce to string
         df2 = df.copy()
         df2.columns = [str(c).strip() for c in df2.columns]
-        # drop pure-empty rows
         df2 = df2.dropna(how="all")
         sheets[str(name).strip()] = df2
     logger.info("Loaded %d sheet(s): %s", len(sheets), list(sheets.keys()))
     return sheets
 
-# Backward compatible aliases
+# Backward-compatible aliases
 extract_sheets = read_excel_sheets
 read_excel_to_sheets = read_excel_sheets
 
-
 # -----------------------------------------------------------------------------
-# Locate employee row (from Demographics/Employees sheet)
+# Employee row (Demographics)
 # -----------------------------------------------------------------------------
 def find_employee_row(sheets: Dict[str, pd.DataFrame], employee_id: str) -> pd.Series:
     """
-    Find an employee's demographic row by EmployeeID (string match).
-    Looks through common sheet names.
+    Find an employee's demographic row by EmployeeID.
     """
     emp_id = str(employee_id).strip()
     logger.info("Finding employee row for EmployeeID=%s", emp_id)
@@ -94,23 +88,19 @@ def find_employee_row(sheets: Dict[str, pd.DataFrame], employee_id: str) -> pd.S
 # Alias
 get_employee_row = find_employee_row
 
-
 # -----------------------------------------------------------------------------
-# Wait Period merge (sheet: "Emp Wait Period")
+# Emp Wait Period
 # -----------------------------------------------------------------------------
 def _load_wait_period(sheets: Dict[str, pd.DataFrame]) -> Optional[pd.DataFrame]:
     wp = sheets.get("Emp Wait Period")
     if wp is None or wp.empty:
         return None
     wp2 = wp.copy()
-    # normalize column names
     id_col  = _pick_col(wp2, ["EmployeeID","EmpID","Employee Id"])
     eff_col = _pick_col(wp2, ["EffectiveDate","Effective Date"])
     waitcol = _pick_col(wp2, ["Wait Period","WaitPeriod","Waiting Period"])
-    # ensure all exist
     if not id_col or not waitcol:
         return None
-    # keep only relevant
     keep = [c for c in [id_col, eff_col, waitcol] if c]
     wp2 = wp2[keep].copy()
     wp2.rename(columns={
@@ -123,7 +113,6 @@ def _load_wait_period(sheets: Dict[str, pd.DataFrame]) -> Optional[pd.DataFrame]
 def attach_wait_period(df: pd.DataFrame, sheets: Dict[str, pd.DataFrame], employee_id: Optional[str] = None) -> pd.DataFrame:
     """
     Attach 'Wait Period' (and EffectiveDate if present) into df by EmployeeID.
-    If employee_id is provided and df has no EmployeeID, add it for merge.
     """
     wp = _load_wait_period(sheets)
     if wp is None or wp.empty:
@@ -138,9 +127,8 @@ def attach_wait_period(df: pd.DataFrame, sheets: Dict[str, pd.DataFrame], employ
     out = work.merge(wp, how="left", on="EmployeeID")
     return out
 
-
 # -----------------------------------------------------------------------------
-# Spouse/Child enrollment (PLAN-AGNOSTIC)
+# Spouse/Child enrollment (Plan-agnostic)
 # -----------------------------------------------------------------------------
 _TIER_KW = {
     "spouse": {
@@ -214,44 +202,37 @@ def derive_spouse_child_enrollment_from_dependents(dep_df: Optional[pd.DataFrame
             break
     return bool(spouse_flag), bool(child_flag)
 
-
 # -----------------------------------------------------------------------------
-# Build monthly final slice (Line14/16 etc.) for a specific employee
+# Monthly final slice (Line14/16 + flags + wait period)
 # -----------------------------------------------------------------------------
 def build_final_for_employee(sheets: Dict[str, pd.DataFrame], employee_id: str) -> pd.DataFrame:
     """
     Returns a tidy per-month DataFrame for an employee with columns:
       EmployeeID, Month, Line14_Final, Line16_Final, Spouse Enrolled, Child Enrolled, (optionally Wait Period, EffectiveDate)
-
-    Sources searched (flexible):
-      - Final / Interim / Results sheets for Line14/16 per month
-      - Emp Enrollment and Dep Enrollment for spouse/child enrolled flags (plan-agnostic)
-      - Emp Wait Period merged in if present
     """
     emp_id = str(employee_id).strip()
     logger.info("Building final monthly slice for EmployeeID=%s", emp_id)
 
-    # 1) Find monthly Line14/16 from likely sheets
+    # 1) Monthly Line14/16
     base_df = _find_monthly_codes(sheets, emp_id)
 
-    # 2) Spouse/Child Enrolled
+    # 2) Spouse/Child Enrolled (plan-agnostic)
     sp_enr, ch_enr = _compute_spouse_child_flags(sheets, emp_id)
     base_df["Spouse Enrolled"] = bool(sp_enr)
     base_df["Child Enrolled"] = bool(ch_enr)
 
-    # 3) Attach Wait Period (if sheet exists)
+    # 3) Wait Period merge
     base_df = attach_wait_period(base_df, sheets, employee_id=emp_id)
 
-    # 4) Ensure Month ordering
+    # 4) Order months
     base_df["Month"] = pd.Categorical(base_df["Month"], categories=MONTHS, ordered=True)
     base_df = base_df.sort_values("Month").reset_index(drop=True)
 
     logger.info("Final monthly slice ready: %d rows", len(base_df))
     return base_df
 
-# Alias for older code
+# Alias
 slice_final_for_employee = build_final_for_employee
-
 
 def _find_monthly_codes(sheets: Dict[str, pd.DataFrame], employee_id: str) -> pd.DataFrame:
     """
@@ -278,6 +259,7 @@ def _find_monthly_codes(sheets: Dict[str, pd.DataFrame], employee_id: str) -> pd
         col_l16 = _pick_col(view, ["Line16_Final","Line16","Line 16","L16","Line 16 Code"])
 
         out = []
+        # Case 1: explicit month rows
         if view[col_month].str.strip().str.lower().isin([m.lower() for m in MONTHS]).any():
             for _, r in view.iterrows():
                 mon = str(r.get(col_month,"")).strip()
@@ -289,10 +271,9 @@ def _find_monthly_codes(sheets: Dict[str, pd.DataFrame], employee_id: str) -> pd
                         "Line16_Final": str(r.get(col_l16, "") or "") if col_l16 else "",
                     })
         else:
-            # Handle "All 12 Months" broadcasting
+            # Case 2: "All 12 Months" broadcast
             all12_col = _pick_col(view, ["All 12 Months","All12Months","All12"])
             if all12_col:
-                # Use the first row as broadcast values if present
                 r = view.iloc[0]
                 v14 = str(r.get(col_l14,"") or "") if col_l14 else ""
                 v16 = str(r.get(col_l16,"") or "") if col_l16 else ""
@@ -306,14 +287,13 @@ def _find_monthly_codes(sheets: Dict[str, pd.DataFrame], employee_id: str) -> pd
         if out:
             return pd.DataFrame(out, columns=["EmployeeID","Month","Line14_Final","Line16_Final"])
 
-    # Fallback: empty codes for all months (but still provide rows)
+    # Fallback: rows for all months with empty codes
     return pd.DataFrame({
         "EmployeeID": [emp_id]*12,
         "Month": MONTHS,
         "Line14_Final": ["" for _ in MONTHS],
         "Line16_Final": ["" for _ in MONTHS],
     })
-
 
 def _compute_spouse_child_flags(sheets: Dict[str, pd.DataFrame], employee_id: str) -> Tuple[bool,bool]:
     """
@@ -323,7 +303,7 @@ def _compute_spouse_child_flags(sheets: Dict[str, pd.DataFrame], employee_id: st
     """
     emp_id = str(employee_id).strip()
 
-    # Try Emp Enrollment first
+    # Emp Enrollment
     emp_enroll = None
     for sh in ["Emp Enrollment","Employee Enrollment","Employee Coverage","Enrollment"]:
         df = sheets.get(sh)
@@ -341,7 +321,7 @@ def _compute_spouse_child_flags(sheets: Dict[str, pd.DataFrame], employee_id: st
     if emp_enroll is not None:
         spouse, child = derive_spouse_child_enrollment_from_emp_row(emp_enroll)
 
-    # Reinforce via Dep Enrollment (if exists)
+    # Dep Enrollment reinforcement
     dep_df = None
     for sh in ["Dep Enrollment","Dependents","Dependent Enrollment","Covered Individuals"]:
         if sh in sheets and not sheets[sh].empty:
@@ -354,9 +334,8 @@ def _compute_spouse_child_flags(sheets: Dict[str, pd.DataFrame], employee_id: st
 
     return bool(spouse), bool(child)
 
-
 # -----------------------------------------------------------------------------
-# Convenience bundle for FastAPI usage
+# FastAPI convenience
 # -----------------------------------------------------------------------------
 def prepare_employee_context(
     xlsx_bytes: bytes,
@@ -371,3 +350,14 @@ def prepare_employee_context(
     emp_row = find_employee_row(sheets, employee_id)
     final_df_emp = build_final_for_employee(sheets, employee_id)
     return sheets, emp_row, final_df_emp
+
+# -----------------------------------------------------------------------------
+# Backward-compat shims (to avoid breaking older imports)
+# -----------------------------------------------------------------------------
+def load_excel(xlsx_bytes: bytes):
+    """Legacy alias used by older code."""
+    return read_excel_sheets(xlsx_bytes)
+
+# Additional handy aliases some projects used
+load_sheets = read_excel_sheets
+get_sheets = read_excel_sheets
