@@ -2,385 +2,250 @@
 from __future__ import annotations
 
 import io
-import logging
-import re
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
-
-import numpy as np
+from datetime import date, timedelta
+from typing import Dict, Tuple, Iterable, List
 import pandas as pd
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-logger = logging.getLogger("aca.processing")
-if not logger.handlers:
-    _h = logging.StreamHandler()
-    _f = logging.Formatter("[ACA][processing] %(levelname)s: %(message)s")
-    _h.setFormatter(_f)
-    logger.addHandler(_h)
-logger.setLevel(logging.INFO)
+from debug_logging import get_logger, log_df, log_call
+log = get_logger("processing")
 
-# -----------------------------------------------------------------------------
-# Constants / helpers
-# -----------------------------------------------------------------------------
+# ----------------- Month labels -----------------
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+FULL_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
-def _norm_txt(x: str) -> str:
-    return re.sub(r"\W+", "", (str(x) or "")).lower()
-
-def _pick_col(df_or_index, candidates: List[str]) -> Optional[str]:
-    cols = list(df_or_index) if not hasattr(df_or_index, "columns") else df_or_index.columns
-    norm = {_norm_txt(c): c for c in cols}
-    for c in candidates:
-        k = _norm_txt(c)
-        if k in norm:
-            return norm[k]
-    return None
-
-# -----------------------------------------------------------------------------
-# Year helpers (back-compat for main_fastapi)
-# -----------------------------------------------------------------------------
-def choose_report_year(requested: Optional[int], fallback: Optional[int] = None) -> int:
-    """
-    Back-compat: normalize the filing/report year.
-    - If 'requested' is a truthy int, return it.
-    - Else if 'fallback' provided, return fallback.
-    - Else return current calendar year.
-    """
+# ----------------- Utilities -----------------
+def _coerce_str(x) -> str:
     try:
-        if requested is not None:
-            y = int(requested)
-            if y > 1900:
-                return y
+        return str(x)
     except Exception:
-        pass
-    if fallback:
-        return int(fallback)
-    return int(datetime.utcnow().year)
+        return ""
 
-# Preserve older alias some code used
-get_report_year = choose_report_year
+def month_bounds(year: int, month: int) -> Tuple[date, date]:
+    import calendar
+    last = calendar.monthrange(year, month)[1]
+    return date(year, month, 1), date(year, month, last)
 
-# -----------------------------------------------------------------------------
-# Excel I/O
-# -----------------------------------------------------------------------------
-def read_excel_sheets(xlsx_bytes: bytes) -> Dict[str, pd.DataFrame]:
+# ----------------- Excel I/O -----------------
+@log_call(log)
+def load_excel(excel_bytes: bytes) -> Dict[str, pd.DataFrame]:
     """
-    Read all worksheets into a dict[name] -> DataFrame, trimmed & cleaned.
+    Read supported sheets (case-insensitive).
+    Missing sheets return empty DataFrames.
     """
-    logger.info("Reading Excel bytes into sheet dict")
-    with io.BytesIO(xlsx_bytes) as bio:
-        xl = pd.read_excel(bio, sheet_name=None, dtype=str, engine="openpyxl")
-    sheets: Dict[str, pd.DataFrame] = {}
-    for name, df in xl.items():
+    x = pd.ExcelFile(io.BytesIO(excel_bytes))
+
+    def pick(name: str) -> str | None:
+        for s in x.sheet_names:
+            if s.strip().lower() == name.strip().lower():
+                return s
+        return None
+
+    def read_sheet(name: str) -> pd.DataFrame:
+        sname = pick(name)
+        if not sname:
+            return pd.DataFrame()
+        df = pd.read_excel(x, sname)
         if df is None:
-            continue
-        df2 = df.copy()
-        df2.columns = [str(c).strip() for c in df2.columns]
-        df2 = df2.dropna(how="all")
-        sheets[str(name).strip()] = df2
-    logger.info("Loaded %d sheet(s): %s", len(sheets), list(sheets.keys()))
-    return sheets
-
-# Backward-compatible aliases
-extract_sheets = read_excel_sheets
-read_excel_to_sheets = read_excel_sheets
-load_excel = read_excel_sheets  # legacy alias
-load_sheets = read_excel_sheets
-get_sheets = read_excel_sheets
-
-# -----------------------------------------------------------------------------
-# Employee row (Demographics)
-# -----------------------------------------------------------------------------
-def find_employee_row(sheets: Dict[str, pd.DataFrame], employee_id: str) -> pd.Series:
-    """
-    Find an employee's demographic row by EmployeeID.
-    """
-    emp_id = str(employee_id).strip()
-    logger.info("Finding employee row for EmployeeID=%s", emp_id)
-    for sh in ["Employee Demographics", "Employees", "Employee Master", "Emp Demo", "Demographics"]:
-        df = sheets.get(sh)
-        if df is None or df.empty:
-            continue
-        col_empid = _pick_col(df, ["EmployeeID","EmpID","Employee Id","Employee_Id"])
-        if not col_empid:
-            continue
-        hit = df[df[col_empid].astype(str).str.strip() == emp_id]
-        if not hit.empty:
-            logger.info("Matched employee on sheet '%s'", sh)
-            return hit.iloc[0]
-    logger.warning("EmployeeID=%s not found in demographic sheets; returning empty row", emp_id)
-    return pd.Series({}, dtype="object")
-
-# Alias
-get_employee_row = find_employee_row
-
-# -----------------------------------------------------------------------------
-# Emp Wait Period
-# -----------------------------------------------------------------------------
-def _load_wait_period(sheets: Dict[str, pd.DataFrame]) -> Optional[pd.DataFrame]:
-    wp = sheets.get("Emp Wait Period")
-    if wp is None or wp.empty:
-        return None
-    wp2 = wp.copy()
-    id_col  = _pick_col(wp2, ["EmployeeID","EmpID","Employee Id"])
-    eff_col = _pick_col(wp2, ["EffectiveDate","Effective Date"])
-    waitcol = _pick_col(wp2, ["Wait Period","WaitPeriod","Waiting Period"])
-    if not id_col or not waitcol:
-        return None
-    keep = [c for c in [id_col, eff_col, waitcol] if c]
-    wp2 = wp2[keep].copy()
-    wp2.rename(columns={
-        id_col: "EmployeeID",
-        eff_col or "EffectiveDate": "EffectiveDate",
-        waitcol: "Wait Period",
-    }, inplace=True)
-    return wp2
-
-def attach_wait_period(df: pd.DataFrame, sheets: Dict[str, pd.DataFrame], employee_id: Optional[str] = None) -> pd.DataFrame:
-    """
-    Attach 'Wait Period' (and EffectiveDate if present) into df by EmployeeID.
-    """
-    wp = _load_wait_period(sheets)
-    if wp is None or wp.empty:
+            return pd.DataFrame()
+        df.columns = [c.strip().lower().replace(" ", "") for c in df.columns]
         return df
 
-    work = df.copy()
-    if "EmployeeID" not in work.columns and employee_id is not None:
-        work["EmployeeID"] = str(employee_id).strip()
-    if "EmployeeID" not in work.columns:
-        return df
+    data: Dict[str, pd.DataFrame] = {}
+    data["emp_demo"]   = read_sheet("Emp Demographic")
+    data["emp_elig"]   = read_sheet("Emp Eligibility")
+    data["emp_enroll"] = read_sheet("Emp Enrollment")
+    data["dep_enroll"] = read_sheet("Dep Enrollment")
 
-    out = work.merge(wp, how="left", on="EmployeeID")
-    return out
+    # Emp Wait Period (exact name)
+    data["emp_wait"]   = read_sheet("Emp Wait Period")  # employeeid, effectivedate, waitperiod
+    w = data["emp_wait"]
+    if not w.empty and "waitperioddays" in w.columns and "waitperiod" not in w.columns:
+        w.rename(columns={"waitperioddays": "waitperiod"}, inplace=True)
 
-# -----------------------------------------------------------------------------
-# Spouse/Child enrollment (Plan-agnostic)
-# -----------------------------------------------------------------------------
-_TIER_KW = {
-    "spouse": {
-        "ee+sp","emp+sp","employeespouse","employee+spouse",
-        "family","ee+fam","emp+fam","employee+family",
-        "ee+sp+ch","ee+sp+children","emp+sp+ch",
-    },
-    "child": {
-        "ee+ch","emp+ch","employeechild","employee+child",
-        "employeechildren","employee+children","ee+children",
-        "family","ee+fam","emp+fam","employee+family",
-        "ee+sp+ch","ee+sp+children","emp+sp+ch",
-    },
-}
+    log.info("load_excel: sheets detected", extra={"extra_data": {"sheets": list(x.sheet_names)}})
+    return data
 
-def _tier_covers(kind: str, tier_text: str) -> bool:
-    t = _norm_txt(tier_text)
-    for kw in _TIER_KW.get(kind, set()):
-        if kw in t:
-            return True
-    return False
-
-def _row_month_flags(row: pd.Series) -> Dict[str, bool]:
-    flags = {m: False for m in MONTHS}
-    all12_col = _pick_col(row.index, ["All 12 Months","All12Months","All12"])
-    if all12_col and str(row.get(all12_col,"")).strip().lower() in {"1","true","yes","y","x"}:
-        return {m: True for m in MONTHS}
-    for m in MONTHS:
-        c = _pick_col(row.index, [m, m.upper(), m.capitalize()])
-        if c and str(row.get(c,"")).strip().lower() in {"1","true","yes","y","x"}:
-            flags[m] = True
-    return flags
-
-def _full_year(flags: Dict[str, bool]) -> bool:
-    return all(flags.get(m, False) for m in MONTHS)
-
-def derive_spouse_child_enrollment_from_emp_row(emp_enroll_row: pd.Series) -> Tuple[bool,bool]:
+@log_call(log)
+def prepare_inputs(data: Dict[str, pd.DataFrame]) -> tuple[
+    pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame
+]:
     """
-    Plan-agnostic: spouse/child enrolled if tier implies coverage AND months cover full year.
+    Normalize frames and return them in a fixed order
+    (NO boolean evaluation of DataFrames).
     """
-    tier_col = _pick_col(emp_enroll_row.index, ["Tier","Coverage Tier","Plan Tier","Enrollment Tier","Tier Name"])
-    tier = str(emp_enroll_row.get(tier_col,"")) if tier_col else ""
-    flags = _row_month_flags(emp_enroll_row)
-    full = _full_year(flags) if flags else False
-    spouse = _tier_covers("spouse", tier) and full
-    child  = _tier_covers("child", tier) and full
-    return bool(spouse), bool(child)
+    def _as_df(x) -> pd.DataFrame:
+        return x if isinstance(x, pd.DataFrame) else pd.DataFrame()
 
-def derive_spouse_child_enrollment_from_dependents(dep_df: Optional[pd.DataFrame], employee_id: str) -> Tuple[bool,bool]:
+    emp_demo   = _as_df(data.get("emp_demo")).copy()
+    emp_elig   = _as_df(data.get("emp_elig")).copy()
+    emp_enroll = _as_df(data.get("emp_enroll")).copy()
+    dep_enroll = _as_df(data.get("dep_enroll")).copy()
+    emp_wait   = _as_df(data.get("emp_wait")).copy()
+
+    for df in (emp_demo, emp_elig, emp_enroll, dep_enroll, emp_wait):
+        if not df.empty and "employeeid" in df.columns:
+            df["employeeid"] = df["employeeid"].astype(str)
+
+    if not emp_wait.empty:
+        if "effectivedate" in emp_wait.columns:
+            emp_wait["effectivedate"] = pd.to_datetime(emp_wait["effectivedate"], errors="coerce")
+        if "waitperiod" in emp_wait.columns:
+            emp_wait["waitperiod"] = pd.to_numeric(emp_wait["waitperiod"], errors="coerce").fillna(0).astype(int)
+
+    log_df(log, emp_demo, "emp_demo")
+    log_df(log, emp_elig, "emp_elig")
+    log_df(log, emp_enroll, "emp_enroll")
+    log_df(log, dep_enroll, "dep_enroll")
+    log_df(log, emp_wait, "emp_wait")
+    return emp_demo, emp_elig, emp_enroll, dep_enroll, emp_wait
+
+def choose_report_year(emp_elig: pd.DataFrame) -> int:
+    import datetime as _dt
+    if not emp_elig.empty:
+        for c in ("eligibilitystartdate","eligibilityenddate"):
+            if c in emp_elig.columns:
+                s = pd.to_datetime(emp_elig[c], errors="coerce")
+                yr = s.dt.year.dropna()
+                if not yr.empty:
+                    return int(yr.iloc[0])
+    return _dt.date.today().year
+
+# ----------------- Helpers imported by builder -----------------
+def _collect_employee_ids(*frames: Iterable[pd.DataFrame]) -> List[str]:
+    ids: set[str] = set()
+    for df in frames:
+        if isinstance(df, pd.DataFrame) and not df.empty and "employeeid" in df.columns:
+            ids |= set(df["employeeid"].astype(str).tolist())
+    return sorted(ids, key=lambda x: (len(x), x))
+
+def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
     """
-    Optional reinforcement using a 'Dep Enrollment' style sheet:
-    If any dependent with Relationship=Spouse (or Child) has full-year months, mark True.
+    Normalize employment status from Emp Demographic with robust FT/PT + ACTIVE/TERM detection.
+    - Creates/aligns: statusstartdate, statusenddate
+    - Derives: _role_norm in {"FULLTIME","PARTTIME",""} and _estatus_norm in {"ACTIVE","TERM",""}
+    - Scans MANY column names/values and also numeric heuristics (FTE, hours).
     """
-    if dep_df is None or dep_df.empty:
-        return False, False
-    col_empid = _pick_col(dep_df, ["EmployeeID","EmpID","Employee Id"])
-    if not col_empid:
-        return False, False
-    rel_col = _pick_col(dep_df, ["Relationship","Rel","Relation"])
-    spouse_flag, child_flag = False, False
-    view = dep_df[dep_df[col_empid].astype(str).str.strip() == str(employee_id).strip()]
-    for _, r in view.iterrows():
-        rel = _norm_txt(str(r.get(rel_col,""))) if rel_col else ""
-        flags = _row_month_flags(r)
-        if _full_year(flags):
-            if "spouse" in rel:
-                spouse_flag = True
-            if "child" in rel or "dependent" in rel:
-                child_flag = True
-        if spouse_flag and child_flag:
-            break
-    return bool(spouse_flag), bool(child_flag)
+    if emp_demo is None or emp_demo.empty:
+        return pd.DataFrame(columns=["employeeid","statusstartdate","statusenddate","_role_norm","_estatus_norm"])
 
-# -----------------------------------------------------------------------------
-# Monthly final slice (Line14/16 + flags + wait period)
-# -----------------------------------------------------------------------------
-def build_final_for_employee(sheets: Dict[str, pd.DataFrame], employee_id: str) -> pd.DataFrame:
+    df = emp_demo.copy()
+
+    if "employeeid" in df.columns:
+        df["employeeid"] = df["employeeid"].astype(str)
+
+    start_cands = ["statusstartdate","hiredate","startdate","effectivedate","originalhiredate","employmentstartdate"]
+    end_cands   = ["statusenddate","termdate","terminationdate","enddate","separationdate","employmentenddate"]
+
+    def _first(cols):
+        for c in cols:
+            if c in df.columns: return c
+        return None
+
+    s_col = _first(start_cands)
+    e_col = _first(end_cands)
+
+    if s_col and s_col != "statusstartdate":
+        df.rename(columns={s_col: "statusstartdate"}, inplace=True)
+    elif "statusstartdate" not in df.columns:
+        df["statusstartdate"] = pd.NaT
+
+    if e_col and e_col != "statusenddate":
+        df.rename(columns={e_col: "statusenddate"}, inplace=True)
+    elif "statusenddate" not in df.columns:
+        df["statusenddate"] = pd.NaT
+
+    for c in ("statusstartdate","statusenddate"):
+        df[c] = pd.to_datetime(df[c], errors="coerce")
+
+    # ACTIVE / TERM
+    status_cands = ["employeestatus","status","employmentstatus","workstatus","jobstatus"]
+    present_stat = [c for c in status_cands if c in df.columns]
+
+    def detect_estatus(row) -> str:
+        for c in present_stat:
+            val = str(row.get(c, "")).upper()
+            if any(t in val for t in ("TERM", "TERMINAT", "SEPARAT", "ENDED", "INACTIVE")):
+                return "TERM"
+            if any(t in val for t in ("ACTIVE", "EMPLOY", "HIRED", "CURRENT")):
+                return "ACTIVE"
+        return ""
+
+    # FT/PT (names + values + numerics)
+    name_ftpt_keywords = ("FT", "FULL", "PART", "PT", "FTE", "HOUR", "STDHOUR", "STANDARDHOUR", "WEEKLYHOUR")
+    role_like_cols = [c for c in df.columns if any(k in c.upper() for k in name_ftpt_keywords)]
+
+    role_cands = set(role_like_cols) | set([
+        "role","ftpt","ft_pt","employmenttype","employeetype","employeeclass","jobclass",
+        "employmentcategory","fulltimeparttime","fte_status","fte","positiontype",
+        "classification","class","standardhours","hoursperweek","avgweeklyhours","weeklyhours"
+    ])
+    role_cands = [c for c in role_cands if c in df.columns]
+
+    FT_STR_TOKENS = ("FULL-TIME","FULLTIME"," FULL"," F/T"," F T"," FT","REGULAR FULL","SALARIED FULL","RFT")
+    PT_STR_TOKENS = ("PART-TIME","PARTTIME"," PART"," P/T"," P T"," PT","RPT")
+
+    def is_ft_numeric(val, colname: str) -> bool | None:
+        try:
+            v = float(val)
+        except Exception:
+            return None
+        cu = colname.upper()
+        if "FTE" in cu:
+            return True if v >= 0.75 else (False if v > 0 else None)
+        if any(k in cu for k in ("HOUR","STDHOUR","WEEKLY")):
+            return True if v >= 30 else (False if 0 < v < 30 else None)
+        return None
+
+    def detect_role(row) -> str:
+        for c in role_cands:
+            val = str(row.get(c, "")).upper()
+            if any(t in val for t in FT_STR_TOKENS): return "FULLTIME"
+            if any(t in val for t in PT_STR_TOKENS): return "PARTTIME"
+        for c in role_cands:
+            res = is_ft_numeric(row.get(c, None), c)
+            if res is True:  return "FULLTIME"
+            if res is False: return "PARTTIME"
+        for c in df.columns:
+            val = str(row.get(c, "")).strip().upper()
+            if val == "FT": return "FULLTIME"
+            if val == "PT": return "PARTTIME"
+        return ""
+
+    df["_role_norm"] = df.apply(detect_role, axis=1)
+    df["_estatus_norm"] = df.apply(detect_estatus, axis=1)
+
+    return df[["employeeid","statusstartdate","statusenddate","_role_norm","_estatus_norm"]]
+
+def _any_overlap(df: pd.DataFrame, start_col: str, end_col: str, ms: date, me: date, *, mask=None) -> bool:
+    if df is None or df.empty or start_col not in df.columns or end_col not in df.columns:
+        return False
+    if mask is None:
+        mask = pd.Series(True, index=df.index)
+    s = pd.to_datetime(df[start_col], errors="coerce").dt.date.fillna(date(1900,1,1))
+    e = pd.to_datetime(df[end_col], errors="coerce").dt.date.fillna(date(9999,12,31))
+    return bool(((e >= ms) & (s <= me) & mask).any())
+
+def _all_month(df: pd.DataFrame, start_col: str, end_col: str, ms: date, me: date, *, mask=None) -> bool:
+    if df is None or df.empty or start_col not in df.columns or end_col not in df.columns:
+        return False
+    if mask is None:
+        mask = pd.Series(True, index=df.index)
+    s = pd.to_datetime(df[start_col], errors="coerce").dt.date.fillna(date(1900,1,1))
+    e = pd.to_datetime(df[end_col], errors="coerce").dt.date.fillna(date(9999,12,31))
+    return bool((mask & (s <= ms) & (e >= me)).any())
+
+# ---- Wait Period overlap from Emp Wait Period
+def _waiting_in_month(wait_df_emp: pd.DataFrame, ms: date, me: date) -> bool:
     """
-    Returns a tidy per-month DataFrame for an employee with columns:
-      EmployeeID, Month, Line14_Final, Line16_Final, Spouse Enrolled, Child Enrolled, (optionally Wait Period, EffectiveDate)
+    True if ANY wait window overlaps the month [ms, me].
+    Each row: start = EffectiveDate, end = start + WaitPeriodDays - 1.
     """
-    emp_id = str(employee_id).strip()
-    logger.info("Building final monthly slice for EmployeeID=%s", emp_id)
-
-    # 1) Monthly Line14/16
-    base_df = _find_monthly_codes(sheets, emp_id)
-
-    # 2) Spouse/Child Enrolled (plan-agnostic)
-    sp_enr, ch_enr = _compute_spouse_child_flags(sheets, emp_id)
-    base_df["Spouse Enrolled"] = bool(sp_enr)
-    base_df["Child Enrolled"] = bool(ch_enr)
-
-    # 3) Wait Period merge
-    base_df = attach_wait_period(base_df, sheets, employee_id=emp_id)
-
-    # 4) Order months
-    base_df["Month"] = pd.Categorical(base_df["Month"], categories=MONTHS, ordered=True)
-    base_df = base_df.sort_values("Month").reset_index(drop=True)
-
-    logger.info("Final monthly slice ready: %d rows", len(base_df))
-    return base_df
-
-# Alias
-slice_final_for_employee = build_final_for_employee
-
-def _find_monthly_codes(sheets: Dict[str, pd.DataFrame], employee_id: str) -> pd.DataFrame:
-    """
-    Look for a per-month table with columns like Month/Line14/Line16 in common sheets.
-    If not found, return empty codes for all months.
-    """
-    candidates = [
-        "Final", "Final Output", "ACA Final", "Results",
-        "Interim", "Interim Output", "ACA Interim",
-    ]
-    emp_id = str(employee_id).strip()
-    for sh in candidates:
-        df = sheets.get(sh)
-        if df is None or df.empty:
-            continue
-        col_empid = _pick_col(df, ["EmployeeID","EmpID","Employee Id"])
-        col_month = _pick_col(df, ["Month","Months","Coverage Month","Period"])
-        if not col_empid or not col_month:
-            continue
-        view = df[df[col_empid].astype(str).str.strip() == emp_id].copy()
-        if view.empty:
-            continue
-        col_l14 = _pick_col(view, ["Line14_Final","Line14","Line 14","L14","Line 14 Code"])
-        col_l16 = _pick_col(view, ["Line16_Final","Line16","Line 16","L16","Line 16 Code"])
-
-        out = []
-        # Case 1: explicit month rows
-        if view[col_month].str.strip().str.lower().isin([m.lower() for m in MONTHS]).any():
-            for _, r in view.iterrows():
-                mon = str(r.get(col_month,"")).strip()
-                if _norm_txt(mon) in [_norm_txt(m) for m in MONTHS]:
-                    out.append({
-                        "EmployeeID": emp_id,
-                        "Month": next(M for M in MONTHS if _norm_txt(M) == _norm_txt(mon)),
-                        "Line14_Final": str(r.get(col_l14, "") or "") if col_l14 else "",
-                        "Line16_Final": str(r.get(col_l16, "") or "") if col_l16 else "",
-                    })
-        else:
-            # Case 2: "All 12 Months" broadcast
-            all12_col = _pick_col(view, ["All 12 Months","All12Months","All12"])
-            if all12_col:
-                r = view.iloc[0]
-                v14 = str(r.get(col_l14,"") or "") if col_l14 else ""
-                v16 = str(r.get(col_l16,"") or "") if col_l16 else ""
-                for m in MONTHS:
-                    out.append({
-                        "EmployeeID": emp_id,
-                        "Month": m,
-                        "Line14_Final": v14,
-                        "Line16_Final": v16,
-                    })
-        if out:
-            return pd.DataFrame(out, columns=["EmployeeID","Month","Line14_Final","Line16_Final"])
-
-    # Fallback: rows for all months with empty codes
-    return pd.DataFrame({
-        "EmployeeID": [emp_id]*12,
-        "Month": MONTHS,
-        "Line14_Final": ["" for _ in MONTHS],
-        "Line16_Final": ["" for _ in MONTHS],
-    })
-
-def _compute_spouse_child_flags(sheets: Dict[str, pd.DataFrame], employee_id: str) -> Tuple[bool,bool]:
-    """
-    Plan-agnostic flags:
-      True if tier implies coverage AND months cover full year;
-      or any dependent (spouse/child) shows full-year coverage.
-    """
-    emp_id = str(employee_id).strip()
-
-    # Emp Enrollment
-    emp_enroll = None
-    for sh in ["Emp Enrollment","Employee Enrollment","Employee Coverage","Enrollment"]:
-        df = sheets.get(sh)
-        if df is None or df.empty:
-            continue
-        col_empid = _pick_col(df, ["EmployeeID","EmpID","Employee Id"])
-        if not col_empid:
-            continue
-        hit = df[df[col_empid].astype(str).str.strip() == emp_id]
-        if not hit.empty:
-            emp_enroll = hit.iloc[0]
-            break
-
-    spouse, child = False, False
-    if emp_enroll is not None:
-        spouse, child = derive_spouse_child_enrollment_from_emp_row(emp_enroll)
-
-    # Dep Enrollment reinforcement
-    dep_df = None
-    for sh in ["Dep Enrollment","Dependents","Dependent Enrollment","Covered Individuals"]:
-        if sh in sheets and not sheets[sh].empty:
-            dep_df = sheets[sh]
-            break
-    if dep_df is not None:
-        dep_sp, dep_ch = derive_spouse_child_enrollment_from_dependents(dep_df, emp_id)
-        spouse = spouse or dep_sp
-        child  = child or dep_ch
-
-    return bool(spouse), bool(child)
-
-# -----------------------------------------------------------------------------
-# FastAPI convenience
-# -----------------------------------------------------------------------------
-def prepare_employee_context(
-    xlsx_bytes: bytes,
-    employee_id: str,
-    year: int
-) -> Tuple[Dict[str, pd.DataFrame], pd.Series, pd.DataFrame]:
-    """
-    Reads Excel, finds the employee row, and builds the monthly final slice.
-    Returns: (sheets, emp_row, final_df_emp)
-    """
-    sheets = read_excel_sheets(xlsx_bytes)
-    emp_row = find_employee_row(sheets, employee_id)
-    final_df_emp = build_final_for_employee(sheets, employee_id)
-    return sheets, emp_row, final_df_emp
-
-# -----------------------------------------------------------------------------
-# Backward-compat shims (to avoid breaking older imports)
-# -----------------------------------------------------------------------------
-# Old projects might import these names:
-prepare_inputs = prepare_employee_context  # legacy alias
+    if wait_df_emp is None or wait_df_emp.empty:
+        return False
+    if "effectivedate" not in wait_df_emp.columns or "waitperiod" not in wait_df_emp.columns:
+        return False
+    s = pd.to_datetime(wait_df_emp["effectivedate"], errors="coerce").dt.date
+    d = pd.to_numeric(wait_df_emp["waitperiod"], errors="coerce").fillna(0).astype(int)
+    e = s + pd.to_timedelta((d.clip(lower=0) - 1).astype(int), unit="D")
+    e = e.where(d > 0, s - timedelta(days=1))  # 0-day → non-wait
+    return bool(((e >= ms) & (s <= me)).any())
