@@ -1,261 +1,398 @@
-# aca_pdf.py — simple AcroForm filling for 1095-C
+# aca_pdf.py
 from __future__ import annotations
 
 import io
-import logging
 import re
-from typing import Dict, Optional, List
+from typing import Dict, List, Optional, Any, Tuple
 
 import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
-from PyPDF2.generic import (
-    NameObject,
-    BooleanObject,
-    TextStringObject,
-    DictionaryObject,
-    IndirectObject,
-)
+from PyPDF2.generic import NameObject, BooleanObject
 
-logger = logging.getLogger("pdf")
 
-# Try to use shared helpers if available, else provide minimal fallbacks
-try:
-    from aca_processing import MONTHS as _MONTHS, _coerce_str as _COERCE
-except Exception:  # fallback to safe defaults
-    _MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sept","Oct","Nov","Dec"]
-    def _COERCE(x): 
-        return "" if (x is None) else str(x).strip()
+# ===========================
+# Shared helpers / constants
+# ===========================
 
-MONTHS = _MONTHS
+MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
-# ---- Explicit field maps per your spec ----
-LINE14_FIELDS: Dict[str, str] = {
-    "Jan": "f1_18[0]", "Feb": "f1_19[0]", "Mar": "f1_20[0]", "Apr": "f1_21[0]",
-    "May": "f1_22[0]", "Jun": "f1_23[0]", "Jul": "f1_24[0]", "Aug": "f1_25[0]",
-    "Sept": "f1_26[0]", "Oct": "f1_27[0]", "Nov": "f1_28[0]", "Dec": "f1_29[0]",
+# Line 14 text fields (per month)
+LINE14_FIELDS = {
+    "Jan": "f1_18[0]",
+    "Feb": "f1_19[0]",
+    "Mar": "f1_20[0]",
+    "Apr": "f1_21[0]",
+    "May": "f1_22[0]",
+    "Jun": "f1_23[0]",
+    "Jul": "f1_24[0]",
+    "Aug": "f1_25[0]",
+    "Sep": "f1_26[0]",
+    "Oct": "f1_27[0]",
+    "Nov": "f1_28[0]",
+    "Dec": "f1_29[0]",
 }
 
-LINE16_FIELDS: Dict[str, Optional[str]] = {
-    "Jan": "f1_44[0]", "Feb": "f1_45[0]", "Mar": "f1_46[0]", "Apr": "f1_47[0]",
-    "May": "f1_48[0]", "Jun": "f1_49[0]", "Jul": "f1_50[0]", "Aug": "f1_51[0]",
-    # Sep–Dec intentionally blank:
-    "Sept": None, "Oct": None, "Nov": None, "Dec": None,
+# Line 16 text fields (per month) — you said Sep–Dec blank
+LINE16_FIELDS = {
+    "Jan": "f1_44[0]",
+    "Feb": "f1_45[0]",
+    "Mar": "f1_46[0]",
+    "Apr": "f1_47[0]",
+    "May": "f1_48[0]",
+    "Jun": "f1_49[0]",
+    "Jul": "f1_50[0]",
+    "Aug": "f1_51[0]",
 }
 
-# Part I (per your latest mapping)
-FIELD_FIRST = "f1_1[0]"
+# Part I: name/SSN fields
+FIELD_FIRST  = "f1_1[0]"
 FIELD_MIDDLE = "f1_2[0]"
-FIELD_LAST = "f1_3[0]"
-FIELD_SSN_LAST4 = "f1_4[0]"  # your form expects last-4 here
+FIELD_LAST   = "f1_3[0]"
+FIELD_SSN    = "f1_4[0]"
 
-# ---------------- utilities ----------------
+# Part I: address fields (Line 3–6)
+FIELD_STREET = "f1_5[0]"  # Street address (including apartment no.)
+FIELD_CITY   = "f1_6[0]"  # City or town
+FIELD_STATE  = "f1_7[0]"  # State or province
+FIELD_COUNTRY_ZIP = "f1_8[0]"  # Country and ZIP or foreign postal code
 
-def _resolve(obj):
-    """Return underlying object if IndirectObject, else obj."""
-    try:
-        if isinstance(obj, IndirectObject):
-            return obj.get_object()
-    except Exception:
-        pass
-    return obj
+# ------------------------------
+# Part III (Covered Individuals)
+# ------------------------------
+PART3_MAP: Dict[int, Dict[str, Any]] = {
+    1: {'name': 'f3_76[0]',  'ssn': 'f3_77[0]', 'dob': 'f3_77[0]', 'all12': 'c3_55[0]',
+        'months': {'Jan': 'c3_56[0]','Feb': 'c3_57[0]','Mar': 'c3_58[0]','Apr': 'c3_59[0]',
+                   'May': 'c3_60[0]','Jun': 'c3_61[0]','Jul': 'c3_62[0]','Aug': 'c3_63[0]',
+                   'Sep': 'c3_64[0]','Oct': 'c3_65[0]','Nov': 'c3_66[0]','Dec': 'c3_67[0]'}},
+    2: {'name': 'f3_89[0]',  'ssn': 'f3_90[0]', 'dob': 'f3_90[0]', 'all12': 'c3_68[0]',
+        'months': {'Jan': 'c3_69[0]','Feb': 'c3_70[0]','Mar': 'c3_71[0]','Apr': 'c3_72[0]',
+                   'May': 'c3_73[0]','Jun': 'c3_74[0]','Jul': 'c3_75[0]','Aug': 'c3_86[0]',
+                   'Sep': 'c3_87[0]','Oct': 'c3_88[0]','Nov': 'c3_101[0]','Dec': 'c3_102[0]'}},
+    3: {'name': 'f3_92[0]',  'ssn': 'f3_93[0]', 'dob': 'f3_93[0]', 'all12': 'c3_81[0]',
+        'months': {'Jan': 'c3_82[0]','Feb': 'c3_83[0]','Mar': 'c3_84[0]','Apr': 'c3_85[0]',
+                   'May': 'c3_96[0]','Jun': 'c3_97[0]','Jul': 'c3_98[0]','Aug': 'c3_99[0]',
+                   'Sep': 'c3_100[0]','Oct': 'c3_113[0]','Nov': 'c3_114[0]','Dec': 'c3_115[0]'}},
+    4: {'name': 'f3_95[0]',  'ssn': 'f3_96[0]', 'dob': 'f3_96[0]', 'all12': 'c3_94[0]',
+        'months': {'Jan': 'c3_95[0]','Feb': 'c3_108[0]','Mar': 'c3_109[0]','Apr': 'c3_110[0]',
+                   'May': 'c3_111[0]','Jun': 'c3_112[0]','Jul': 'c3_125[0]','Aug': 'c3_126[0]',
+                   'Sep': 'c3_127[0]','Oct': 'c3_128[0]','Nov': 'c3_129[0]','Dec': 'c3_130[0]'}},
+    5: {'name': 'f3_98[0]',  'ssn': 'f3_99[0]', 'dob': 'f3_99[0]', 'all12': 'c3_107[0]',
+        'months': {'Jan': 'c3_120[0]','Feb': 'c3_121[0]','Mar': 'c3_122[0]','Apr': 'c3_123[0]',
+                   'May': 'c3_124[0]','Jun': 'c3_137[0]','Jul': 'c3_138[0]','Aug': 'c3_139[0]',
+                   'Sep': 'c3_140[0]','Oct': 'c3_141[0]','Nov': 'c3_142[0]','Dec': 'c3_143[0]'}},
+    6: {'name': 'f3_102[0]','ssn': 'f3_103[0]','dob': 'f3_104[0]','all12': 'c3_116[0]',
+        'months': {'Jan': 'c3_117[0]','Feb': 'c3_118[0]','Mar': 'c3_119[0]','Apr': 'c3_131[0]',
+                   'May': 'c3_132[0]','Jun': 'c3_133[0]','Jul': 'c3_134[0]','Aug': 'c3_135[0]',
+                   'Sep': 'c3_136[0]','Oct': 'c3_147[0]','Nov': 'c3_148[0]','Dec': 'c3_149[0]'}},
+    7: {'name': 'f3_105[0]','ssn': 'f3_106[0]','dob': 'f3_106[0]','all12': 'c3_150[0]',
+        'months': {'Jan': 'c3_151[0]','Feb': 'c3_152[0]','Mar': 'c3_153[0]','Apr': 'c3_154[0]',
+                   'May': 'c3_155[0]','Jun': 'c3_156[0]','Jul': 'c3_157[0]','Aug': 'c3_158[0]',
+                   'Sep': 'c3_159[0]','Oct': 'c3_160[0]','Nov': 'c3_161[0]','Dec': 'c3_162[0]'}},
+    8: {'name': 'f3_109[0]','ssn': 'f3_110[0]','dob': 'f3_110[0]','all12': 'c3_163[0]',
+        'months': {'Jan': 'c3_164[0]','Feb': 'c3_165[0]','Mar': 'c3_166[0]','Apr': 'c3_167[0]',
+                   'May': 'c3_168[0]','Jun': 'c3_169[0]','Jul': 'c3_170[0]','Aug': 'c3_171[0]',
+                   'Sep': 'c3_172[0]','Oct': 'c3_173[0]','Nov': 'c3_174[0]','Dec': 'c3_175[0]'}},
+    9: {'name': 'f3_118[0]','ssn': 'f3_119[0]','dob': 'f3_119[0]','all12': 'c3_138[0]',
+        'months': {'Jan': 'c3_139[0]','Feb': 'c3_140[0]','Mar': 'c3_141[0]','Apr': 'c3_142[0]',
+                   'May': 'c3_143[0]','Jun': 'c3_144[0]','Jul': 'c3_145[0]','Aug': 'c3_146[0]',
+                   'Sep': 'c3_148[0]','Oct': 'c3_149[0]','Nov': 'c3_150[0]','Dec': 'c3_151[0]'}},
+}
 
-def _set_text_by_name(reader: PdfReader, field_name: str, value: Optional[str]):
-    """Set /V for a named text field across the whole document (no error if missing)."""
-    if not field_name:
-        return
-    val = TextStringObject("" if value is None else str(value))
-    for page in reader.pages:
-        p = _resolve(page)
-        anns = _resolve(p.get("/Annots"))
-        if not anns:
-            continue
-        for a in anns:
-            annot = _resolve(a)
-            if _resolve(annot.get("/T")) == field_name:
-                annot.update({NameObject("/V"): val})
 
-def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    """Return the first existing column matching any candidate (case/space-insensitive)."""
-    norm = {re.sub(r"\W+", "", c).lower(): c for c in df.columns}
-    for cand in candidates:
-        key = re.sub(r"\W+", "", cand).lower()
-        if key in norm:
-            return norm[key]
+# ======================
+# Field filling helpers
+# ======================
+
+def _norm(s: str) -> str:
+    return re.sub(r"\W+", "", (s or "")).lower()
+
+def _pick(df_or_index, candidates: List[str]) -> Optional[str]:
+    cols = list(df_or_index) if not hasattr(df_or_index, "columns") else df_or_index.columns
+    norm = {_norm(c): c for c in cols}
+    for c in candidates:
+        k = _norm(c)
+        if k in norm:
+            return norm[k]
     return None
 
-def _norm_month(m: str) -> str:
-    s = (m or "").strip()
-    if not s:
+def _split_name(first: str, middle: str, last: str, full: str) -> Tuple[str,str,str]:
+    first = (first or "").strip()
+    middle = (middle or "").strip()
+    last = (last or "").strip()
+    full = (full or "").strip()
+    if first or last:
+        return first, middle, last
+    if full:
+        parts = [p for p in re.split(r"\s+", full) if p]
+        if len(parts) == 1:
+            return parts[0], "", ""
+        if len(parts) == 2:
+            return parts[0], "", parts[1]
+        return parts[0], " ".join(parts[1:-1]), parts[-1]
+    return "", "", ""
+
+def _extract_name_from_row(row: pd.Series) -> Tuple[str,str,str]:
+    fn = row.get(_pick(row.index, ["FirstName","First","Given"]))
+    mi = row.get(_pick(row.index, ["Middle","MiddleInitial","MI"]))
+    ln = row.get(_pick(row.index, ["LastName","Last","Surname"]))
+    full = row.get(_pick(row.index, ["Name","FullName","Employee Name"]))
+    return _split_name(str(fn or ""), str(mi or ""), str(ln or ""), str(full or ""))
+
+def _extract_ssn(row: pd.Series) -> str:
+    ssn_col = _pick(row.index, ["SSN","TIN","SSN/TIN"])
+    if not ssn_col:
         return ""
-    s = s.title().replace("Sept.", "Sept").replace("Sep", "Sept")
-    if s in {"All 12 Months", "All", "All12"}:
-        return "All"
-    # normalize full month names to our 3/4-letter keys
-    full2short = {
-        "January":"Jan","February":"Feb","March":"Mar","April":"Apr","May":"May",
-        "June":"Jun","July":"Jul","August":"Aug","September":"Sept",
-        "October":"Oct","November":"Nov","December":"Dec",
+    return str(row.get(ssn_col) or "").strip()
+
+def _extract_address(row: pd.Series) -> Dict[str,str]:
+    street = str(row.get(_pick(row.index, ["Address","Address1","Street","Street Address"])) or "").strip()
+    apt    = str(row.get(_pick(row.index, ["Address2","Apt","Apartment"])) or "").strip()
+    if apt and apt.lower() not in {"nan", "none"}:
+        street_out = f"{street} {apt}".strip()
+    else:
+        street_out = street
+
+    city   = str(row.get(_pick(row.index, ["City","City/Town"])) or "").strip()
+    state  = str(row.get(_pick(row.index, ["State","Province","State/Province"])) or "").strip()
+    zipc   = str(row.get(_pick(row.index, ["ZIP","Zip","Postal","PostalCode","ZIP Code"])) or "").strip()
+    cntry  = str(row.get(_pick(row.index, ["Country","Nation"])) or "").strip()
+
+    # The form has "Country and ZIP (or foreign postal)" as one field.
+    cz = " ".join([x for x in [cntry, zipc] if x]).strip()
+    return {
+        "street": street_out,
+        "city": city,
+        "state": state,
+        "country_zip": cz,
     }
-    return full2short.get(s, s)
 
-def _extract_last4_ssn(raw: str) -> str:
-    if not raw:
-        return ""
-    digits = "".join(ch for ch in raw if ch.isdigit())
-    if len(digits) >= 4:
-        return digits[-4:]
-    # also accept masked strings like XXX-XX-1234 -> keep last 4
-    m = re.search(r"(\d{4})\s*$", raw)
-    return m.group(1) if m else raw[-4:]
+def _extract_line_codes(final_df_emp: Optional[pd.DataFrame]) -> Tuple[Dict[str,str], Dict[str,str]]:
+    l14: Dict[str,str] = {m: "" for m in MONTHS}
+    l16: Dict[str,str] = {m: "" for m in MONTHS}
+    if final_df_emp is None or final_df_emp.empty:
+        return l14, l16
 
-def _copy_acroform_and_pages(reader: PdfReader) -> PdfWriter:
+    col_month = _pick(final_df_emp, ["Month","Months","Coverage Month","Period"])
+    col_l14 = _pick(final_df_emp, ["Line14_Final","Line14","Line 14","L14","Line 14 Code"])
+    col_l16 = _pick(final_df_emp, ["Line16_Final","Line16","Line 16","L16","Line 16 Code"])
+    if not col_month:
+        return l14, l16
+
+    for _, r in final_df_emp.iterrows():
+        month_val = str(r.get(col_month) or "").strip()
+        v14 = str(r.get(col_l14) or "").strip() if col_l14 else ""
+        v16 = str(r.get(col_l16) or "").strip() if col_l16 else ""
+
+        if _norm(month_val) in {"all12months", "all12"}:
+            for m in MONTHS:
+                if v14: l14[m] = v14
+                if v16: l16[m] = v16
+            continue
+
+        for m in MONTHS:
+            if _norm(month_val) == _norm(m):
+                if v14: l14[m] = v14
+                if v16: l16[m] = v16
+                break
+
+    return l14, l16
+
+def _extract_part3_rows_from_excel(
+    sheets: Optional[Dict[str, pd.DataFrame]],
+    employee_id: str,
+    emp_fullname: str
+) -> List[Dict[str, Any]]:
     """
-    Create a PdfWriter, copy pages, and clone AcroForm safely.
+    Row 1 = employee; 2..9 = dependents.
     """
-    writer = PdfWriter()
+    def _month_flags(row: pd.Series) -> Dict[str, bool]:
+        out = {m: False for m in MONTHS}
+        all12_col = _pick(row.index, ["All 12 Months","All12Months","All12"])
+        all12 = False
+        if all12_col:
+            v = row.get(all12_col)
+            all12 = str(v).strip().lower() in {"1","true","yes","y","x"}
+        for m in MONTHS:
+            col = _pick(row.index, [m, m.upper(), m.capitalize()])
+            if col and pd.notna(row.get(col)):
+                out[m] = str(row.get(col)).strip().lower() in {"1","true","yes","y","x"}
+        if all12:
+            out = {m: True for m in MONTHS}
+        return out
 
-    # 1) copy pages (use original PageObject; do not resolve to raw dict)
-    for p in reader.pages:
-        writer.add_page(p)
+    def _name_from_row(row: pd.Series) -> str:
+        nm = str(row.get(_pick(row.index, ["Name","FullName"])) or "").strip()
+        if nm:
+            return nm
+        fn, mi, ln = _extract_name_from_row(row)
+        return " ".join([x for x in [fn, mi, ln] if x])
 
-    # 2) copy AcroForm (resolved) + set NeedAppearances, remove XFA if present
-    root = _resolve(reader.trailer.get("/Root"))
-    acro = _resolve(root.get("/AcroForm")) if isinstance(root, dict) else None
-    if isinstance(acro, dict):
-        acro_copy = DictionaryObject()
-        for k, v in acro.items():
-            if str(k) == "/XFA":
+    def _ids_from_row(row: pd.Series) -> Dict[str,str]:
+        ssn_col = _pick(row.index, ["SSN","TIN","SSN/TIN"])
+        dob_col = _pick(row.index, ["DOB","Date of Birth","BirthDate","Birth"])
+        return {
+            "ssn": str(row.get(ssn_col) or "").strip() if ssn_col else "",
+            "dob": str(row.get(dob_col) or "").strip() if dob_col else "",
+        }
+
+    rows: List[Dict[str, Any]] = []
+    if not sheets:
+        return rows
+
+    # Employee (row 1)
+    emp = None
+    for sh in ["Emp Enrollment","Employee Enrollment","Employee Coverage","Enrollment"]:
+        df = sheets.get(sh)
+        if df is None or df.empty:
+            continue
+        col_empid = _pick(df, ["EmployeeID","EmpID","Employee Id"])
+        if not col_empid:
+            continue
+        sel = df[df[col_empid].astype(str).str.strip() == str(employee_id).strip()]
+        if not sel.empty:
+            emp = sel.iloc[0]
+            break
+
+    if emp is not None:
+        rows.append({
+            "name": _name_from_row(emp) or emp_fullname,
+            "ssn": _ids_from_row(emp)["ssn"],
+            "dob": _ids_from_row(emp)["dob"],
+            "months": _month_flags(emp),
+        })
+    else:
+        rows.append({"name": emp_fullname, "ssn": "", "dob": "", "months": {m: False for m in MONTHS}})
+
+    # Dependents (rows 2..9)
+    dep_df = None
+    for sh in ["Dep Enrollment","Dependents","Dependent Enrollment","Covered Individuals"]:
+        df = sheets.get(sh)
+        if df is None or df.empty:
+            continue
+        col_empid = _pick(df, ["EmployeeID","EmpID","Employee Id"])
+        if not col_empid:
+            continue
+        view = df[df[col_empid].astype(str).str.strip() == str(employee_id).strip()]
+        if not view.empty:
+            dep_df = view
+            break
+
+    if dep_df is not None and not dep_df.empty:
+        for _, drow in dep_df.iterrows():
+            nm = _name_from_row(drow)
+            if not nm:
                 continue
-            acro_copy[NameObject(k)] = v  # safe to reference, then add_object below
-        acro_copy.update({NameObject("/NeedAppearances"): BooleanObject(True)})
-        acro_ref = writer._add_object(acro_copy)
-        writer._root_object.update({NameObject("/AcroForm"): acro_ref})
-    return writer
+            ids = _ids_from_row(drow)
+            rows.append({"name": nm, "ssn": ids["ssn"], "dob": ids["dob"], "months": _month_flags(drow)})
 
-# ---------------- core API ----------------
+    return rows[:9]
+
+
+def _part3_rows_to_field_values(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    fields: Dict[str, Any] = {}
+    for idx, data in enumerate(rows, start=1):
+        if idx not in PART3_MAP:
+            break
+        m = PART3_MAP[idx]
+        # Name
+        fields[m["name"]] = data.get("name","")
+
+        # SSN or DOB
+        ssn = (data.get("ssn") or "").strip()
+        dob = (data.get("dob") or "").strip()
+        if ssn:
+            fields[m["ssn"]] = ssn
+        elif dob:
+            fields[m["dob"]] = dob
+
+        months = data.get("months") or {}
+        if months and all(months.get(mn, False) for mn in MONTHS) and m.get("all12"):
+            fields[m["all12"]] = "/Yes"
+        for mn, fname in m["months"].items():
+            if months.get(mn, False):
+                fields[fname] = "/Yes"
+    return fields
+
+
+def _fill_acroform(pdf_bytes: bytes, field_values: Dict[str, Any]) -> bytes:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+
+    if "/AcroForm" in writer._root_object:
+        acro = writer._root_object["/AcroForm"]
+        acro.update({NameObject("/NeedAppearances"): BooleanObject(True)})
+
+    for page in writer.pages:
+        writer.update_page_form_field_values(page, field_values)
+
+    buf = io.BytesIO()
+    writer.write(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ===========================
+# Public: main fill function
+# ===========================
 
 def fill_pdf_for_employee(
     pdf_bytes: bytes,
     emp_row: pd.Series,
-    final_df_emp: pd.DataFrame,
+    final_df_emp: Optional[pd.DataFrame],
     year_used: int,
-    emp_enroll_emp: Optional[pd.DataFrame] = None,
-    dep_enroll_emp: Optional[pd.DataFrame] = None,
+    sheets: Optional[Dict[str, pd.DataFrame]] = None,
 ):
     """
-    Fill 1095-C using explicit AcroForm field names you provided.
-
     Returns:
-      (editable_name, editable_io, flat_name, flat_io)
+      (editable_name: str, editable_bytes: BytesIO,
+       flat_name: str, flat_bytes: BytesIO)
     """
-    if not isinstance(pdf_bytes, (bytes, bytearray)):
-        raise ValueError("pdf_bytes must be raw bytes")
+    # Part I — names & SSN
+    first, middle, last = _extract_name_from_row(emp_row)
+    ssn = _extract_ssn(emp_row)
+    full_name = " ".join([x for x in [first, middle, last] if x])
 
-    reader = PdfReader(io.BytesIO(pdf_bytes))
+    # Part I — address
+    addr = _extract_address(emp_row)
 
-    # ---- Part I: First / Middle / Last / SSN last-4 ----
-    first = _COERCE(emp_row.get("firstname"))
-    middle = _COERCE(emp_row.get("middleinitial"))
-    last = _COERCE(emp_row.get("lastname"))
-    ssn_raw = _COERCE(emp_row.get("ssn"))
-    ssn_last4 = _extract_last4_ssn(ssn_raw)
+    field_values: Dict[str, Any] = {
+        FIELD_FIRST: first,
+        FIELD_MIDDLE: middle,
+        FIELD_LAST: last,
+        FIELD_SSN: ssn,
+        FIELD_STREET: addr["street"],
+        FIELD_CITY: addr["city"],
+        FIELD_STATE: addr["state"],
+        FIELD_COUNTRY_ZIP: addr["country_zip"],
+    }
 
-    _set_text_by_name(reader, FIELD_FIRST, first)
-    _set_text_by_name(reader, FIELD_MIDDLE, middle)
-    _set_text_by_name(reader, FIELD_LAST, last)
-    _set_text_by_name(reader, FIELD_SSN_LAST4, ssn_last4)
+    # Line 14 + Line 16
+    l14, l16 = _extract_line_codes(final_df_emp)
+    for m in MONTHS:
+        f = LINE14_FIELDS.get(m)
+        if f:
+            field_values[f] = l14.get(m, "")
+    for m in LINE16_FIELDS.keys():
+        f = LINE16_FIELDS.get(m)
+        if f:
+            field_values[f] = l16.get(m, "")
 
-    # ---- Part II: Line 14 & Line 16 from final_df_emp ----
-    if final_df_emp is None or final_df_emp.empty:
-        logger.warning("final_df_emp is empty — Line 14/16 will remain blank")
-    else:
-        col_month = _pick_col(final_df_emp, ["Month", "Months", "Coverage Month", "Period"])
-        col_l14   = _pick_col(final_df_emp, ["Line14_Final","Line 14","Line14","L14","Line 14 Code"])
-        col_l16   = _pick_col(final_df_emp, ["Line16_Final","Line 16","Line16","L16","Line 16 Code"])
+    # Part III
+    emp_id_col = _pick(emp_row.index, ["EmployeeID","EmpID","Employee Id"]) or ""
+    employee_id = str(emp_row.get(emp_id_col) or "").strip()
+    part3_rows = _extract_part3_rows_from_excel(sheets, employee_id, full_name)
+    if part3_rows:
+        field_values.update(_part3_rows_to_field_values(part3_rows))
 
-        if not col_month:
-            logger.warning("No Month/Months column found; skipping Line 14/16 population")
-        else:
-            # build month->code maps (with All 12 Months backfill)
-            codes14: Dict[str, str] = {}
-            codes16: Dict[str, str] = {}
-            all14 = None
-            all16 = None
+    # Write
+    out_bytes = _fill_acroform(pdf_bytes, field_values)
+    editable_name = f"1095c_{employee_id}.pdf" if employee_id else "1095c.pdf"
+    flat_name = editable_name  # same bytes; NeedAppearances set
 
-            for _, r in final_df_emp.iterrows():
-                m = _norm_month(_COERCE(r.get(col_month)))
-                v14 = _COERCE(r.get(col_l14)) if col_l14 else ""
-                v16 = _COERCE(r.get(col_l16)) if col_l16 else ""
-
-                if m == "All":
-                    if v14: all14 = v14
-                    if v16: all16 = v16
-                    continue
-                if m in MONTHS:
-                    if v14: codes14[m] = v14
-                    if v16: codes16[m] = v16
-
-            # backfill All-12 if specific month missing
-            if all14:
-                for m in MONTHS:
-                    codes14.setdefault(m, all14)
-            if all16:
-                for m in MONTHS:
-                    codes16.setdefault(m, all16)
-
-            # write Line 14 into its explicit fields
-            for m in MONTHS:
-                target = LINE14_FIELDS.get(m)
-                if not target:
-                    continue
-                val = codes14.get(m, "")
-                _set_text_by_name(reader, target, val)
-
-            # write Line 16 into Jan–Aug fields only (Sep–Dec intentionally blank)
-            for m in MONTHS:
-                target = LINE16_FIELDS.get(m)
-                if not target:
-                    continue  # None means leave blank
-                val = codes16.get(m, "")
-                _set_text_by_name(reader, target, val)
-
-    # ---- write out with AcroForm preserved ----
-    writer = _copy_acroform_and_pages(reader)
-    out = io.BytesIO()
-    writer.write(out)
-    out.seek(0)
-    pdf_bytes_out = out.getvalue()
-
-    empid = _COERCE(emp_row.get("employeeid")) or "employee"
-    editable_name = f"1095c_editable_{empid}.pdf"
-    flat_name = f"1095c_{empid}.pdf"
-
-    # We return both as BytesIO for compatibility with your existing FastAPI handler
     return (
-        editable_name, io.BytesIO(pdf_bytes_out),
-        flat_name, io.BytesIO(pdf_bytes_out),
+        editable_name,
+        io.BytesIO(out_bytes),
+        flat_name,
+        io.BytesIO(out_bytes),
     )
-
-# ---------------- Excel bundling (unchanged API) ----------------
-
-def save_excel_outputs(
-    interim: pd.DataFrame,
-    final: pd.DataFrame,
-    year: int,
-    penalty_dashboard: Optional[pd.DataFrame] = None,
-) -> bytes:
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        wrote = False
-        if final is not None and not final.empty:
-            final.to_excel(xw, index=False, sheet_name=f"Final {year}"); wrote = True
-        if interim is not None and not interim.empty:
-            interim.to_excel(xw, index=False, sheet_name=f"Interim {year}"); wrote = True
-        if penalty_dashboard is not None and not penalty_dashboard.empty:
-            penalty_dashboard.to_excel(xw, index=False, sheet_name=f"Penalty Dashboard {year}"); wrote = True
-        if not wrote:
-            pd.DataFrame({"Info":[f"No output for year {year}"]}).to_excel(
-                xw, index=False, sheet_name="Info"
-            )
-    buf.seek(0)
-    return buf.getvalue()
