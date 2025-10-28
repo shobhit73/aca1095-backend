@@ -1,277 +1,251 @@
 # aca_processing.py
 from __future__ import annotations
 
-from typing import Optional, Tuple, Dict, List, Any
 import io
-import calendar
+from datetime import date, timedelta
+from typing import Dict, Tuple, Iterable, List
 import pandas as pd
 
-from debug_logging import get_logger, log_time
-import aca_builder as builder
-from aca_pdf import save_excel_outputs, fill_pdf_for_employee
-
+from debug_logging import get_logger, log_df, log_call
 log = get_logger("processing")
 
+# ----------------- Month labels -----------------
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 FULL_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
+# ----------------- Utilities -----------------
+def _coerce_str(x) -> str:
+    try:
+        return str(x)
+    except Exception:
+        return ""
 
-# -------------------------
-# Helpers
-# -------------------------
+def month_bounds(year: int, month: int) -> Tuple[date, date]:
+    import calendar
+    last = calendar.monthrange(year, month)[1]
+    return date(year, month, 1), date(year, month, last)
 
-def month_bounds(year: int, m: int):
-    last = calendar.monthrange(year, m)[1]
-    return pd.Timestamp(year, m, 1).date(), pd.Timestamp(year, m, last).date()
-
-def _find_sheet(xls: pd.ExcelFile, candidates: List[str]) -> Optional[str]:
-    names = xls.sheet_names
-    lc_map = {n.lower().strip(): n for n in names}
-    for c in candidates:
-        if c in names:
-            return c
-        if c.lower().strip() in lc_map:
-            return lc_map[c.lower().strip()]
-    # contains-like
-    for n in names:
-        ln = n.lower()
-        for c in candidates:
-            if c.lower() in ln:
-                return n
-    return None
-
-def _read_sheet(xls: pd.ExcelFile, candidates: List[str]) -> pd.DataFrame:
-    name = _find_sheet(xls, candidates)
-    if not name:
-        return pd.DataFrame()
-    return pd.read_excel(xls, sheet_name=name)
-
-def choose_report_year(emp_elig_df: pd.DataFrame) -> Optional[int]:
+# ----------------- Excel I/O -----------------
+@log_call(log)
+def load_excel(excel_bytes: bytes) -> Dict[str, pd.DataFrame]:
     """
-    Infer a filing year if the frontend didn't provide one.
-    Priority: eligibility start/end -> enrollment start/end -> status dates.
+    Read supported sheets (case-insensitive).
+    Missing sheets return empty DataFrames.
     """
-    def _year_from(df: pd.DataFrame, cols: List[str]) -> Optional[int]:
-        for c in cols:
-            if c in df.columns:
-                try:
-                    ys = pd.to_datetime(df[c], errors="coerce").dt.year.dropna().astype(int)
-                    if not ys.empty:
-                        # Pick most frequent to stabilize
-                        return int(ys.mode().iloc[0])
-                except Exception:
-                    pass
+    x = pd.ExcelFile(io.BytesIO(excel_bytes))
+
+    def pick(name: str) -> str | None:
+        for s in x.sheet_names:
+            if s.strip().lower() == name.strip().lower():
+                return s
         return None
 
-    y = _year_from(emp_elig_df, ["eligibilitystartdate","EligibilityStartDate","EligibilityEndDate","eligibilityenddate"])
-    return y
+    def read_sheet(name: str) -> pd.DataFrame:
+        sname = pick(name)
+        if not sname:
+            return pd.DataFrame()
+        df = pd.read_excel(x, sname)
+        if df is None:
+            return pd.DataFrame()
+        df.columns = [c.strip().lower().replace(" ", "") for c in df.columns]
+        return df
 
-def _normalize_aliases_for_demo(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    x = df.copy()
-    # common aliases
-    rename = {}
-    for c in x.columns:
-        lc = str(c).strip().lower()
-        if lc in ("employee id","empid","emp id","id"):
-            rename[c] = "EmployeeID"
-        elif lc in ("first name","firstname","fname"):
-            rename[c] = "FirstName"
-        elif lc in ("middle name","middlename","mname"):
-            rename[c] = "MiddleName"
-        elif lc in ("last name","lastname","lname","surname"):
-            rename[c] = "LastName"
-        elif lc in ("ssn","ssn#","social","socialsecuritynumber"):
-            rename[c] = "SSN"
-        elif lc in ("address1","address line 1","addr1","address"):
-            rename[c] = "Address1"
-        elif lc in ("address2","address line 2","addr2"):
-            rename[c] = "Address2"
-        elif lc in ("city",):
-            rename[c] = "City"
-        elif lc in ("state","province","region"):
-            rename[c] = "State"
-        elif lc in ("zip","postal","zipcode"):
-            rename[c] = "Zip"
-        elif lc in ("statusstartdate","employmentstatusstartdate","estatusstartdate"):
-            rename[c] = "StatusStartDate"
-        elif lc in ("statusenddate","employmentstatusenddate","estatusenddate"):
-            rename[c] = "StatusEndDate"
-        elif lc in ("status","employmentstatus","empstatus","estatus"):
-            rename[c] = "Status"
-        elif lc in ("role","employeerole","emprole"):
-            rename[c] = "Role"
-    x = x.rename(columns=rename)
-    return x
+    data: Dict[str, pd.DataFrame] = {}
+    data["emp_demo"]   = read_sheet("Emp Demographic")
+    data["emp_elig"]   = read_sheet("Emp Eligibility")
+    data["emp_enroll"] = read_sheet("Emp Enrollment")
+    data["dep_enroll"] = read_sheet("Dep Enrollment")
 
+    # Emp Wait Period (exact name)
+    data["emp_wait"]   = read_sheet("Emp Wait Period")  # employeeid, effectivedate, waitperiod
+    w = data["emp_wait"]
+    if not w.empty and "waitperioddays" in w.columns and "waitperiod" not in w.columns:
+        w.rename(columns={"waitperioddays": "waitperiod"}, inplace=True)
 
-# -------------------------
-# Public: Excel -> DataFrames / PDFs
-# -------------------------
-
-def load_excel(input_excel_bytes: bytes) -> Dict[str, pd.DataFrame]:
-    """
-    Load workbook sheets into dataframes with minimal assumptions.
-    """
-    xls = pd.ExcelFile(io.BytesIO(input_excel_bytes))
-    data = {
-        "emp_demo":   _read_sheet(xls, ["Emp Demographic","Employee Demographic","Demographic"]),
-        "emp_elig":   _read_sheet(xls, ["Emp Eligibility","Eligibility"]),
-        "emp_enroll": _read_sheet(xls, ["Emp Enrollment","Enrollment"]),
-        "dep_enroll": _read_sheet(xls, ["Dep Enrollment","Dependent Enrollment","Dependents"]),
-        "emp_wait":   _read_sheet(xls, ["Emp Wait Period","Wait Period","Waiting Period"]),
-    }
+    log.info("load_excel: sheets detected", extra={"extra_data": {"sheets": list(x.sheet_names)}})
     return data
 
-
-def build_outputs_from_excel(input_excel_bytes: bytes, filing_year: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, int]:
+@log_call(log)
+def prepare_inputs(data: Dict[str, pd.DataFrame]) -> tuple[
+    pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame
+]:
     """
-    Returns (interim, final, penalty, year_used)
+    Normalize frames and return them in a fixed order
+    (NO boolean evaluation of DataFrames).
     """
-    with log_time(log, "build_outputs_from_excel"):
-        sheets = load_excel(input_excel_bytes)
-        emp_demo   = sheets["emp_demo"]
-        emp_elig   = sheets["emp_elig"]
-        emp_enroll = sheets["emp_enroll"]
-        dep_enroll = sheets["dep_enroll"]
-        emp_wait   = sheets.get("emp_wait", pd.DataFrame())
+    def _as_df(x) -> pd.DataFrame:
+        return x if isinstance(x, pd.DataFrame) else pd.DataFrame()
 
-        year = int(filing_year) if filing_year else (choose_report_year(emp_elig) or pd.Timestamp.today().year)
+    emp_demo   = _as_df(data.get("emp_demo")).copy()
+    emp_elig   = _as_df(data.get("emp_elig")).copy()
+    emp_enroll = _as_df(data.get("emp_enroll")).copy()
+    dep_enroll = _as_df(data.get("dep_enroll")).copy()
+    emp_wait   = _as_df(data.get("emp_wait")).copy()
 
-        interim = builder.build_interim(emp_demo, emp_elig, emp_enroll, dep_enroll, year, emp_wait=emp_wait)
-        final   = builder.build_final(interim)
-        penalty = builder.build_penalty_dashboard(interim)
+    for df in (emp_demo, emp_elig, emp_enroll, dep_enroll, emp_wait):
+        if not df.empty and "employeeid" in df.columns:
+            df["employeeid"] = df["employeeid"].astype(str)
 
-        return interim, final, penalty, year
+    if not emp_wait.empty:
+        if "effectivedate" in emp_wait.columns:
+            emp_wait["effectivedate"] = pd.to_datetime(emp_wait["effectivedate"], errors="coerce")
+        if "waitperiod" in emp_wait.columns:
+            emp_wait["waitperiod"] = pd.to_numeric(emp_wait["waitperiod"], errors="coerce").fillna(0).astype(int)
 
+    log_df(log, emp_demo, "emp_demo")
+    log_df(log, emp_elig, "emp_elig")
+    log_df(log, emp_enroll, "emp_enroll")
+    log_df(log, dep_enroll, "dep_enroll")
+    log_df(log, emp_wait, "emp_wait")
+    return emp_demo, emp_elig, emp_enroll, dep_enroll, emp_wait
 
-def process_excel_to_workbook(input_excel_bytes: bytes, filing_year: Optional[int] = None) -> Tuple[bytes, Dict[str, Any]]:
+def choose_report_year(emp_elig: pd.DataFrame) -> int:
+    import datetime as _dt
+    if not emp_elig.empty:
+        for c in ("eligibilitystartdate","eligibilityenddate"):
+            if c in emp_elig.columns:
+                s = pd.to_datetime(emp_elig[c], errors="coerce")
+                yr = s.dt.year.dropna()
+                if not yr.empty:
+                    return int(yr.iloc[0])
+    return _dt.date.today().year
+
+# ----------------- Helpers imported by builder -----------------
+def _collect_employee_ids(*frames: Iterable[pd.DataFrame]) -> List[str]:
+    ids: set[str] = set()
+    for df in frames:
+        if isinstance(df, pd.DataFrame) and not df.empty and "employeeid" in df.columns:
+            ids |= set(df["employeeid"].astype(str).tolist())
+    return sorted(ids, key=lambda x: (len(x), x))
+
+def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
     """
-    Build (Interim, Final, Penalty) and return an .xlsx (bytes).
-    Accepts both positional and keyword calls to save_excel_outputs().
+    Normalize employment status from Emp Demographic with robust FT/PT + ACTIVE/TERM detection.
+    - Creates/aligns: statusstartdate, statusenddate
+    - Derives: _role_norm in {"FULLTIME","PARTTIME",""} and _estatus_norm in {"ACTIVE","TERM",""}
+    - Scans MANY column names/values and also numeric heuristics (FTE, hours).
     """
-    interim, final, penalty, year = build_outputs_from_excel(input_excel_bytes, filing_year)
-    # Both positional and keyword supported by save_excel_outputs
-    xlsx_bytes = save_excel_outputs(interim, final, penalty, f"ACA Outputs ({year})")
-    meta = {"year": year, "rows_interim": len(interim), "rows_final": len(final)}
-    return xlsx_bytes, meta
+    if emp_demo is None or emp_demo.empty:
+        return pd.DataFrame(columns=["employeeid","statusstartdate","statusenddate","_role_norm","_estatus_norm"])
 
+    df = emp_demo.copy()
 
-# -------------------------
-# PDF generation utilities
-# -------------------------
+    if "employeeid" in df.columns:
+        df["employeeid"] = df["employeeid"].astype(str)
 
-def _final_maps_for_employee(final_df: pd.DataFrame, employee_id: str) -> Tuple[Dict[int, str], Dict[int, str]]:
+    start_cands = ["statusstartdate","hiredate","startdate","effectivedate","originalhiredate","employmentstartdate"]
+    end_cands   = ["statusenddate","termdate","terminationdate","enddate","separationdate","employmentenddate"]
+
+    def _first(cols):
+        for c in cols:
+            if c in df.columns: return c
+        return None
+
+    s_col = _first(start_cands)
+    e_col = _first(end_cands)
+
+    if s_col and s_col != "statusstartdate":
+        df.rename(columns={s_col: "statusstartdate"}, inplace=True)
+    elif "statusstartdate" not in df.columns:
+        df["statusstartdate"] = pd.NaT
+
+    if e_col and e_col != "statusenddate":
+        df.rename(columns={e_col: "statusenddate"}, inplace=True)
+    elif "statusenddate" not in df.columns:
+        df["statusenddate"] = pd.NaT
+
+    for c in ("statusstartdate","statusenddate"):
+        df[c] = pd.to_datetime(df[c], errors="coerce")
+
+    # ACTIVE / TERM
+    status_cands = ["employeestatus","status","employmentstatus","workstatus","jobstatus"]
+    present_stat = [c for c in status_cands if c in df.columns]
+
+    def detect_estatus(row) -> str:
+        for c in present_stat:
+            val = str(row.get(c, "")).upper()
+            if any(t in val for t in ("TERM", "TERMINAT", "SEPARAT", "ENDED", "INACTIVE")):
+                return "TERM"
+            if any(t in val for t in ("ACTIVE", "EMPLOY", "HIRED", "CURRENT")):
+                return "ACTIVE"
+        return ""
+
+    # FT/PT (names + values + numerics)
+    name_ftpt_keywords = ("FT", "FULL", "PART", "PT", "FTE", "HOUR", "STDHOUR", "STANDARDHOUR", "WEEKLYHOUR")
+    role_like_cols = [c for c in df.columns if any(k in c.upper() for k in name_ftpt_keywords)]
+
+    role_cands = set(role_like_cols) | set([
+        "role","ftpt","ft_pt","employmenttype","employeetype","employeeclass","jobclass",
+        "employmentcategory","fulltimeparttime","fte_status","fte","positiontype",
+        "classification","class","standardhours","hoursperweek","avgweeklyhours","weeklyhours"
+    ])
+    role_cands = [c for c in role_cands if c in df.columns]
+
+    FT_STR_TOKENS = ("FULL-TIME","FULLTIME"," FULL"," F/T"," F T"," FT","REGULAR FULL","SALARIED FULL","RFT")
+    PT_STR_TOKENS = ("PART-TIME","PARTTIME"," PART"," P/T"," P T"," PT","RPT")
+
+    def is_ft_numeric(val, colname: str) -> bool | None:
+        try:
+            v = float(val)
+        except Exception:
+            return None
+        cu = colname.upper()
+        if "FTE" in cu:
+            return True if v >= 0.75 else (False if v > 0 else None)
+        if any(k in cu for k in ("HOUR","STDHOUR","WEEKLY")):
+            return True if v >= 30 else (False if 0 < v < 30 else None)
+        return None
+
+    def detect_role(row) -> str:
+        for c in role_cands:
+            val = str(row.get(c, "")).upper()
+            if any(t in val for t in FT_STR_TOKENS): return "FULLTIME"
+            if any(t in val for t in PT_STR_TOKENS): return "PARTTIME"
+        for c in role_cands:
+            res = is_ft_numeric(row.get(c, None), c)
+            if res is True:  return "FULLTIME"
+            if res is False: return "PARTTIME"
+        for c in df.columns:
+            val = str(row.get(c, "")).strip().upper()
+            if val == "FT": return "FULLTIME"
+            if val == "PT": return "PARTTIME"
+        return ""
+
+    df["_role_norm"] = df.apply(detect_role, axis=1)
+    df["_estatus_norm"] = df.apply(detect_estatus, axis=1)
+
+    return df[["employeeid","statusstartdate","statusenddate","_role_norm","_estatus_norm"]]
+
+def _any_overlap(df: pd.DataFrame, start_col: str, end_col: str, ms: date, me: date, *, mask=None) -> bool:
+    if df is None or df.empty or start_col not in df.columns or end_col not in df.columns:
+        return False
+    if mask is None:
+        mask = pd.Series(True, index=df.index)
+    s = pd.to_datetime(df[start_col], errors="coerce").dt.date.fillna(date(1900,1,1))
+    e = pd.to_datetime(df[end_col], errors="coerce").dt.date.fillna(date(9999,12,31))
+    return bool(((e >= ms) & (s <= me) & mask).any())
+
+def _all_month(df: pd.DataFrame, start_col: str, end_col: str, ms: date, me: date, *, mask=None) -> bool:
+    if df is None or df.empty or start_col not in df.columns or end_col not in df.columns:
+        return False
+    if mask is None:
+        mask = pd.Series(True, index=df.index)
+    s = pd.to_datetime(df[start_col], errors="coerce").dt.date.fillna(date(1900,1,1))
+    e = pd.to_datetime(df[end_col], errors="coerce").dt.date.fillna(date(9999,12,31))
+    return bool((mask & (s <= ms) & (e >= me)).any())
+
+# ---- Wait Period overlap from Emp Wait Period
+def _waiting_in_month(wait_df_emp: pd.DataFrame, ms: date, me: date) -> bool:
     """
-    Extract month -> Line14, month -> Line16 for one employee from Final.
+    True if ANY wait window overlaps the month [ms, me].
+    Each row: start = EffectiveDate, end = start + WaitPeriodDays - 1.
     """
-    row = final_df[final_df["EmployeeID"].astype(str) == str(employee_id)]
-    if row.empty:
-        return {}, {}
-    r = row.iloc[0]
-    l14 = {
-        1: r.get("Jan",""), 2: r.get("Feb",""), 3: r.get("Mar",""), 4: r.get("Apr",""),
-        5: r.get("May",""), 6: r.get("Jun",""), 7: r.get("Jul",""), 8: r.get("Aug",""),
-        9: r.get("Sep",""), 10: r.get("Oct",""), 11: r.get("Nov",""), 12: r.get("Dec",""),
-    }
-    l16 = {
-        1: r.get("Line16_Jan",""), 2: r.get("Line16_Feb",""), 3: r.get("Line16_Mar",""), 4: r.get("Line16_Apr",""),
-        5: r.get("Line16_May",""), 6: r.get("Line16_Jun",""), 7: r.get("Line16_Jul",""), 8: r.get("Line16_Aug",""),
-        9: r.get("Line16_Sep",""), 10: r.get("Line16_Oct",""), 11: r.get("Line16_Nov",""), 12: r.get("Line16_Dec",""),
-    }
-    # Coerce to str
-    l14 = {k: ("" if pd.isna(v) else str(v)) for k,v in l14.items()}
-    l16 = {k: ("" if pd.isna(v) else str(v)) for k,v in l16.items()}
-    return l14, l16
-
-
-def _employee_pi_from_demo(demo_df: pd.DataFrame, employee_id: str) -> Dict[str, str]:
-    """
-    Get Part I (PI) fields from demographic.
-    """
-    if demo_df is None or demo_df.empty:
-        return {"first_name":"","middle_name":"","last_name":"","ssn":"","address1":"","address2":"","city":"","state":"","zip":""}
-    x = _normalize_aliases_for_demo(demo_df)
-    row = x[x["EmployeeID"].astype(str) == str(employee_id)]
-    if row.empty:
-        return {"first_name":"","middle_name":"","last_name":"","ssn":"","address1":"","address2":"","city":"","state":"","zip":""}
-    r = row.iloc[0]
-    return {
-        "first_name": str(r.get("FirstName", "") or ""),
-        "middle_name": str(r.get("MiddleName", "") or ""),
-        "last_name":  str(r.get("LastName", "") or ""),
-        "ssn":        str(r.get("SSN", "") or ""),
-        "address1":   str(r.get("Address1", "") or ""),
-        "address2":   str(r.get("Address2", "") or ""),
-        "city":       str(r.get("City", "") or ""),
-        "state":      str(r.get("State", "") or ""),
-        "zip":        str(r.get("Zip", "") or ""),
-    }
-
-
-def generate_single_pdf_from_excel(
-    *,
-    input_excel_bytes: bytes,
-    blank_pdf_bytes: bytes,
-    employee_id: Optional[str] = None,
-    filing_year: Optional[int] = None,
-    flatten: bool = True
-) -> bytes:
-    """
-    Build outputs, pick employee (given or first), and render one PDF.
-    Accepts both positional and keyword calling styles downstream.
-    """
-    with log_time(log, "generate_single_pdf_from_excel"):
-        interim, final, penalty, year = build_outputs_from_excel(input_excel_bytes, filing_year)
-
-        # Decide employee
-        if employee_id is None:
-            # Pick first EmployeeID from Final to be consistent
-            if final.empty:
-                raise ValueError("No employees found to generate PDF.")
-            employee_id = str(final["EmployeeID"].iloc[0])
-
-        l14_map, l16_map = _final_maps_for_employee(final, str(employee_id))
-        if not l14_map:
-            raise ValueError(f"No Final row found for EmployeeID={employee_id}")
-
-        # Part I payload
-        demo = load_excel(input_excel_bytes)["emp_demo"]
-        employee_pi = _employee_pi_from_demo(demo, str(employee_id))
-
-        # Positional call (backward compatible)
-        flat_bytes, _editable = fill_pdf_for_employee(
-            blank_pdf_bytes, employee_pi, l14_map, l16_map, None, bool(flatten)
-        )
-        return flat_bytes
-
-
-def generate_bulk_pdfs_from_excel(
-    *,
-    input_excel_bytes: bytes,
-    blank_pdf_bytes: bytes,
-    filing_year: Optional[int] = None,
-    flatten: bool = True
-) -> List[Dict[str, Any]]:
-    """
-    Build outputs for all employees and return a list of PDF blobs with names.
-    """
-    with log_time(log, "generate_bulk_pdfs_from_excel"):
-        interim, final, penalty, year = build_outputs_from_excel(input_excel_bytes, filing_year)
-        if final.empty:
-            return []
-
-        demo = load_excel(input_excel_bytes)["emp_demo"]
-        out: List[Dict[str, Any]] = []
-        for _, row in final.iterrows():
-            emp = str(row["EmployeeID"])
-            l14_map, l16_map = _final_maps_for_employee(final, emp)
-            pi = _employee_pi_from_demo(demo, emp)
-            pdf_bytes, _ = fill_pdf_for_employee(
-                blank_pdf_bytes, pi, l14_map, l16_map, None, bool(flatten)
-            )
-            # Safe filename
-            fname = f"1095C_{emp}.pdf"
-            out.append({"employee_id": emp, "filename": fname, "pdf_bytes": pdf_bytes})
-        return out
+    if wait_df_emp is None or wait_df_emp.empty:
+        return False
+    if "effectivedate" not in wait_df_emp.columns or "waitperiod" not in wait_df_emp.columns:
+        return False
+    s = pd.to_datetime(wait_df_emp["effectivedate"], errors="coerce").dt.date
+    d = pd.to_numeric(wait_df_emp["waitperiod"], errors="coerce").fillna(0).astype(int)
+    e = s + pd.to_timedelta((d.clip(lower=0) - 1).astype(int), unit="D")
+    e = e.where(d > 0, s - timedelta(days=1))  # 0-day → non-wait
+    return bool(((e >= ms) & (s <= me)).any())
