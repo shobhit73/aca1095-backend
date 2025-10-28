@@ -1,14 +1,12 @@
 fastapi==0.115.0
 uvicorn==0.30.6            # no [standard]; skips uvloop/watchfiles/httptools
 python-multipart==0.0.9
-
 pandas==2.2.2
 numpy==1.26.4
 openpyxl==3.1.5
 XlsxWriter==3.2.0
-
 PyPDF2==3.0.1
-reportlab==4.0.8           # stable wheel on Linux for py3.11
+reportlab==4.0.8           # stable wheel on Linux for py3.11 (optional; flattening later)
 pydantic==2.9.2
 pydantic-core==2.23.4
 pydantic-settings==2.5.2
