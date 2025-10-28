@@ -82,61 +82,34 @@ def health():
 # ---------- Excel → xlsx (Final/Interim/Penalty) ----------
 @app.post("/process/excel")
 async def process_excel(
-    excel: UploadFile = File(...),
-    filing_year: Optional[int] = Form(None),
-    affordability_threshold: Optional[float] = Form(None),
-    include_penalty_dashboard: str = Form("true"),
-    api_key: str = Depends(_get_api_key),
+    file: UploadFile = File(...),
+    year: Optional[int] = Form(None),
+    x_api_key: str = Header(None)
 ):
-    if not excel.filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Upload a .xlsx file")
-
-    excel_bytes = await excel.read()
-    log.info("process_excel: file received", extra={"extra_data": {"filename": excel.filename}})
-
     try:
-        data = load_excel(excel_bytes)
-        emp_demo, emp_elig, emp_enroll, dep_enroll, emp_wait = prepare_inputs(data)
+        excel_bytes = await file.read()
+        data = load_excel(excel_bytes)                 # returns parsed sheets
+        year_used = year or datetime.now().year
 
-        log_df(log, emp_demo, "emp_demo")
-        log_df(log, emp_elig, "emp_elig")
-        log_df(log, emp_enroll, "emp_enroll")
-        log_df(log, dep_enroll, "dep_enroll")
-        log_df(log, emp_wait, "emp_wait")
+        interim_df = build_interim(data, year_used)    # your existing builder
+        final_df = build_final(interim_df, year_used)  # your existing final
+        penalty_df = build_penalty_dashboard(final_df) # may be None/empty
 
-        year_used = int(filing_year) if filing_year else choose_report_year(emp_elig)
-        log.info("process_excel: chosen year", extra={"extra_data": {"year": year_used}})
+        outputs = {"Interim": interim_df, "Final": final_df}
+        if penalty_df is not None and not penalty_df.empty:
+            outputs["Penalty Dashboard"] = penalty_df
 
-        with log_time(log, "build_interim"):
-            interim_df = build_interim(
-                emp_demo, emp_elig, emp_enroll, dep_enroll,
-                year=year_used,
-                emp_wait=emp_wait,                           # Emp Wait Period
-                affordability_threshold=affordability_threshold,
-            )
-        log_df(log, interim_df, "interim")
+        out_bytes = save_excel_outputs(outputs)        # <-- single dict arg
 
-        final_df = build_final(interim_df)
-        log_df(log, final_df, "final")
-
-        penalty_df = None
-        if include_penalty_dashboard.lower() in {"true", "1", "yes", "y"}:
-            penalty_df = build_penalty_dashboard(interim_df)
-            if penalty_df is not None and not penalty_df.empty:
-                log_df(log, penalty_df, "penalty")
-
-        out_bytes = save_excel_outputs(
-            interim_df, final_df, year_used, penalty_dashboard=penalty_df
+        return StreamingResponse(
+            io.BytesIO(out_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="ACA-Outputs-{year_used}.xlsx"'},
         )
-
-    except HTTPException:
-        raise
     except Exception as e:
-        import traceback, sys
-        log.exception("process_excel failed")
-        print("=== /process/excel FAILED ===", file=sys.stderr, flush=True)
-        print(traceback.format_exc(), file=sys.stderr, flush=True)
-        raise HTTPException(status_code=422, detail=f"Failed to process Excel: {e}")
+        log.exception("Failed to process Excel")
+        raise HTTPException(status_code=400, detail=f"Failed to process Excel: {e}")
+
 
     fname = f"final_interim_penalty_{year_used}.xlsx"
     headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
