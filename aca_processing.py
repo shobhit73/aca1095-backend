@@ -6,12 +6,11 @@ from datetime import date, timedelta
 from typing import Dict, Tuple, Iterable, List
 import pandas as pd
 
-from debug_logging import get_logger, log_df, log_call
-log = get_logger("processing")
 
 # ----------------- Month labels -----------------
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 FULL_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+
 
 # ----------------- Utilities -----------------
 def _coerce_str(x) -> str:
@@ -20,13 +19,14 @@ def _coerce_str(x) -> str:
     except Exception:
         return ""
 
+
 def month_bounds(year: int, month: int) -> Tuple[date, date]:
     import calendar
     last = calendar.monthrange(year, month)[1]
     return date(year, month, 1), date(year, month, last)
 
+
 # ----------------- Excel I/O -----------------
-@log_call(log)
 def load_excel(excel_bytes: bytes) -> Dict[str, pd.DataFrame]:
     """
     Read supported sheets (case-insensitive).
@@ -47,6 +47,7 @@ def load_excel(excel_bytes: bytes) -> Dict[str, pd.DataFrame]:
         df = pd.read_excel(x, sname)
         if df is None:
             return pd.DataFrame()
+        # normalize columns: lower + without spaces
         df.columns = [c.strip().lower().replace(" ", "") for c in df.columns]
         return df
 
@@ -57,15 +58,15 @@ def load_excel(excel_bytes: bytes) -> Dict[str, pd.DataFrame]:
     data["dep_enroll"] = read_sheet("Dep Enrollment")
 
     # Emp Wait Period (exact name)
-    data["emp_wait"]   = read_sheet("Emp Wait Period")  # employeeid, effectivedate, waitperiod
+    data["emp_wait"]   = read_sheet("Emp Wait Period")  # expects employeeid, effectivedate, waitperiod
+    # alias if workbook used "Wait Period Days"
     w = data["emp_wait"]
     if not w.empty and "waitperioddays" in w.columns and "waitperiod" not in w.columns:
         w.rename(columns={"waitperioddays": "waitperiod"}, inplace=True)
 
-    log.info("load_excel: sheets detected", extra={"extra_data": {"sheets": list(x.sheet_names)}})
     return data
 
-@log_call(log)
+
 def prepare_inputs(data: Dict[str, pd.DataFrame]) -> tuple[
     pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame
 ]:
@@ -82,24 +83,23 @@ def prepare_inputs(data: Dict[str, pd.DataFrame]) -> tuple[
     dep_enroll = _as_df(data.get("dep_enroll")).copy()
     emp_wait   = _as_df(data.get("emp_wait")).copy()
 
+    # employeeid as string where present
     for df in (emp_demo, emp_elig, emp_enroll, dep_enroll, emp_wait):
         if not df.empty and "employeeid" in df.columns:
             df["employeeid"] = df["employeeid"].astype(str)
 
+    # parse dates/numbers for wait sheet
     if not emp_wait.empty:
         if "effectivedate" in emp_wait.columns:
             emp_wait["effectivedate"] = pd.to_datetime(emp_wait["effectivedate"], errors="coerce")
         if "waitperiod" in emp_wait.columns:
             emp_wait["waitperiod"] = pd.to_numeric(emp_wait["waitperiod"], errors="coerce").fillna(0).astype(int)
 
-    log_df(log, emp_demo, "emp_demo")
-    log_df(log, emp_elig, "emp_elig")
-    log_df(log, emp_enroll, "emp_enroll")
-    log_df(log, dep_enroll, "dep_enroll")
-    log_df(log, emp_wait, "emp_wait")
     return emp_demo, emp_elig, emp_enroll, dep_enroll, emp_wait
 
+
 def choose_report_year(emp_elig: pd.DataFrame) -> int:
+    """Pick a sensible default filing year if UI doesn't provide one."""
     import datetime as _dt
     if not emp_elig.empty:
         for c in ("eligibilitystartdate","eligibilityenddate"):
@@ -110,6 +110,7 @@ def choose_report_year(emp_elig: pd.DataFrame) -> int:
                     return int(yr.iloc[0])
     return _dt.date.today().year
 
+
 # ----------------- Helpers imported by builder -----------------
 def _collect_employee_ids(*frames: Iterable[pd.DataFrame]) -> List[str]:
     ids: set[str] = set()
@@ -117,6 +118,7 @@ def _collect_employee_ids(*frames: Iterable[pd.DataFrame]) -> List[str]:
         if isinstance(df, pd.DataFrame) and not df.empty and "employeeid" in df.columns:
             ids |= set(df["employeeid"].astype(str).tolist())
     return sorted(ids, key=lambda x: (len(x), x))
+
 
 def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
     """
@@ -130,9 +132,11 @@ def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
 
     df = emp_demo.copy()
 
+    # unify id
     if "employeeid" in df.columns:
         df["employeeid"] = df["employeeid"].astype(str)
 
+    # ---- dates (tolerant) ----
     start_cands = ["statusstartdate","hiredate","startdate","effectivedate","originalhiredate","employmentstartdate"]
     end_cands   = ["statusenddate","termdate","terminationdate","enddate","separationdate","employmentenddate"]
 
@@ -157,7 +161,7 @@ def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
     for c in ("statusstartdate","statusenddate"):
         df[c] = pd.to_datetime(df[c], errors="coerce")
 
-    # ACTIVE / TERM
+    # ---- ACTIVE / TERM detection ----
     status_cands = ["employeestatus","status","employmentstatus","workstatus","jobstatus"]
     present_stat = [c for c in status_cands if c in df.columns]
 
@@ -170,10 +174,12 @@ def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
                 return "ACTIVE"
         return ""
 
-    # FT/PT (names + values + numerics)
+    # ---- FT/PT detection (names + values + numerics) ----
+    # columns whose name suggests role/hrs/fte
     name_ftpt_keywords = ("FT", "FULL", "PART", "PT", "FTE", "HOUR", "STDHOUR", "STANDARDHOUR", "WEEKLYHOUR")
     role_like_cols = [c for c in df.columns if any(k in c.upper() for k in name_ftpt_keywords)]
 
+    # plus a curated list
     role_cands = set(role_like_cols) | set([
         "role","ftpt","ft_pt","employmenttype","employeetype","employeeclass","jobclass",
         "employmentcategory","fulltimeparttime","fte_status","fte","positiontype",
@@ -197,14 +203,17 @@ def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
         return None
 
     def detect_role(row) -> str:
+        # 1) string tokens
         for c in role_cands:
             val = str(row.get(c, "")).upper()
             if any(t in val for t in FT_STR_TOKENS): return "FULLTIME"
             if any(t in val for t in PT_STR_TOKENS): return "PARTTIME"
+        # 2) numeric heuristics (FTE / Hours)
         for c in role_cands:
             res = is_ft_numeric(row.get(c, None), c)
             if res is True:  return "FULLTIME"
             if res is False: return "PARTTIME"
+        # 3) last-resort: any column value exactly "FT"/"PT"
         for c in df.columns:
             val = str(row.get(c, "")).strip().upper()
             if val == "FT": return "FULLTIME"
@@ -216,6 +225,7 @@ def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
 
     return df[["employeeid","statusstartdate","statusenddate","_role_norm","_estatus_norm"]]
 
+
 def _any_overlap(df: pd.DataFrame, start_col: str, end_col: str, ms: date, me: date, *, mask=None) -> bool:
     if df is None or df.empty or start_col not in df.columns or end_col not in df.columns:
         return False
@@ -224,6 +234,7 @@ def _any_overlap(df: pd.DataFrame, start_col: str, end_col: str, ms: date, me: d
     s = pd.to_datetime(df[start_col], errors="coerce").dt.date.fillna(date(1900,1,1))
     e = pd.to_datetime(df[end_col], errors="coerce").dt.date.fillna(date(9999,12,31))
     return bool(((e >= ms) & (s <= me) & mask).any())
+
 
 def _all_month(df: pd.DataFrame, start_col: str, end_col: str, ms: date, me: date, *, mask=None) -> bool:
     if df is None or df.empty or start_col not in df.columns or end_col not in df.columns:
@@ -234,11 +245,12 @@ def _all_month(df: pd.DataFrame, start_col: str, end_col: str, ms: date, me: dat
     e = pd.to_datetime(df[end_col], errors="coerce").dt.date.fillna(date(9999,12,31))
     return bool((mask & (s <= ms) & (e >= me)).any())
 
+
 # ---- Wait Period overlap from Emp Wait Period
 def _waiting_in_month(wait_df_emp: pd.DataFrame, ms: date, me: date) -> bool:
     """
     True if ANY wait window overlaps the month [ms, me].
-    Each row: start = EffectiveDate, end = start + WaitPeriodDays - 1.
+    Each row defines a window: start = EffectiveDate, end = start + WaitPeriodDays - 1.
     """
     if wait_df_emp is None or wait_df_emp.empty:
         return False
@@ -247,5 +259,6 @@ def _waiting_in_month(wait_df_emp: pd.DataFrame, ms: date, me: date) -> bool:
     s = pd.to_datetime(wait_df_emp["effectivedate"], errors="coerce").dt.date
     d = pd.to_numeric(wait_df_emp["waitperiod"], errors="coerce").fillna(0).astype(int)
     e = s + pd.to_timedelta((d.clip(lower=0) - 1).astype(int), unit="D")
-    e = e.where(d > 0, s - timedelta(days=1))  # 0-day → non-wait
+    # 0-day windows → treat as non-wait
+    e = e.where(d > 0, s - timedelta(days=1))
     return bool(((e >= ms) & (s <= me)).any())
