@@ -1,19 +1,101 @@
 # aca_builder.py
 from __future__ import annotations
 from typing import Optional, Dict, Any, List, Tuple
+import calendar
 import pandas as pd
 
 from debug_logging import get_logger, log_df, log_time
-from aca_processing import (
-    MONTHS, FULL_MONTHS,
-    _collect_employee_ids, month_bounds,
-    _any_overlap, _all_month,
-    _status_from_demographic, _waiting_in_month,
-)
 
 log = get_logger("builder")
 
 AFFORDABILITY_THRESHOLD_DEFAULT = 50.0  # UAT/test threshold for affordability
+
+# -----------------------
+# Local constants & helpers (to avoid circular import)
+# -----------------------
+
+MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+FULL_MONTHS = MONTHS[:]  # same list
+
+def month_bounds(year: int, m: int):
+    last = calendar.monthrange(year, m)[1]
+    return pd.Timestamp(year, m, 1).date(), pd.Timestamp(year, m, last).date()
+
+def _any_overlap(
+    df: pd.DataFrame,
+    start_col: str,
+    end_col: str,
+    ms,
+    me,
+    *,
+    mask: Optional[pd.Series] = None
+) -> bool:
+    if df is None or df.empty:
+        return False
+    x = df.copy()
+    if start_col in x.columns and not pd.api.types.is_datetime64_any_dtype(x[start_col]):
+        x[start_col] = pd.to_datetime(x[start_col], errors="coerce")
+    if end_col in x.columns and not pd.api.types.is_datetime64_any_dtype(x[end_col]):
+        x[end_col] = pd.to_datetime(x[end_col], errors="coerce")
+    s = x.get(start_col)
+    e = x.get(end_col)
+    if s is None and e is None:
+        return False
+    if s is None:
+        s = pd.Series([pd.NaT] * len(x), index=x.index)
+    if e is None:
+        e = pd.Series([pd.NaT] * len(x), index=x.index)
+    ov = e.fillna(pd.Timestamp.max).dt.date.ge(ms) & s.fillna(pd.Timestamp.min).dt.date.le(me)
+    if mask is not None:
+        ov = ov & mask.reindex_like(ov).fillna(False)
+    return bool(ov.any())
+
+def _all_month(
+    df: pd.DataFrame,
+    start_col: str,
+    end_col: str,
+    ms,
+    me,
+    *,
+    mask: Optional[pd.Series] = None
+) -> bool:
+    if df is None or df.empty:
+        return False
+    x = df.copy()
+    if start_col in x.columns and not pd.api.types.is_datetime64_any_dtype(x[start_col]):
+        x[start_col] = pd.to_datetime(x[start_col], errors="coerce")
+    if end_col in x.columns and not pd.api.types.is_datetime64_any_dtype(x[end_col]):
+        x[end_col] = pd.to_datetime(x[end_col], errors="coerce")
+    s = x.get(start_col)
+    e = x.get(end_col)
+    if s is None and e is None:
+        return False
+    if s is None:
+        s = pd.Series([pd.NaT] * len(x), index=x.index)
+    if e is None:
+        e = pd.Series([pd.NaT] * len(x), index=x.index)
+    full = s.fillna(pd.Timestamp.min).dt.date.le(ms) & e.fillna(pd.Timestamp.max).dt.date.ge(me)
+    if mask is not None:
+        full = full & mask.reindex_like(full).fillna(False)
+    return bool(full.any())
+
+def _waiting_in_month(wait_df: pd.DataFrame, ms, me) -> bool:
+    if wait_df is None or wait_df.empty:
+        return False
+    # Use any overlap on a generic start/end pair if present
+    for sc, ec in (("waitstartdate", "waitenddate"), ("statusstartdate","statusenddate")):
+        if sc in wait_df.columns or ec in wait_df.columns:
+            w = wait_df.copy()
+            if sc in w.columns and not pd.api.types.is_datetime64_any_dtype(w[sc]):
+                w[sc] = pd.to_datetime(w[sc], errors="coerce")
+            if ec in w.columns and not pd.api.types.is_datetime64_any_dtype(w[ec]):
+                w[ec] = pd.to_datetime(w[ec], errors="coerce")
+            s = w.get(sc, pd.Series([pd.NaT]*len(w), index=w.index))
+            e = w.get(ec, pd.Series([pd.NaT]*len(w), index=w.index))
+            ov = e.fillna(pd.Timestamp.max).dt.date.ge(ms) & s.fillna(pd.Timestamp.min).dt.date.le(me)
+            if bool(ov.any()):
+                return True
+    return False
 
 # -----------------------
 # Utilities / Aliases
@@ -33,6 +115,7 @@ ALIASES = {
     "status": {"employmentstatus", "empstatus", "estatus"},
     "statusstartdate": {"employmentstatusstartdate", "estatusstartdate"},
     "statusenddate": {"employmentstatusenddate", "estatusenddate"},
+    "role": {"employeerole", "emprole"},
 
     "eligibilitystartdate": {"eligstartdate", "eligibility start date"},
     "eligibilityenddate": {"eligenddate", "eligibility end date"},
@@ -57,10 +140,7 @@ TIER_ALIASES = {
     "EMPFAM": {"EF", "EMP+FAM", "EMP_FAMILY", "FAMILY", "EMPFAM"},
 }
 
-# ---- Safe access helpers (prevent '.astype' on scalars) -----------------
-
 def _safe_series(df: pd.DataFrame, col: str) -> pd.Series:
-    """Return df[col] as Series or an empty Series aligned to df.index if missing/invalid."""
     if isinstance(df, pd.DataFrame) and (col in df.columns):
         s = df[col]
         if isinstance(s, pd.Series):
@@ -69,7 +149,6 @@ def _safe_series(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.Series(index=(df.index if isinstance(df, pd.DataFrame) else None), dtype="object")
 
 def _series_str_upper_strip(s: pd.Series) -> pd.Series:
-    """Coerce to string, uppercase, strip; safe on empty/any dtype."""
     if not isinstance(s, pd.Series):
         s = pd.Series([], dtype="object")
     try:
@@ -81,7 +160,6 @@ def _apply_aliases(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
     x = df.copy()
-    # column renames
     cols = {c: c for c in x.columns}
     for canon, alts in ALIASES.items():
         for c in list(cols):
@@ -92,7 +170,7 @@ def _apply_aliases(df: pd.DataFrame) -> pd.DataFrame:
                 cols[c] = canon
     x = x.rename(columns=cols)
     # normalize common string columns (safely)
-    for c in ("employeeid", "plancode", "planname", "eligibilitytier", "tier"):
+    for c in ("employeeid", "plancode", "planname", "eligibilitytier", "tier", "status", "role"):
         if c in x.columns:
             s = _safe_series(x, c)
             x[c] = _series_str_upper_strip(s).str.replace(r"\s+", " ", regex=True)
@@ -101,10 +179,28 @@ def _apply_aliases(df: pd.DataFrame) -> pd.DataFrame:
 def _df_or_empty(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
 
-# ---- Month/offer/enrollment helpers ------------------------------------
+# Status normalization from demographics
+def _status_from_demographic(emp_demo: pd.DataFrame) -> pd.DataFrame:
+    if emp_demo is None or emp_demo.empty:
+        return pd.DataFrame()
+    x = _apply_aliases(emp_demo)
+    # Expect: employeeid, status, role, statusstartdate, statusenddate
+    # Create normalized helper columns
+    if "status" in x.columns:
+        x["_estatus_norm"] = _series_str_upper_strip(_safe_series(x, "status"))
+    if "role" in x.columns:
+        x["_role_norm"] = _series_str_upper_strip(_safe_series(x, "role"))
+    # Ensure datetime
+    for c in ("statusstartdate", "statusenddate"):
+        if c in x.columns and not pd.api.types.is_datetime64_any_dtype(x[c]):
+            x[c] = pd.to_datetime(x[c], errors="coerce")
+    return x
+
+# -----------------------
+# Tier/Offer/Cost helpers
+# -----------------------
 
 def _offered_allmonth(el_df: pd.DataFrame, ms, me) -> bool:
-    """Any eligibility row (any tier) covering the full month → offer_ee_allmonth."""
     if el_df is None or el_df.empty:
         return False
     return _all_month(el_df, "eligibilitystartdate", "eligibilityenddate", ms, me)
@@ -125,7 +221,6 @@ def _tier_offered_any(
 
     tnorm = _series_str_upper_strip(_safe_series(df, tier_col)).str.replace(r"[^A-Z]", "", regex=True)
 
-    # Expand aliases to a comparable tier set
     tier_set = set()
     for t in tiers:
         t_up = t.upper()
@@ -140,18 +235,14 @@ def _tier_offered_any(
     return _any_overlap(df, start_col, end_col, ms, me, mask=mask)
 
 def _enrolled_full_month_union(en_df: pd.DataFrame, ms, me) -> bool:
-    """True if any non-WAIVE enrollment interval fully covers [ms, me]."""
     if en_df is None or en_df.empty:
         return False
-
     df = en_df.copy()
 
-    # filter to enrolled==True if present
     mask = pd.Series(True, index=df.index)
     if "isenrolled" in df.columns:
         mask &= _safe_series(df, "isenrolled").astype(bool).fillna(False)
 
-    # exclude WAIVE if present in code/name
     waive_mask = pd.Series(False, index=df.index)
     for col in ("plancode", "planname"):
         if col in df.columns:
@@ -162,38 +253,31 @@ def _enrolled_full_month_union(en_df: pd.DataFrame, ms, me) -> bool:
     if df.empty:
         return False
 
-    # normalize dates
     for c in ("enrollmentstartdate", "enrollmentenddate"):
         if c in df.columns and not pd.api.types.is_datetime64_any_dtype(df[c]):
             df[c] = pd.to_datetime(df[c], errors="coerce")
 
-    ms_d, me_d = ms, me
     for _, r in df.iterrows():
         s = r.get("enrollmentstartdate")
         e = r.get("enrollmentenddate")
         s = s if pd.notna(s) else pd.Timestamp.min
         e = e if pd.notna(e) else pd.Timestamp.max
         try:
-            s_d = s.date()
-            e_d = e.date()
+            if s.date() <= ms and e.date() >= me:
+                return True
         except Exception:
             continue
-        if s_d <= ms_d and e_d >= me_d:
-            return True
     return False
 
 def _latest_emp_cost_for_month(el_df: pd.DataFrame, ms, me) -> Optional[float]:
-    """Return the latest EMP-tier plancost applicable in [ms, me]; fallback to any tier if EMP not present."""
     if el_df is None or el_df.empty:
         return None
 
     df = el_df.copy()
-    # normalize dates
     for c in ("eligibilitystartdate", "eligibilityenddate"):
         if c in df.columns and not pd.api.types.is_datetime64_any_dtype(df[c]):
             df[c] = pd.to_datetime(df[c], errors="coerce")
 
-    # rows that touch the month
     end_series   = _safe_series(df, "eligibilityenddate").fillna(pd.Timestamp.max)
     start_series = _safe_series(df, "eligibilitystartdate").fillna(pd.Timestamp.min)
     if end_series.empty or start_series.empty:
@@ -203,7 +287,6 @@ def _latest_emp_cost_for_month(el_df: pd.DataFrame, ms, me) -> Optional[float]:
     if df.empty or ("plancost" not in df.columns):
         return None
 
-    # Prefer EMP tier when we can
     if "eligibilitytier" in df.columns:
         tnorm = _series_str_upper_strip(_safe_series(df, "eligibilitytier")).str.replace(r"[^A-Z]", "", regex=True)
         emp_aliases = (TIER_ALIASES.get("EE", set()) | {"EE"})
@@ -221,6 +304,10 @@ def _latest_emp_cost_for_month(el_df: pd.DataFrame, ms, me) -> Optional[float]:
     except Exception:
         return None
 
+# -----------------------
+# Line 14 / Line 16 logic
+# -----------------------
+
 def _month_line14(
     eligible_mv: bool,
     offer_ee_allmonth: bool,
@@ -228,13 +315,6 @@ def _month_line14(
     offer_dependents: bool,
     affordable: bool
 ) -> str:
-    """
-    Simplified (UAT) monthly Line 14:
-      - No full-month offer to EE → 1H
-      - Offer not MV → 1F
-      - MV + spouse + dependents → 1A if affordable else 1E
-      - Otherwise 1E
-    """
     if not offer_ee_allmonth:
         return "1H"
     if not eligible_mv:
@@ -252,25 +332,16 @@ def _month_line16(
     offer_ee_allmonth: bool,
     affordable: bool
 ) -> str:
-    """
-    Simplified (UAT) Line 16:
-      2C: enrolled full month
-      2A: not employed any day
-      2D: waiting period
-      2B: not FT any day
-      2H: affordable safe harbor (offered all month, not enrolled)
-      else: blank
-    """
     if enrolled_full:
-      return "2C"
+        return "2C"
     if not employed:
-      return "2A"
+        return "2A"
     if waiting:
-      return "2D"
+        return "2D"
     if not ft:
-      return "2B"
+        return "2B"
     if offer_ee_allmonth and affordable:
-      return "2H"
+        return "2H"
     return ""
 
 # -----------------------
@@ -299,7 +370,6 @@ def build_interim(
         dep_enroll = _apply_aliases(_df_or_empty(dep_enroll))
         emp_wait   = _df_or_empty(emp_wait)
 
-        # normalize critical date columns
         for df, sc, ec in (
             (emp_elig, "eligibilitystartdate", "eligibilityenddate"),
             (emp_enroll, "enrollmentstartdate", "enrollmentenddate"),
@@ -311,7 +381,16 @@ def build_interim(
                         df[c] = pd.to_datetime(df[c], errors="coerce")
 
         st = _status_from_demographic(emp_demo)
-        employee_ids = _collect_employee_ids(emp_demo, st, emp_elig, emp_enroll, dep_enroll, emp_wait)
+
+        # Collect employee ids from all sheets
+        def _collect_ids(*dfs: pd.DataFrame) -> List[str]:
+            ids = []
+            for d in dfs:
+                if d is not None and not d.empty and "employeeid" in d.columns:
+                    ids.extend(d["employeeid"].astype(str).tolist())
+            return sorted({i for i in ids if i})
+        employee_ids = _collect_ids(emp_demo, st, emp_elig, emp_enroll, dep_enroll, emp_wait)
+
         rows: List[Dict[str, Any]] = []
         thresh = AFFORDABILITY_THRESHOLD_DEFAULT if affordability_threshold is None else float(affordability_threshold)
 
@@ -361,7 +440,7 @@ def build_interim(
             mask = s.str.contains("PARTTIME", na=False) | s.str.fullmatch("PT", na=False)
             return _all_month(st_emp, "statusstartdate", "statusenddate", ms, me, mask=mask)
 
-        # Precompute a non-WAIVE mask in enrollment for EMPFAM full-month checks
+        # Precompute non-WAIVE enrollment rows for EMPFAM full-month checks
         en_non_waive = emp_enroll.copy()
         if not en_non_waive.empty:
             code = _series_str_upper_strip(_safe_series(en_non_waive, "plancode"))
@@ -376,7 +455,7 @@ def build_interim(
             st_emp = st[st["employeeid"].astype(str) == str(emp)].copy() if not st.empty else pd.DataFrame()
             wt_emp = emp_wait[emp_wait["employeeid"].astype(str) == str(emp)].copy() if not emp_wait.empty else pd.DataFrame()
 
-            for m in range(1, 12 + 1):
+            for m in range(1, 13):
                 ms, me = month_bounds(year, m)
 
                 employed = _is_employed_month(st_emp, ms, me)
@@ -411,11 +490,10 @@ def build_interim(
                 emp_cost = _latest_emp_cost_for_month(el_emp, ms, me)
                 affordable = (emp_cost is not None) and (emp_cost <= thresh)
 
-                waiting = _waiting_in_month(wt_emp, ms, me)  # ONLY from Emp Wait Period
+                waiting = _waiting_in_month(wt_emp, ms, me)
 
                 l14 = _month_line14(eligible_mv, offer_ee_allmonth, offer_spouse, offer_dependents, affordable)
                 if (not bool(elig_any)) and bool(enrolled_full):
-                    # Not eligible but enrolled full → treat as 1E offer
                     l14 = "1E"
 
                 l16 = _month_line16(
@@ -435,11 +513,9 @@ def build_interim(
                     mask_empfam = tnorm.eq("EMPFAM")
                     if mask_empfam.any():
                         sub = en_emp_nonwaive.loc[mask_empfam].copy()
-                        # ensure dates are datetimes
                         for c in ("enrollmentstartdate", "enrollmentenddate"):
                             if c in sub.columns and not pd.api.types.is_datetime64_any_dtype(sub[c]):
                                 sub[c] = pd.to_datetime(sub[c], errors="coerce")
-                        # full-month coverage check
                         full_mask = (
                             _safe_series(sub, "enrollmentstartdate").fillna(pd.Timestamp.min).dt.date.le(ms) &
                             _safe_series(sub, "enrollmentenddate").fillna(pd.Timestamp.max).dt.date.ge(me)
