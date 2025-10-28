@@ -1,82 +1,78 @@
-# main.py — FastAPI app on Render
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
-from fastapi.responses import StreamingResponse, JSONResponse
-import io, zipfile, os
-import pandas as pd
+# main_fastapi.py
+# FastAPI entrypoint: /pipeline => returns a ZIP with interim_full.xlsx + pdfs/*
 
-# If you use your PDF filler:
-# from your_pdf_module import generate_pdfs_from_summary  # your earlier Part I/II/III filler in-memory
+from __future__ import annotations
+import io, os, zipfile
+from typing import Optional, List, Tuple
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+
+from debug_logging import get_logger
+from aca_builder import build_interim_df, load_input_workbook
+from pdf_filler import generate_all_pdfs
+
+log = get_logger("aca1095-backend")
 
 API_KEY = os.getenv("FASTAPI_API_KEY", "")
 PDF_TEMPLATE_PATH = os.getenv("PDF_TEMPLATE_PATH", "/opt/app/f1095c.pdf")
 FIELDS_JSON_PATH  = os.getenv("FIELDS_JSON_PATH",  "/opt/app/pdf_acro_fields_details.json")
 
-app = FastAPI()
+app = FastAPI(title="ACA 1095 Pipeline", version="1.0.0")
 
-def require_api_key(key: str | None):
-    if not API_KEY:
-        return  # no auth configured
-    if not key or key != API_KEY:
+def _require_api_key(x_api_key: Optional[str]):
+    if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-# ---------- Helpers you plug in ----------
-
-def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
-    """
-    Build the full interim table for all employees (12 months),
-    including line_14 and line_16 columns.
-
-    Replace this with your real pipeline code.
-    """
-    # Example skeleton: load the input workbook and call your logic.
-    # Here, we just show a tiny placeholder DataFrame so the endpoint is runnable.
-    # >>> Replace entirely with your real logic that we already built earlier. <<<
-    df = pd.DataFrame([
-        {"Employee_ID": 1001, "Name": "Jane A Doe", "Year": year, "Month": "Jan", "line_14": "1E", "line_16": "2C"},
-        {"Employee_ID": 1001, "Name": "Jane A Doe", "Year": year, "Month": "Feb", "line_14": "1E", "line_16": "2C"},
-    ])
-    return df
-
-def generate_all_pdfs(interim_df: pd.DataFrame) -> list[tuple[str, bytes]]:
-    """
-    From the interim_df (which includes Month, line_14, line_16), generate
-    a PDF per employee and return as list of (filename, bytes).
-
-    Replace this with your real PDF filler (the Part I/II/III code we wrote).
-    """
-    # Pseudo-implementation: you should call your existing filler using
-    # PDF_TEMPLATE_PATH and FIELDS_JSON_PATH. It should *not* write to disk; return bytes.
-
-    # For demo purposes, we return an empty list (so you can wire the real filler).
-    # Example expected return: [("1095C_1001.pdf", pdf_bytes), ("1095C_1002.pdf", pdf_bytes2), ...]
-    return []
-
-# ----------------------------------------
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 @app.post("/pipeline")
 async def pipeline(
     year: int = Form(...),
     input_excel: UploadFile = File(...),
-    x_api_key: str | None = Header(None)
+    x_api_key: Optional[str] = Header(default=None)
 ):
-    require_api_key(x_api_key)
-
+    _require_api_key(x_api_key)
     try:
         excel_bytes = await input_excel.read()
+        log.info(f"Pipeline start | year={year} | file={input_excel.filename} | bytes={len(excel_bytes)}")
 
-        # 1) Build full interim table
+        # 1) Build interim DF (all employees, all months)
         interim_df = build_interim_df(year, excel_bytes)
+        if interim_df.empty:
+            raise ValueError("No employees or no data after processing.")
 
-        # 2) Generate all PDFs from interim
-        pdf_files: list[tuple[str, bytes]] = generate_all_pdfs(interim_df)
+        # 2) Load demographics / dependents for PDF Part I/III (optional)
+        sheets = load_input_workbook(excel_bytes)
+        demo = sheets.get("Emp Demographic") or sheets.get("Emp_Demographic")
+        dep  = sheets.get("Dep Enrollment") or sheets.get("Dep_Enrollment")
+        if demo is not None and not demo.empty and "EmployeeID" in demo.columns:
+            demo["EmployeeID"] = pd.to_numeric(demo["EmployeeID"], errors="coerce").astype("Int64")
 
-        # 3) Write an Excel (interim_full.xlsx) to memory
+        # 3) Generate PDFs
+        if not os.path.exists(PDF_TEMPLATE_PATH):
+            raise FileNotFoundError(f"PDF template not found at: {PDF_TEMPLATE_PATH}")
+        if not os.path.exists(FIELDS_JSON_PATH):
+            raise FileNotFoundError(f"Fields JSON not found at: {FIELDS_JSON_PATH}")
+
+        pdf_files: List[Tuple[str, bytes]] = generate_all_pdfs(
+            interim_df=interim_df,
+            year=year,
+            template_path=PDF_TEMPLATE_PATH,
+            fields_json_path=FIELDS_JSON_PATH,
+            demo_df=demo,
+            dep_df=dep
+        )
+
+        # 4) Build interim_full.xlsx in-memory
         interim_buf = io.BytesIO()
         with pd.ExcelWriter(interim_buf, engine="xlsxwriter") as writer:
             interim_df.to_excel(writer, index=False, sheet_name="Interim")
         interim_buf.seek(0)
 
-        # 4) Zip: interim_full.xlsx + pdfs/
+        # 5) ZIP both outputs
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("interim_full.xlsx", interim_buf.getvalue())
@@ -84,8 +80,10 @@ async def pipeline(
                 z.writestr(f"pdfs/{fname}", data)
         zip_buf.seek(0)
 
-        headers = {"Content-Disposition": 'attachment; filename="1095c_outputs.zip"'}
+        headers = {"Content-Disposition": f'attachment; filename="1095c_outputs_{year}.zip"'}
+        log.info(f"Pipeline done | rows={len(interim_df)} | pdfs={len(pdf_files)}")
         return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
 
     except Exception as e:
+        log.exception("Pipeline failed")
         return JSONResponse(status_code=400, content={"error": str(e)})
