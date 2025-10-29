@@ -1,8 +1,7 @@
+# --- Python/runtime agnostic pins ---
 fastapi==0.115.0
 uvicorn==0.30.6
 python-multipart==0.0.9
-pandas==2.2.2
-numpy==1.26.4
 openpyxl==3.1.5
 XlsxWriter==3.2.0
 PyPDF2==3.0.1
@@ -11,3 +10,12 @@ pydantic==2.9.2
 pydantic-core==2.23.4
 pydantic-settings==2.5.2
 typing_extensions==4.12.2
+
+# --- Numeric stack: pick wheels per Python version ---
+# For Python < 3.13 (local dev on 3.11/3.12):
+numpy==1.26.4 ; python_version < "3.13"
+pandas==2.2.2 ; python_version < "3.13"
+
+# For Python >= 3.13 (Render default right now):
+numpy==2.1.3 ; python_version >= "3.13"
+pandas==2.2.3 ; python_version >= "3.13"
