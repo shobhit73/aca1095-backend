@@ -58,4 +58,33 @@ async def pipeline(
         if not os.path.exists(FIELDS_JSON_PATH):
             raise FileNotFoundError(f"Fields JSON not found at: {FIELDS_JSON_PATH}")
 
-        pdf_files: List[Tuple[str, bytes]] = generate_all
+        pdf_files: List[Tuple[str, bytes]] = generate_all_pdfs(
+            interim_df=interim_df,
+            year=year,
+            template_path=PDF_TEMPLATE_PATH,
+            fields_json_path=FIELDS_JSON_PATH,
+            demo_df=demo if isinstance(demo, pd.DataFrame) else None,
+            dep_df=dep if isinstance(dep, pd.DataFrame) else None
+        )
+
+        # 4) Build interim_full.xlsx in-memory
+        interim_buf = io.BytesIO()
+        with pd.ExcelWriter(interim_buf, engine="xlsxwriter") as writer:
+            interim_df.to_excel(writer, index=False, sheet_name="Interim")
+        interim_buf.seek(0)
+
+        # 5) ZIP both outputs
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("interim_full.xlsx", interim_buf.getvalue())
+            for fname, data in pdf_files:
+                z.writestr(f"pdfs/{fname}", data)
+        zip_buf.seek(0)
+
+        headers = {"Content-Disposition": f'attachment; filename="1095c_outputs_{year}.zip"'}
+        log.info(f"Pipeline done | rows={len(interim_df)} | pdfs={len(pdf_files)}")
+        return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)
+
+    except Exception as e:
+        log.exception("Pipeline failed")
+        return JSONResponse(status_code=400, content={"error": str(e)})
