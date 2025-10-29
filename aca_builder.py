@@ -36,7 +36,6 @@ except Exception:  # pragma: no cover
 log = get_logger("aca_builder")
 
 AFFORDABILITY_THRESHOLD_DEFAULT = 50.0  # UAT default
-
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
 # -----------------------
@@ -242,19 +241,14 @@ def _month_line16(*, employed: bool, enrolled_full: bool, waiting: bool, ft: boo
 # =======================
 # PUBLIC API (compat with main_fastapi)
 # =======================
-
 def load_input_workbook(excel_bytes_or_filelike: bytes | io.BytesIO | str) -> dict[str, pd.DataFrame]:
-    """
-    Load the incoming Excel into normalized dataframes keyed by canonical names:
-      'Emp Demographic', 'Emp Eligibility', 'Emp Enrollment', 'Dependent Enrollment', 'Waiting Period'
-    Accepts bytes, filelike, or path.
-    """
+    """Load Excel into normalized dataframes keyed by canonical names."""
     if isinstance(excel_bytes_or_filelike, (bytes, bytearray)):
         buf = io.BytesIO(excel_bytes_or_filelike)
     else:
-        buf = excel_bytes_or_filelike  # path or file-like is fine for pandas
+        buf = excel_bytes_or_filelike
     xls = pd.ExcelFile(buf)
-    sheets = {}
+    sheets: dict[str, pd.DataFrame] = {}
 
     def pick(name_variants: list[str]) -> Optional[str]:
         for s in xls.sheet_names:
@@ -277,10 +271,7 @@ def load_input_workbook(excel_bytes_or_filelike: bytes | io.BytesIO | str) -> di
 
     for key, variants in mapping.items():
         nm = pick(variants)
-        if nm:
-            sheets[key] = pd.read_excel(xls, sheet_name=nm)
-        else:
-            sheets[key] = pd.DataFrame()
+        sheets[key] = pd.read_excel(xls, sheet_name=nm) if nm else pd.DataFrame()
 
     return sheets
 
@@ -290,10 +281,14 @@ def build_interim_df(
     affordability_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
     """
-    Backward-compatible: accepts either a sheets dict OR raw Excel (bytes / filelike / path).
-    If raw Excel is provided, we convert it to sheets internally to avoid 'bytes'.get errors.
+    Backward-compatible: accepts either a sheets dict OR raw Excel (bytes/filelike/path).
     """
-    # Normalize: if sheets isn't a dict, convert bytes/filelike/path -> sheets dict
+    # Optional visibility for debugging types:
+    try:
+        log.info(f"build_interim_df: received type={type(sheets).__name__}")
+    except Exception:
+        pass
+
     if not isinstance(sheets, dict):
         sheets = load_input_workbook(sheets)
 
@@ -313,11 +308,9 @@ def build_interim_df(
         affordability_threshold=affordability_threshold,
     )
 
-
 # =======================
 # CORE BUILDERS
 # =======================
-
 def build_interim(
     emp_demo: pd.DataFrame,
     emp_elig: pd.DataFrame,
@@ -397,8 +390,7 @@ def build_interim(
                 pt_rows = pd.DataFrame()
                 if not st_emp.empty and "role" in st_emp.columns:
                     r = _series_str_upper_strip(_safe_series(st_emp, "role"))
-                    pt_mask = r.str_contains("PARTTIME", regex=False) | r.eq("PT")
-                    # r.str_contains is not a pandas method; fallback:
+                    # FIXED: use str.contains (not str_contains)
                     pt_mask = r.str.contains("PARTTIME", na=False) | r.eq("PT")
                     pt_rows = st_emp[pt_mask]
                 parttime_full = (not ft_full) and (_covers_full_union(pt_rows, "statusstartdate", "statusenddate", ms, me) if not pt_rows.empty else False)
@@ -568,7 +560,8 @@ def build_penalty_dashboard(interim: pd.DataFrame) -> pd.DataFrame:
             reasons = [month_reason(r) for _, r in months_sorted.iterrows()]
             for i, m in enumerate(MONTHS):
                 rec[m] = reasons[i] if i < len(reasons) else "–"
-            rec["Reason"] = next((x for x in reasons if x != "–"), "–")
+            rec["Reason"] = next((x for x in reasons if x != "–"), "–"
+            )
             out_rows.append(rec)
 
         cols = ["EmployeeID", "Reason"] + MONTHS
