@@ -9,27 +9,19 @@ from typing import Optional, Dict, Any, List, Tuple
 import pandas as pd
 
 # -----------------------
-# Robust logging imports (graceful fallbacks)
+# Logging (graceful fallbacks if debug_logging is minimal/missing)
 # -----------------------
 try:
-    from debug_logging import get_logger  # type: ignore
+    from debug_logging import get_logger, log_time, log_df  # type: ignore
 except Exception:  # pragma: no cover
+    import logging
+    from contextlib import contextmanager
     def get_logger(name: str):
-        import logging
         logging.basicConfig(level=logging.INFO)
         return logging.getLogger(name)
-
-try:
-    from debug_logging import log_time  # type: ignore
-except Exception:  # pragma: no cover
-    from contextlib import contextmanager
     @contextmanager
     def log_time(_logger, _msg: str):
         yield
-
-try:
-    from debug_logging import log_df  # type: ignore
-except Exception:  # pragma: no cover
     def log_df(_logger, _name: str, _df: pd.DataFrame):
         pass
 
@@ -39,7 +31,7 @@ AFFORDABILITY_THRESHOLD_DEFAULT = 50.0  # UAT default
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
 # -----------------------
-# Helpers
+# Small helpers
 # -----------------------
 def month_bounds(year: int, m: int) -> tuple[date, date]:
     last = calendar.monthrange(year, m)[1]
@@ -215,7 +207,7 @@ def _latest_emp_cost_for_month(el_df: pd.DataFrame, ms: date, me: date) -> Optio
     except Exception:
         return None
 
-# ---- Line code helpers
+# ---- Line code helpers (simplified but stable)
 def _month_line14(eligible_mv: bool, offer_ee_allmonth: bool, offer_spouse: bool, offer_dependents: bool, affordable: bool) -> str:
     if not offer_ee_allmonth:
         return "1H"
@@ -239,7 +231,7 @@ def _month_line16(*, employed: bool, enrolled_full: bool, waiting: bool, ft: boo
     return ""
 
 # =======================
-# PUBLIC API (compat with main_fastapi)
+# PUBLIC API (used by FastAPI)
 # =======================
 def load_input_workbook(excel_bytes_or_filelike: bytes | io.BytesIO | str) -> dict[str, pd.DataFrame]:
     """Load Excel into normalized dataframes keyed by canonical names."""
@@ -283,7 +275,6 @@ def build_interim_df(
     """
     Backward-compatible: accepts either a sheets dict OR raw Excel (bytes/filelike/path).
     """
-    # Optional visibility for debugging types:
     try:
         log.info(f"build_interim_df: received type={type(sheets).__name__}")
     except Exception:
@@ -323,11 +314,11 @@ def build_interim(
 ) -> pd.DataFrame:
     """
     Implements:
-      - is_employed_for_full_month: union of all non-termination status intervals covers the month (adjacent intervals merge). LOA counts as employed.
+      - is_employed_for_full_month: union of all non-TERM status intervals covers the month (adjacent intervals merge). LOA counts as employed.
       - ft: a FULL-TIME role interval covers the whole month.
       - parttime: no FT full-month, and a PART-TIME role interval covers the whole month.
-      - spouse_enrolled / child_enrolled: True only if EMPFAM non-WAIVE ENROLLMENT covers the month.
-      - include employees present only in Eligibility/Enrollment with employment flags = False all months.
+      - spouse_enrolled / child_enrolled: True only if EMPFAM non-WAIVE ENROLLMENT covers the full month.
+      - include employees present only in Eligibility/Enrollment with employment flags = False for all months.
     """
     with log_time(log, "build_interim"):
         emp_demo   = _apply_aliases(_df_or_empty(emp_demo))
@@ -349,7 +340,7 @@ def build_interim(
             emp_demo["name"] = _safe_series(emp_demo, "name").fillna("")
             name_map = {str(r["employeeid"]): str(r["name"]) for _, r in emp_demo.iterrows() if pd.notna(r.get("employeeid"))}
 
-        thresh = AFFORDABILITY_THRESHOLD_DEFAULT if affordability_threshold is None else float(affordability_threshold)
+        threshold = AFFORDABILITY_THRESHOLD_DEFAULT if affordability_threshold is None else float(affordability_threshold)
         rows: List[Dict[str, Any]] = []
 
         # Pre-clean enrollment rows that are non-WAIVE (for spouse/child flags)
@@ -390,7 +381,6 @@ def build_interim(
                 pt_rows = pd.DataFrame()
                 if not st_emp.empty and "role" in st_emp.columns:
                     r = _series_str_upper_strip(_safe_series(st_emp, "role"))
-                    # FIXED: use str.contains (not str_contains)
                     pt_mask = r.str.contains("PARTTIME", na=False) | r.eq("PT")
                     pt_rows = st_emp[pt_mask]
                 parttime_full = (not ft_full) and (_covers_full_union(pt_rows, "statusstartdate", "statusenddate", ms, me) if not pt_rows.empty else False)
@@ -425,14 +415,13 @@ def build_interim(
                 if not en_emp_nonwaive.empty and "tier" in en_emp_nonwaive.columns:
                     mask_empfam = _tier_mask(en_emp_nonwaive, "tier", ("EMPFAM",))
                     sub = en_emp_nonwaive.loc[mask_empfam].copy()
-                    if not sub.empty:
-                        if _all_month(sub, "enrollmentstartdate", "enrollmentenddate", ms, me):
-                            spouse_enrolled = True
-                            child_enrolled = True
+                    if not sub.empty and _all_month(sub, "enrollmentstartdate", "enrollmentenddate", ms, me):
+                        spouse_enrolled = True
+                        child_enrolled = True
 
                 # Cost / affordability
                 emp_cost = _latest_emp_cost_for_month(el_emp, ms, me)
-                affordable = (emp_cost is not None) and (emp_cost <= (AFFORDABILITY_THRESHOLD_DEFAULT if affordability_threshold is None else float(affordability_threshold)))
+                affordable = (emp_cost is not None) and (emp_cost <= threshold)
 
                 # Waiting period (optional)
                 waiting = False
@@ -485,7 +474,7 @@ def build_interim(
 
         interim = pd.DataFrame.from_records(rows)
 
-        # Year-level 1G
+        # Year-level 1G: never FT in any month but enrolled at least one month
         if not interim.empty:
             one_g_emp_ids = []
             for emp in interim["EmployeeID"].unique().tolist():
@@ -560,8 +549,7 @@ def build_penalty_dashboard(interim: pd.DataFrame) -> pd.DataFrame:
             reasons = [month_reason(r) for _, r in months_sorted.iterrows()]
             for i, m in enumerate(MONTHS):
                 rec[m] = reasons[i] if i < len(reasons) else "–"
-            rec["Reason"] = next((x for x in reasons if x != "–"), "–"
-            )
+            rec["Reason"] = next((x for x in reasons if x != "–"), "–")
             out_rows.append(rec)
 
         cols = ["EmployeeID", "Reason"] + MONTHS
