@@ -1,7 +1,7 @@
 # main_fastapi.py
 from __future__ import annotations
 import io, os, zipfile
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -22,6 +22,15 @@ def _require_key(x_api_key: Optional[str]):
     if API_KEY and (x_api_key != API_KEY):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+def _first_sheet_local(sheets: Dict[str, pd.DataFrame], candidates: list[str]) -> pd.DataFrame:
+    """Return the first matching DataFrame by name, else empty DataFrame (no boolean checks)."""
+    for name in candidates:
+        if name in sheets:
+            df = sheets[name]
+            if isinstance(df, pd.DataFrame):
+                return df
+    return pd.DataFrame()
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -37,13 +46,16 @@ async def pipeline(
         excel_bytes = await input_excel.read()
         log.info(f"start year={year} file={input_excel.filename} bytes={len(excel_bytes)}")
 
+        # Build interim (full table)
         interim_df = build_interim_df(year, excel_bytes)
         if interim_df is None or interim_df.empty:
             raise ValueError("No data after processing (empty interim)")
 
+        # Pull optional sheets for Part I / Part III (without boolean DF checks)
         sheets = load_input_workbook(excel_bytes)
-        demo = sheets.get("Emp Demographic") or sheets.get("Emp_Demographic")
-        dep  = sheets.get("Dep Enrollment") or sheets.get("Dep_Enrollment")
+        demo = _first_sheet_local(sheets, ["Emp Demographic", "Emp_Demographic"])
+        dep  = _first_sheet_local(sheets, ["Dep Enrollment", "Dep_Enrollment"])
+
         if isinstance(demo, pd.DataFrame) and (not demo.empty) and ("EmployeeID" in demo.columns):
             demo["EmployeeID"] = pd.to_numeric(demo["EmployeeID"], errors="coerce").astype("Int64")
 
@@ -52,6 +64,7 @@ async def pipeline(
         if not os.path.exists(FIELDS_JSON_PATH):
             raise FileNotFoundError(f"Missing fields JSON at {FIELDS_JSON_PATH}")
 
+        # Generate PDFs
         pdfs: List[Tuple[str, bytes]] = generate_all_pdfs(
             interim_df=interim_df,
             year=year,
@@ -61,13 +74,13 @@ async def pipeline(
             dep_df=dep if isinstance(dep, pd.DataFrame) else None
         )
 
-        # build interim workbook
+        # Excel (interim)
         interim_buf = io.BytesIO()
         with pd.ExcelWriter(interim_buf, engine="xlsxwriter") as w:
             interim_df.to_excel(w, index=False, sheet_name="Interim")
         interim_buf.seek(0)
 
-        # zip both
+        # ZIP both outputs
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("interim_full.xlsx", interim_buf.getvalue())
