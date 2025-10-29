@@ -286,10 +286,17 @@ def load_input_workbook(excel_bytes_or_filelike: bytes | io.BytesIO | str) -> di
 
 def build_interim_df(
     year: int,
-    sheets: dict[str, pd.DataFrame],
+    sheets: dict[str, pd.DataFrame] | bytes | bytearray | io.BytesIO | str,
     affordability_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
-    """Wrapper expected by main_fastapi: builds Interim from preloaded sheets."""
+    """
+    Backward-compatible: accepts either a sheets dict OR raw Excel (bytes / filelike / path).
+    If raw Excel is provided, we convert it to sheets internally to avoid 'bytes'.get errors.
+    """
+    # Normalize: if sheets isn't a dict, convert bytes/filelike/path -> sheets dict
+    if not isinstance(sheets, dict):
+        sheets = load_input_workbook(sheets)
+
     demo = _apply_aliases(_df_or_empty(sheets.get("Emp Demographic")))
     elig = _apply_aliases(_df_or_empty(sheets.get("Emp Eligibility")))
     enr  = _apply_aliases(_df_or_empty(sheets.get("Emp Enrollment")))
@@ -305,6 +312,7 @@ def build_interim_df(
         emp_wait=wait,
         affordability_threshold=affordability_threshold,
     )
+
 
 # =======================
 # CORE BUILDERS
