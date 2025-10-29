@@ -1,9 +1,6 @@
 # pdf_filler.py
-# Create one 1095-C PDF per employee from the interim DataFrame.
-# Part I is optional (needs demographics sheet); Part III is optional (needs dependent sheet mapping in JSON).
-
 from __future__ import annotations
-import json, io, os
+import json, io
 from typing import Dict, Any, Optional, List, Tuple
 import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
@@ -15,10 +12,8 @@ def is_df_present(df) -> bool:
     return isinstance(df, pd.DataFrame) and (not df.empty)
 
 def month_to_index(m: str) -> int:
-    try:
-        return MONTHS.index(str(m))
-    except Exception:
-        return 0
+    try: return MONTHS.index(str(m))
+    except Exception: return 0
 
 def enable_need_appearances(reader: PdfReader, writer: PdfWriter):
     try:
@@ -48,25 +43,27 @@ def load_field_map(path: str) -> Dict[str, Any]:
     if "part1" not in m: m["part1"]={}
     if "part2" not in m: m["part2"]={}
     if "part3" not in m: m["part3"]={"rows":[]}
-    for which in ["line14","line16"]:
-        if which not in m:
-            raise ValueError(f"Field map missing '{which}'")
+    for k in ["line14","line16"]:
+        if k not in m: raise ValueError(f"Missing '{k}' in fields JSON")
     return m
 
 def derive_part1_values(emp_id: int, demo_df: Optional[pd.DataFrame]) -> Dict[str, Any]:
-    out = {"employee_first":None,"employee_middle":None,"employee_last":None,"employee_ssn":None,
-           "employee_addr1":None,"employee_city":None,"employee_state":None,"employee_zip":None,"employee_country":None,
-           "employer_name":None,"employer_ein":None,"employer_addr1":None,"employer_city":None,"employer_state":None,
-           "employer_zip":None,"employer_country":None,"employer_phone":None}
-    if not is_df_present(demo_df) or "EmployeeID" not in demo_df.columns: 
+    out = dict(
+        employee_first=None, employee_middle=None, employee_last=None, employee_ssn=None,
+        employee_addr1=None, employee_city=None, employee_state=None, employee_zip=None, employee_country=None,
+        employer_name=None, employer_ein=None, employer_addr1=None, employer_city=None, employer_state=None,
+        employer_zip=None, employer_country=None, employer_phone=None
+    )
+    if not is_df_present(demo_df) or "EmployeeID" not in demo_df.columns:
         return out
     g = demo_df.loc[demo_df["EmployeeID"]==emp_id]
     if g.empty: return out
-    def first(col): 
+    def first(col):
         s = g.get(col)
         if s is None: return None
         s = s.dropna().astype(str).str.strip()
         return s.iloc[0] if len(s) else None
+
     mapping = {
         "FirstName":"employee_first","MiddleInitial":"employee_middle","LastName":"employee_last",
         "SSN":"employee_ssn","AddressLine1":"employee_addr1","City":"employee_city","State":"employee_state",
@@ -81,14 +78,13 @@ def derive_part1_values(emp_id: int, demo_df: Optional[pd.DataFrame]) -> Dict[st
         out["employee_ssn"] = str(out["employee_ssn"]).replace("-","").replace(" ","")
     for z in ("employee_zip","employer_zip"):
         if out[z] is not None:
-            try: out[z] = str(out[z]).split(".")[0]
-            except: pass
+            out[z] = str(out[z]).split(".")[0]
     return out
 
 def all_12_same(d: Dict[str, Optional[str]]) -> Optional[str]:
     vals = [d.get(m) for m in MONTHS]
     vals = [v for v in vals if v and str(v).strip()]
-    return list(set(vals))[0] if len(vals)==12 and len(set(vals))==1 else None
+    return list(set(vals))[0] if (len(vals)==12 and len(set(vals))==1) else None
 
 def fill_line_codes(writer: PdfWriter, fields: Dict[str, Any], codes: Dict[str, Optional[str]], which: str):
     sec = fields.get(which, {}) or {}
@@ -99,8 +95,7 @@ def fill_line_codes(writer: PdfWriter, fields: Dict[str, Any], codes: Dict[str, 
             if m in sec: set_form_text(writer, sec[m], "")
     else:
         for m in MONTHS:
-            if m in sec:
-                set_form_text(writer, sec[m], codes.get(m) or "")
+            if m in sec: set_form_text(writer, sec[m], codes.get(m) or "")
 
 def build_line_dict(block: pd.DataFrame, col: str) -> Dict[str, Optional[str]]:
     out = {m: None for m in MONTHS}
@@ -111,49 +106,48 @@ def build_line_dict(block: pd.DataFrame, col: str) -> Dict[str, Optional[str]]:
     return out
 
 def build_part3_rows(emp_id: int, year: int, block: pd.DataFrame, dep_df: Optional[pd.DataFrame]) -> List[Dict[str,Any]]:
-    persons: List[Dict[str,Any]] = []
+    people: List[Dict[str,Any]] = []
 
-    # Employee row: covered if employee_enrolled is truthy
+    # Employee
     cov = {m: False for m in MONTHS}
     if "employee_enrolled" in block.columns:
         for _, r in block.iterrows():
             mo = str(r.get("Month"))
             if mo in cov:
-                v = str(r.get("employee_enrolled")).strip().lower()
+                v = str(r.get("employee_enrolled") or "").strip().lower()
                 cov[mo] = v in {"yes","true","1"}
-    # name
     emp_name = None
     if "Name" in block.columns and not block["Name"].isna().all():
         emp_name = str(block["Name"].dropna().astype(str).str.strip().iloc[0])
-    persons.append({"name": emp_name or str(emp_id), "ssn": None, "dob": None, "covered": cov})
+    people.append({"name": emp_name or str(emp_id), "ssn": None, "dob": None, "covered": cov})
 
-    # Dependents from Dep Enrollment (optional)
+    # Dependents (optional)
     if is_df_present(dep_df) and "EmployeeID" in dep_df.columns:
-        use = dep_df.copy()
-        for c in ["EnrollmentStartDate","EnrollmentEndDate"]:
-            if c in use.columns:
-                use[c] = pd.to_datetime(use[c], errors="coerce")
-        use["EmployeeID"] = pd.to_numeric(use["EmployeeID"], errors="coerce").astype("Int64")
-        rows = use.loc[use["EmployeeID"]==emp_id]
+        ddf = dep_df.copy()
+        for col in ["EnrollmentStartDate","EnrollmentEndDate"]:
+            if col in ddf.columns:
+                ddf[col] = pd.to_datetime(ddf[col], errors="coerce")
+        ddf["EmployeeID"] = pd.to_numeric(ddf["EmployeeID"], errors="coerce").astype("Int64")
+        rows = ddf.loc[ddf["EmployeeID"] == emp_id]
         if not rows.empty:
             for _, d in rows.iterrows():
-                name = ("{} {}".format(str(d.get("DepFirstName") or "").strip(), str(d.get("DepLastName") or "").strip())).strip() or "Dependent"
+                name = (f"{str(d.get('DepFirstName') or '').strip()} {str(d.get('DepLastName') or '').strip()}").strip() or "Dependent"
                 covered = {m: False for m in MONTHS}
                 s = d.get("EnrollmentStartDate"); e = d.get("EnrollmentEndDate")
                 if pd.notna(s) and pd.notna(e):
-                    for i,mn in enumerate(MONTHS, start=1):
+                    for i, mn in enumerate(MONTHS, start=1):
                         ms = pd.Timestamp(year=year, month=i, day=1)
                         me = ms + pd.offsets.MonthEnd(1)
                         if (s <= me) and (e >= ms):
                             covered[mn] = True
-                persons.append({"name": name, "ssn": None, "dob": None, "covered": covered})
-    return persons
+                people.append({"name": name, "ssn": None, "dob": None, "covered": covered})
+    return people
 
 def fill_part1(writer: PdfWriter, fields: Dict[str,Any], vals: Dict[str,Any]):
-    p1 = fields.get("part1", {}) or {}
+    part1 = fields.get("part1", {}) or {}
     for k,v in vals.items():
-        if (k in p1) and (v is not None):
-            set_form_text(writer, p1[k], str(v))
+        if (k in part1) and (v is not None):
+            set_form_text(writer, part1[k], str(v))
 
 def fill_part3(writer: PdfWriter, fields: Dict[str,Any], persons: List[Dict[str,Any]]):
     p3 = fields.get("part3", {}) or {}
@@ -164,14 +158,13 @@ def fill_part3(writer: PdfWriter, fields: Dict[str,Any], persons: List[Dict[str,
         m = rowmaps[idx]
         if m.get("name") and person.get("name"):
             set_form_text(writer, m["name"], str(person["name"]))
-        if m.get("ssn")  and person.get("ssn"):
-            set_form_text(writer, m["ssn"],  str(person["ssn"]))
-        if m.get("dob")  and person.get("dob"):
-            set_form_text(writer, m["dob"],  str(person["dob"]))
+        if m.get("ssn") and person.get("ssn"):
+            set_form_text(writer, m["ssn"], str(person["ssn"]))
+        if m.get("dob") and person.get("dob"):
+            set_form_text(writer, m["dob"], str(person["dob"]))
+
         all_field = m.get("all")
         months_map = m.get("months", {}) or {}
-
-        # all-12 optimization
         all_covered = all(bool(person["covered"].get(mm, False)) for mm in MONTHS)
         if all_covered and all_field:
             set_form_text(writer, all_field, "X")
@@ -189,27 +182,32 @@ def generate_all_pdfs(
     demo_df: Optional[pd.DataFrame] = None,
     dep_df: Optional[pd.DataFrame] = None
 ) -> List[Tuple[str, bytes]]:
-    """
-    Returns [(filename, pdf_bytes), ...]
-    """
     fields = load_field_map(fields_json_path)
     out: List[Tuple[str, bytes]] = []
 
-    # Explicitly guard iteration set
     emp_ids = []
     if "Employee_ID" in interim_df.columns:
         emp_ids = [eid for eid in interim_df["Employee_ID"].dropna().unique().tolist()]
 
     for emp_id in sorted(emp_ids):
-        block = interim_df.loc[interim_df["Employee_ID"] == emp_id].copy()
+        block = interim_df.loc[interim_df["Employee_ID"]==emp_id].copy()
         if block.empty:
             continue
         if "Month" in block.columns:
-            block = block.sort_values(key=lambda s: s.map(month_to_index) if s.name=="Month" else s)
+            block = block.sort_values(
+                by="Month",
+                key=lambda s: s.map(lambda v: month_to_index(v))
+            )
 
-        # Build Line14/Line16 dicts
-        l14 = build_line_dict(block, "line_14")
-        l16 = build_line_dict(block, "line_16")
+        # Line 14/16 dicts
+        def line_dict(col):
+            d = {m: None for m in MONTHS}
+            for _, r in block.iterrows():
+                mo = str(r.get("Month"))
+                if mo in d: d[mo] = r.get(col)
+            return d
+        l14 = line_dict("line_14")
+        l16 = line_dict("line_16")
 
         # PDF
         reader = PdfReader(template_path)
@@ -218,19 +216,18 @@ def generate_all_pdfs(
             writer.add_page(p)
         enable_need_appearances(reader, writer)
 
-        # Part I (optional)
-        p1_vals = derive_part1_values(int(emp_id), demo_df)
-        fill_part1(writer, fields, p1_vals)
+        # Part I
+        p1 = derive_part1_values(int(emp_id), demo_df)
+        fill_part1(writer, fields, p1)
 
         # Part II
         fill_line_codes(writer, fields, l14, "line14")
         fill_line_codes(writer, fields, l16, "line16")
 
-        # Part III (optional)
+        # Part III
         persons = build_part3_rows(int(emp_id), year, block, dep_df)
         fill_part3(writer, fields, persons)
 
-        # Save to bytes
         buf = io.BytesIO()
         writer.write(buf)
         out.append((f"1095C_{int(emp_id)}.pdf", buf.getvalue()))
