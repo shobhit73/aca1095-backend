@@ -3,42 +3,28 @@
 
 from __future__ import annotations
 import io
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import pandas as pd
 
-# ---------- Small helpers to avoid ambiguous truth ----------
+# ---------- helpers to avoid ambiguous truth ----------
 def is_df_present(df) -> bool:
-    """Safely check if a DataFrame is present and non-empty."""
     return isinstance(df, pd.DataFrame) and (not df.empty)
 
-def is_series_nonempty_bool(s: pd.Series) -> bool:
-    """Safely decide if a boolean Series contains at least one True."""
-    if not isinstance(s, pd.Series):
-        return False
-    try:
-        return bool(s.any())
-    except Exception:
-        return False
-
-# ---------- Month helpers ----------
 MONTHS = ["Jan","Feb","Mar","Apr","May","June","July","Aug","Sept","Oct","Nov","Dec"]
-MONTH_ALIASES = {
-    "Jan":"Jan","January":"Jan",
-    "Feb":"Feb","February":"Feb",
-    "Mar":"Mar","March":"Mar",
-    "Apr":"Apr","April":"Apr",
+ALIASES = {
+    "January":"Jan","Jan":"Jan",
+    "February":"Feb","Feb":"Feb",
+    "March":"Mar","Mar":"Mar",
+    "April":"Apr","Apr":"Apr",
     "May":"May",
-    "Jun":"June","June":"June",
-    "Jul":"July","July":"July",
-    "Aug":"Aug","August":"Aug",
-    "Sep":"Sept","Sept":"Sept","September":"Sept",
-    "Oct":"Oct","October":"Oct",
-    "Nov":"Nov","November":"Nov",
-    "Dec":"Dec","December":"Dec",
+    "June":"June","Jun":"June",
+    "July":"July","Jul":"July",
+    "August":"Aug","Aug":"Aug",
+    "September":"Sept","Sep":"Sept","Sept":"Sept",
+    "October":"Oct","Oct":"Oct",
+    "November":"Nov","Nov":"Nov",
+    "December":"Dec","Dec":"Dec",
 }
-
-def to_canon_month(m: str) -> str:
-    return MONTH_ALIASES.get(str(m).strip(), str(m).strip())
 
 def months_in_range(start: pd.Timestamp, end: pd.Timestamp) -> List[str]:
     if pd.isna(start) or pd.isna(end):
@@ -46,29 +32,21 @@ def months_in_range(start: pd.Timestamp, end: pd.Timestamp) -> List[str]:
     rng = pd.date_range(start, end, freq="MS")
     return [MONTHS[d.month-1] for d in rng]
 
-# ---------- Core loader ----------
 def load_input_workbook(excel_bytes: bytes) -> Dict[str, pd.DataFrame]:
     bio = io.BytesIO(excel_bytes)
-    sheets: Dict[str, pd.DataFrame] = {}
+    out: Dict[str, pd.DataFrame] = {}
     with pd.ExcelFile(bio) as xf:
-        for name in xf.sheet_names:
+        for s in xf.sheet_names:
             try:
-                df = xf.parse(name)
-                if isinstance(df, pd.DataFrame) and not df.empty:
+                df = xf.parse(s)
+                if isinstance(df, pd.DataFrame):
                     df.columns = df.columns.str.strip().str.replace(" ", "_")
-                sheets[name] = df
+                out[s] = df
             except Exception:
-                # keep best-effort loading
                 pass
-    return sheets
+    return out
 
-# ---------- Interim builder ----------
 def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
-    """
-    Returns a row-per-employee-per-month DataFrame for the given reporting year.
-    Required sheets (if present): Emp_Demographic, Emp_Eligibility, Emp_Enrollment, Emp_Wait_Period (optional)
-    Column names are normalized (spaces -> _).
-    """
     sheets = load_input_workbook(excel_bytes)
 
     demo = sheets.get("Emp Demographic") or sheets.get("Emp_Demographic") or pd.DataFrame()
@@ -76,12 +54,10 @@ def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
     enrl = sheets.get("Emp Enrollment") or sheets.get("Emp_Enrollment") or pd.DataFrame()
     wait = sheets.get("Emp Wait Period") or sheets.get("Emp_Wait_Period") or pd.DataFrame()
 
-    # Normalize
     for df in [demo, elig, enrl, wait]:
         if is_df_present(df):
             df.columns = df.columns.str.strip().str.replace(" ", "_")
 
-    # Types
     if is_df_present(demo) and "EmployeeID" in demo.columns:
         demo["EmployeeID"] = pd.to_numeric(demo["EmployeeID"], errors="coerce").astype("Int64")
     if is_df_present(elig) and "EmployeeID" in elig.columns:
@@ -91,11 +67,9 @@ def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
     if is_df_present(wait) and "EmployeeID" in wait.columns:
         wait["EmployeeID"] = pd.to_numeric(wait["EmployeeID"], errors="coerce").astype("Int64")
 
-    # Dates
-    for c in ["StatusStartDate", "StatusEndDate"]:
+    for c in ["StatusStartDate","StatusEndDate"]:
         if is_df_present(demo) and c in demo.columns:
             demo[c] = pd.to_datetime(demo[c], errors="coerce")
-
     for pair in [("EligibilityStartDate","EligibilityEndDate"), ("EnrollmentStartDate","EnrollmentEndDate")]:
         for c in pair:
             if is_df_present(elig) and c in elig.columns:
@@ -105,15 +79,15 @@ def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
             if is_df_present(wait) and c in wait.columns:
                 wait[c] = pd.to_datetime(wait[c], errors="coerce")
 
-    # Exclude WAIVE in eligibility/enrollment
     if is_df_present(elig) and "EligiblePlan" in elig.columns:
         elig = elig[~elig["EligiblePlan"].astype(str).str.contains("Waive", case=False, na=False)]
     if is_df_present(enrl) and "PlanCode" in enrl.columns:
         enrl = enrl[~enrl["PlanCode"].astype(str).str.contains("Waive", case=False, na=False)]
 
-    # Build base grid: each employee x each month of the year
     months = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="MS")
-    base_records = []
+
+    # base grid
+    base_rows = []
     if is_df_present(demo):
         for _, emp in demo.iterrows():
             emp_id = emp.get("EmployeeID")
@@ -122,87 +96,81 @@ def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
             name = (str(emp.get("FirstName") or "") + " " +
                     str(emp.get("MiddleInitial") or "") + " " +
                     str(emp.get("LastName") or "")).strip()
-            role = str(emp.get("Role") or "").strip().upper()
+            role = str(emp.get("Role") or "").upper().strip()
             sstart = emp.get("StatusStartDate")
             send   = emp.get("StatusEndDate")
-
             for m in months:
-                mend = (m + pd.offsets.MonthEnd(1))
+                mend = m + pd.offsets.MonthEnd(1)
                 employed_full = (pd.notna(sstart) and pd.notna(send) and sstart <= m and send >= mend)
-                base_records.append({
+                base_rows.append({
                     "Employee_ID": int(emp_id),
                     "Name": name if name else str(int(emp_id)),
                     "Year": year,
                     "Month": MONTHS[m.month-1],
                     "Is_Employed_full_month": "Yes" if employed_full else "No",
-                    "Is_full_time_full_month": "Yes" if (employed_full and role == "FT") else "No",
-                    "Is_Part_time_full_month": "Yes" if (employed_full and role == "PT") else "No",
+                    "Is_full_time_full_month": "Yes" if (employed_full and role=="FT") else "No",
+                    "Is_Part_time_full_month": "Yes" if (employed_full and role=="PT") else "No",
                 })
-
-    base = pd.DataFrame(base_records)
+    base = pd.DataFrame(base_rows)
     if base.empty:
         return base
 
-    # Expand eligibility to month-level
+    # month-level eligibility
     elig_monthly = pd.DataFrame()
     if is_df_present(elig):
         rows = []
         for _, r in elig.iterrows():
-            for m in months_in_range(r.get("EligibilityStartDate"), r.get("EligibilityEndDate")):
+            for mon in months_in_range(r.get("EligibilityStartDate"), r.get("EligibilityEndDate")):
                 rows.append({
                     "EmployeeID": r.get("EmployeeID"),
-                    "Month": m,
+                    "Month": mon,
                     "EligiblePlan": r.get("EligiblePlan"),
                     "EligibleTier": r.get("EligibleTier"),
-                    "PlanCost": r.get("PlanCost")
+                    "PlanCost": r.get("PlanCost"),
                 })
         if rows:
             elig_monthly = pd.DataFrame(rows).drop_duplicates()
 
-    # Expand enrollment to month-level
+    # month-level enrollment
     enrl_monthly = pd.DataFrame()
     if is_df_present(enrl):
         rows = []
         for _, r in enrl.iterrows():
-            for m in months_in_range(r.get("EnrollmentStartDate"), r.get("EnrollmentEndDate")):
+            for mon in months_in_range(r.get("EnrollmentStartDate"), r.get("EnrollmentEndDate")):
                 rows.append({
                     "EmployeeID": r.get("EmployeeID"),
-                    "Month": m,
+                    "Month": mon,
                     "PlanCode": r.get("PlanCode"),
-                    "Tier": r.get("Tier")
+                    "Tier": r.get("Tier"),
                 })
         if rows:
             enrl_monthly = pd.DataFrame(rows).drop_duplicates()
 
-    # Aggregate by (EmployeeID, Month)
+    # aggregate
     if is_df_present(elig_monthly):
         agg_elig = (
-            elig_monthly
-            .groupby(["EmployeeID","Month"])
+            elig_monthly.groupby(["EmployeeID","Month"])
             .agg({
                 "EligiblePlan": lambda x: set([str(v) for v in x.dropna()]),
                 "EligibleTier": lambda x: set([str(v) for v in x.dropna()]),
-                "PlanCost": lambda x: pd.to_numeric(pd.Series(list(x.dropna())), errors="coerce").min() if len(x.dropna()) else None
-            })
-            .reset_index()
+                "PlanCost": lambda x: pd.to_numeric(pd.Series(list(x.dropna())), errors="coerce").min()
+                          if len(x.dropna()) else None
+            }).reset_index()
         )
     else:
         agg_elig = pd.DataFrame(columns=["EmployeeID","Month","EligiblePlan","EligibleTier","PlanCost"])
 
     if is_df_present(enrl_monthly):
         agg_enrl = (
-            enrl_monthly
-            .groupby(["EmployeeID","Month"])
+            enrl_monthly.groupby(["EmployeeID","Month"])
             .agg({
                 "PlanCode": lambda x: set([str(v) for v in x.dropna()]),
-                "Tier":     lambda x: set([str(v) for v in x.dropna()])
-            })
-            .reset_index()
+                "Tier":     lambda x: set([str(v) for v in x.dropna()]),
+            }).reset_index()
         )
     else:
         agg_enrl = pd.DataFrame(columns=["EmployeeID","Month","PlanCode","Tier"])
 
-    # Merge into base
     final = base.merge(
         agg_elig, left_on=["Employee_ID","Month"], right_on=["EmployeeID","Month"], how="left"
     ).merge(
@@ -210,13 +178,12 @@ def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
     )
     final = final.drop(columns=["EmployeeID_x","EmployeeID_y"], errors="ignore")
 
-    # Wait period flags per month (true if any wait row overlaps the month)
+    # wait period per month
     final["is_waiting_period_true_full_month"] = "No"
     if is_df_present(wait):
-        # Normalize (again, safe)
-        for col in ["EligibilityStartDate","EligibilityEndDate"]:
-            if col in wait.columns:
-                wait[col] = pd.to_datetime(wait[col], errors="coerce")
+        for c in ["EligibilityStartDate","EligibilityEndDate"]:
+            if c in wait.columns:
+                wait[c] = pd.to_datetime(wait[c], errors="coerce")
 
         def month_overlap(emp_id: int, mon: str) -> bool:
             try:
@@ -224,15 +191,13 @@ def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
             except Exception:
                 return False
             ms = pd.Timestamp(year=year, month=idx, day=1)
-            me = (ms + pd.offsets.MonthEnd(1))
+            me = ms + pd.offsets.MonthEnd(1)
             w = wait.loc[wait["EmployeeID"]==emp_id] if "EmployeeID" in wait.columns else pd.DataFrame()
             if w.empty:
                 return False
             for _, rr in w.iterrows():
                 s = rr.get("EligibilityStartDate"); e = rr.get("EligibilityEndDate")
-                if pd.isna(s) or pd.isna(e):
-                    continue
-                if (s <= me) and (e >= ms):
+                if pd.notna(s) and pd.notna(e) and (s <= me) and (e >= ms):
                     return True
             return False
 
@@ -240,7 +205,7 @@ def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
             lambda r: "Yes" if month_overlap(r["Employee_ID"], r["Month"]) else "No", axis=1
         )
 
-    # Plan cost > 50 (EMP-only affordability check)
+    # plan cost > 50 (EMP-only)
     def plan_cost_gt_50(r) -> str:
         c = r.get("PlanCost", None)
         try:
@@ -249,10 +214,9 @@ def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
             return "Yes" if float(c) > 50 else "No"
         except Exception:
             return "No"
-
     final["plan_cost_greater_than_50"] = final.apply(plan_cost_gt_50, axis=1)
 
-    # Eligibility/enrollment flags
+    # eligibility/enrollment flags
     def infer_flags(row):
         tiers_e = row["EligibleTier"] if isinstance(row.get("EligibleTier"), set) else set()
         plans_e = row["EligiblePlan"] if isinstance(row.get("EligiblePlan"), set) else set()
@@ -260,19 +224,19 @@ def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
 
         emp_tiers    = {"EMP","EMPFAM","EMPSPOUSE"}
         family_tiers = {"EMPFAM","EMPSPOUSE"}
-        child_tier   = "EMPFAM"
 
         employee_eligible = len(tiers_e.intersection(emp_tiers)) > 0
         spouse_eligible   = len(tiers_e.intersection(family_tiers)) > 0
-        child_eligible    = child_tier in tiers_e
+        child_eligible    = "EMPFAM" in tiers_e
+
         employee_enrolled = len(tiers_n.intersection(emp_tiers)) > 0
         spouse_enrolled   = len(tiers_n.intersection(family_tiers)) > 0
-        child_enrolled    = child_tier in tiers_n
+        child_enrolled    = "EMPFAM" in tiers_n
 
-        eligible_planA_emp_any = ("PlanA" in plans_e) and employee_eligible
+        planA_emp_any = ("PlanA" in plans_e) and employee_eligible
 
         return pd.Series([
-            "Yes" if eligible_planA_emp_any else "No",
+            "Yes" if planA_emp_any else "No",
             "Yes" if employee_eligible else "No",
             "Yes" if spouse_eligible else "No",
             "Yes" if child_eligible else "No",
@@ -291,19 +255,18 @@ def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
         "child_enrolled"
     ]] = final.apply(infer_flags, axis=1)
 
-    # ------------- Line 14 / Line 16 logic -------------
+    # line 14/16
     def compute_line_codes(r):
         ft      = (r.get("Is_full_time_full_month") == "Yes")
         emp_elg = (r.get("employee_eligible") == "Yes")
         sp_elg  = (r.get("spouse_eligible") == "Yes")
         ch_elg  = (r.get("child_eligible") == "Yes")
         emp_enr = (r.get("employee_enrolled") == "Yes")
-        waitp   = (r.get("is_waiting_period_true_full_month") == "Yes")
+        wait_p  = (r.get("is_waiting_period_true_full_month") == "Yes")
         cost_gt = (r.get("plan_cost_greater_than_50") == "Yes")
         planA_emp = (r.get("employee_eligible_for_planA_full_month") == "Yes")
 
-        # ---- Line 14 ----
-        l14 = ""
+        # Line 14
         if ft and planA_emp and sp_elg and ch_elg and not cost_gt:
             l14 = "1A"
         elif emp_elg and (not sp_elg) and (not ch_elg):
@@ -314,23 +277,21 @@ def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
             l14 = "1D"
         elif ft and planA_emp and sp_elg and ch_elg and cost_gt:
             l14 = "1E"
-        elif emp_elg and (not planA_emp):  # eligible for a plan but NOT Plan A
+        elif emp_elg and (not planA_emp):
             l14 = "1F"
         elif (not ft) and emp_enr:
             l14 = "1G"
         else:
-            # not eligible for A/B OR only eligible for non A/B plan
             l14 = "1H"
 
-        # ---- Line 16 ----
-        l16 = ""
+        # Line 16
         if r.get("Is_Employed_full_month") == "No":
             l16 = "2A"
         elif not ft:
             l16 = "2B"
         elif emp_enr:
-            l16 = "2C"        # precedence
-        elif waitp:
+            l16 = "2C"
+        elif wait_p:
             l16 = "2D"
         elif not cost_gt:
             l16 = "2F"
@@ -341,7 +302,6 @@ def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
 
     final[["line_14","line_16"]] = final.apply(compute_line_codes, axis=1)
 
-    # Order columns nicely
     pref = [
         "Employee_ID","Name","Year","Month",
         "Is_Employed_full_month","Is_full_time_full_month","Is_Part_time_full_month",
@@ -351,7 +311,5 @@ def build_interim_df(year: int, excel_bytes: bytes) -> pd.DataFrame:
         "is_waiting_period_true_full_month","plan_cost_greater_than_50",
         "line_14","line_16"
     ]
-    rest = [c for c in final.columns if c not in pref and c not in {"EligiblePlan","EligibleTier","PlanCode","Tier","PlanCost"}]
-    final = final[pref + rest]
-
-    return final
+    extra = [c for c in final.columns if c not in pref and c not in {"EligiblePlan","EligibleTier","PlanCode","Tier","PlanCost"}]
+    return final[pref + extra]
